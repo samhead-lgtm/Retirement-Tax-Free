@@ -5,7 +5,6 @@ import json, os
 import numpy as np
 from itertools import permutations
 
-st.set_page_config(page_title="Retirement Estimator (Accumulation)", layout="wide")
 
 DEFAULT_STATE = {
     "projection_results": None,

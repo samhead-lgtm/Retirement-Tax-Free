@@ -7,7 +7,6 @@ from functools import lru_cache
 from itertools import permutations
 from fpdf import FPDF
 
-st.set_page_config(page_title="RTF Tax + Wealth Engine (Master)", layout="wide")
 
 DEFAULT_STATE = {
     "base_results": None, "base_inputs": None, "assets": None,
