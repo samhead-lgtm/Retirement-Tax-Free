@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import datetime as dt
+import json, os
 from functools import lru_cache
 from itertools import permutations
 
@@ -18,6 +19,46 @@ DEFAULT_STATE = {
 for k, v in DEFAULT_STATE.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ---------- Client Profile Save / Load ----------
+_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tax_profiles")
+os.makedirs(_PROFILE_DIR, exist_ok=True)
+
+_PROFILE_KEYS = [
+    "tax_year", "filing_status", "inflation",
+    "enter_dobs", "filer_dob", "spouse_dob",
+    "filer_ss_already", "filer_ss_current", "filer_ss_start_year", "filer_ss_fra", "filer_ss_claim",
+    "spouse_ss_already", "spouse_ss_current", "spouse_ss_start_year", "spouse_ss_fra", "spouse_ss_claim",
+    "pension_filer", "pension_spouse", "pension_cola",
+    "auto_rmd", "pretax_bal_filer_prior", "pretax_bal_spouse_prior", "baseline_pretax_dist", "rmd_manual",
+    "wages", "tax_exempt_interest", "interest_taxable",
+    "total_ordinary_div", "qualified_div", "cap_gain_loss", "other_income",
+    "filer_65_plus", "spouse_65_plus",
+    "adjustments", "dependents", "retirement_deduction", "out_of_state_gain",
+    "itemizing", "itemized_amount",
+    "taxable_cash_bal", "taxable_brokerage_bal", "brokerage_gain_pct",
+    "pretax_bal", "roth_bal", "life_cash_value", "annuity_value", "annuity_basis",
+    "r_taxable_side", "r_pretax_side", "r_roth_side", "r_annuity_side", "r_life_side",
+]
+_DATE_KEYS = {"filer_dob", "spouse_dob"}
+
+def _collect_profile():
+    data = {}
+    for k in _PROFILE_KEYS:
+        if k in st.session_state:
+            v = st.session_state[k]
+            if isinstance(v, dt.date):
+                data[k] = v.isoformat()
+            elif v is not None:
+                data[k] = v
+    return data
+
+def _apply_profile(data):
+    for k, v in data.items():
+        if k in _DATE_KEYS and v is not None:
+            st.session_state[k] = dt.date.fromisoformat(v)
+        else:
+            st.session_state[k] = v
 
 def age_at_date(dob, asof):
     if dob is None: return None
@@ -593,79 +634,102 @@ st.title("RTF Tax + Income Needs + LT Projection + Optimizer")
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Base Tax Estimator", "Income Needs", "Wealth Projection", "Income Optimizer", "Roth Conversion Opportunity"])
 
 with st.sidebar:
+    with st.expander("Save / Load Client Profile"):
+        _profiles = sorted([f[:-5] for f in os.listdir(_PROFILE_DIR) if f.endswith(".json")])
+        if _profiles:
+            _sel = st.selectbox("Select Profile", _profiles, key="_prof_sel")
+            if st.button("Load Profile", key="_prof_load"):
+                with open(os.path.join(_PROFILE_DIR, f"{_sel}.json")) as _f:
+                    _apply_profile(json.load(_f))
+                st.rerun()
+        else:
+            st.caption("No saved profiles yet.")
+        st.divider()
+        _save_name = st.text_input("Profile Name", key="_prof_name")
+        _c1, _c2 = st.columns(2)
+        with _c1:
+            if st.button("Save", key="_prof_save") and _save_name:
+                with open(os.path.join(_PROFILE_DIR, f"{_save_name}.json"), "w") as _f:
+                    json.dump(_collect_profile(), _f, indent=2)
+                st.success(f"Saved: {_save_name}")
+        with _c2:
+            if _profiles and st.button("Delete", key="_prof_del"):
+                os.remove(os.path.join(_PROFILE_DIR, f"{_sel}.json"))
+                st.rerun()
+
     st.header("Tax Year & Filing")
     current_year = dt.date.today().year
-    tax_year = st.number_input("Tax year", min_value=2020, max_value=2100, value=2025, step=1)
-    filing_status = st.selectbox("Filing Status", ["Single", "Married Filing Jointly", "Head of Household"])
+    tax_year = st.number_input("Tax year", min_value=2020, max_value=2100, value=2025, step=1, key="tax_year")
+    filing_status = st.selectbox("Filing Status", ["Single", "Married Filing Jointly", "Head of Household"], key="filing_status")
     st.divider()
     st.header("Inflation / COLA")
-    inflation = st.number_input("Inflation (also SS COLA)", value=0.030, step=0.005, format="%.3f")
+    inflation = st.number_input("Inflation (also SS COLA)", value=0.030, step=0.005, format="%.3f", key="inflation")
     st.divider()
     st.header("DOBs (for RMD + SS not-yet)")
-    enter_dobs = st.checkbox("Enter DOBs", value=True)
+    enter_dobs = st.checkbox("Enter DOBs", value=True, key="enter_dobs")
     if enter_dobs:
-        filer_dob = st.date_input("Filer DOB", value=dt.date(1955, 1, 1), min_value=dt.date(1930, 1, 1), max_value=dt.date(2000, 12, 31))
-        spouse_dob = st.date_input("Spouse DOB", value=dt.date(1955, 1, 1), min_value=dt.date(1930, 1, 1), max_value=dt.date(2000, 12, 31)) if "joint" in filing_status.lower() else None
+        filer_dob = st.date_input("Filer DOB", value=dt.date(1955, 1, 1), min_value=dt.date(1930, 1, 1), max_value=dt.date(2000, 12, 31), key="filer_dob")
+        spouse_dob = st.date_input("Spouse DOB", value=dt.date(1955, 1, 1), min_value=dt.date(1930, 1, 1), max_value=dt.date(2000, 12, 31), key="spouse_dob") if "joint" in filing_status.lower() else None
     else: filer_dob = None; spouse_dob = None
     st.divider()
     st.header("Social Security")
-    filer_ss_already = st.checkbox("Filer already receiving SS?", value=False)
+    filer_ss_already = st.checkbox("Filer already receiving SS?", value=False, key="filer_ss_already")
     if filer_ss_already:
-        filer_ss_current = st.number_input("Filer current annual SS", value=0.0, step=1000.0)
-        filer_ss_start_year = st.number_input("Filer SS start year", value=int(tax_year), step=1)
+        filer_ss_current = st.number_input("Filer current annual SS", value=0.0, step=1000.0, key="filer_ss_current")
+        filer_ss_start_year = st.number_input("Filer SS start year", value=int(tax_year), step=1, key="filer_ss_start_year")
         filer_ss_fra = 0.0; filer_ss_claim = "FRA"
     else:
         filer_ss_current = 0.0; filer_ss_start_year = 9999
-        filer_ss_fra = st.number_input("Filer SS at FRA", value=0.0, step=1000.0)
-        filer_ss_claim = st.selectbox("Filer claim choice", ["62", "FRA", "70"], index=1)
+        filer_ss_fra = st.number_input("Filer SS at FRA", value=0.0, step=1000.0, key="filer_ss_fra")
+        filer_ss_claim = st.selectbox("Filer claim choice", ["62", "FRA", "70"], index=1, key="filer_ss_claim")
     if "joint" in filing_status.lower():
-        spouse_ss_already = st.checkbox("Spouse already receiving SS?", value=False)
+        spouse_ss_already = st.checkbox("Spouse already receiving SS?", value=False, key="spouse_ss_already")
         if spouse_ss_already:
-            spouse_ss_current = st.number_input("Spouse current annual SS", value=0.0, step=1000.0)
-            spouse_ss_start_year = st.number_input("Spouse SS start year", value=int(tax_year), step=1)
+            spouse_ss_current = st.number_input("Spouse current annual SS", value=0.0, step=1000.0, key="spouse_ss_current")
+            spouse_ss_start_year = st.number_input("Spouse SS start year", value=int(tax_year), step=1, key="spouse_ss_start_year")
             spouse_ss_fra = 0.0; spouse_ss_claim = "FRA"
         else:
             spouse_ss_current = 0.0; spouse_ss_start_year = 9999
-            spouse_ss_fra = st.number_input("Spouse SS at FRA", value=0.0, step=1000.0)
-            spouse_ss_claim = st.selectbox("Spouse claim choice", ["62", "FRA", "70"], index=1)
+            spouse_ss_fra = st.number_input("Spouse SS at FRA", value=0.0, step=1000.0, key="spouse_ss_fra")
+            spouse_ss_claim = st.selectbox("Spouse claim choice", ["62", "FRA", "70"], index=1, key="spouse_ss_claim")
     else: spouse_ss_already = False; spouse_ss_current = 0.0; spouse_ss_start_year = 9999; spouse_ss_fra = 0.0; spouse_ss_claim = "FRA"
     st.divider()
     st.header("Pensions")
-    pension_filer = st.number_input("Filer pension", value=0.0, step=1000.0)
-    pension_spouse = st.number_input("Spouse pension", value=0.0, step=1000.0) if "joint" in filing_status.lower() else 0.0
-    pension_cola = st.number_input("Pension COLA (%)", value=0.00, step=0.005, format="%.3f")
+    pension_filer = st.number_input("Filer pension", value=0.0, step=1000.0, key="pension_filer")
+    pension_spouse = st.number_input("Spouse pension", value=0.0, step=1000.0, key="pension_spouse") if "joint" in filing_status.lower() else 0.0
+    pension_cola = st.number_input("Pension COLA (%)", value=0.00, step=0.005, format="%.3f", key="pension_cola")
     st.divider()
     st.header("RMD Inputs")
-    auto_rmd = st.checkbox("Auto-calculate RMD", value=True)
-    pretax_balance_filer_prior = st.number_input("Filer prior-year 12/31 pre-tax balance", value=0.0, step=1000.0)
-    pretax_balance_spouse_prior = st.number_input("Spouse prior-year 12/31 pre-tax balance", value=0.0, step=1000.0) if "joint" in filing_status.lower() else 0.0
-    baseline_pretax_distributions = st.number_input("Baseline pre-tax distributions", value=0.0, step=1000.0)
-    rmd_manual = st.number_input("RMD manual override", value=0.0, step=1000.0) if not auto_rmd else 0.0
+    auto_rmd = st.checkbox("Auto-calculate RMD", value=True, key="auto_rmd")
+    pretax_balance_filer_prior = st.number_input("Filer prior-year 12/31 pre-tax balance", value=0.0, step=1000.0, key="pretax_bal_filer_prior")
+    pretax_balance_spouse_prior = st.number_input("Spouse prior-year 12/31 pre-tax balance", value=0.0, step=1000.0, key="pretax_bal_spouse_prior") if "joint" in filing_status.lower() else 0.0
+    baseline_pretax_distributions = st.number_input("Baseline pre-tax distributions", value=0.0, step=1000.0, key="baseline_pretax_dist")
+    rmd_manual = st.number_input("RMD manual override", value=0.0, step=1000.0, key="rmd_manual") if not auto_rmd else 0.0
     st.divider()
     st.header("Other Income / Deductions / Assets")
-    wages = st.number_input("Wages", value=0.0, step=1000.0)
-    tax_exempt_interest = st.number_input("Tax-exempt interest", value=0.0, step=100.0)
-    interest_taxable = st.number_input("Taxable interest", value=0.0, step=100.0)
-    total_ordinary_dividends = st.number_input("Total ordinary dividends", value=0.0, step=100.0)
-    qualified_dividends = st.number_input("Qualified dividends", value=0.0, max_value=total_ordinary_dividends, step=100.0)
-    cap_gain_loss = st.number_input("Baseline net cap gain/(loss)", value=0.0, step=1000.0)
-    other_income = st.number_input("Other taxable income", value=0.0, step=500.0)
-    filer_65_plus = st.checkbox("Filer age 65+")
-    spouse_65_plus = st.checkbox("Spouse age 65+") if "joint" in filing_status.lower() else False
-    adjustments = st.number_input("Adjustments to income", value=0.0, step=500.0)
-    dependents = st.number_input("Dependents", value=0, step=1)
-    retirement_deduction = st.number_input("SC retirement deduction", value=0.0, step=1000.0)
-    out_of_state_gain = st.number_input("Out-of-state gain (SC)", value=0.0, step=1000.0)
-    itemizing = st.checkbox("Itemizing deductions?")
-    itemized_amount = st.number_input("Itemized amount", value=0.0, step=1000.0) if itemizing else 0.0
-    taxable_cash_bal = st.number_input("After-tax cash", value=0.0, step=1000.0)
-    taxable_brokerage_bal = st.number_input("After-tax brokerage", value=0.0, step=1000.0)
-    brokerage_gain_pct = st.slider("Brokerage sale gain %", min_value=0.0, max_value=1.0, value=0.60, step=0.05)
-    pretax_bal = st.number_input("Pre-tax (IRA/401k) current", value=0.0, step=1000.0)
-    roth_bal = st.number_input("Roth balance", value=0.0, step=1000.0)
-    life_cash_value = st.number_input("Life insurance CV", value=0.0, step=1000.0)
-    annuity_value = st.number_input("Annuity value", value=0.0, step=1000.0)
-    annuity_basis = st.number_input("Annuity cost basis", value=0.0, step=1000.0)
+    wages = st.number_input("Wages", value=0.0, step=1000.0, key="wages")
+    tax_exempt_interest = st.number_input("Tax-exempt interest", value=0.0, step=100.0, key="tax_exempt_interest")
+    interest_taxable = st.number_input("Taxable interest", value=0.0, step=100.0, key="interest_taxable")
+    total_ordinary_dividends = st.number_input("Total ordinary dividends", value=0.0, step=100.0, key="total_ordinary_div")
+    qualified_dividends = st.number_input("Qualified dividends", value=0.0, max_value=total_ordinary_dividends, step=100.0, key="qualified_div")
+    cap_gain_loss = st.number_input("Baseline net cap gain/(loss)", value=0.0, step=1000.0, key="cap_gain_loss")
+    other_income = st.number_input("Other taxable income", value=0.0, step=500.0, key="other_income")
+    filer_65_plus = st.checkbox("Filer age 65+", key="filer_65_plus")
+    spouse_65_plus = st.checkbox("Spouse age 65+", key="spouse_65_plus") if "joint" in filing_status.lower() else False
+    adjustments = st.number_input("Adjustments to income", value=0.0, step=500.0, key="adjustments")
+    dependents = st.number_input("Dependents", value=0, step=1, key="dependents")
+    retirement_deduction = st.number_input("SC retirement deduction", value=0.0, step=1000.0, key="retirement_deduction")
+    out_of_state_gain = st.number_input("Out-of-state gain (SC)", value=0.0, step=1000.0, key="out_of_state_gain")
+    itemizing = st.checkbox("Itemizing deductions?", key="itemizing")
+    itemized_amount = st.number_input("Itemized amount", value=0.0, step=1000.0, key="itemized_amount") if itemizing else 0.0
+    taxable_cash_bal = st.number_input("After-tax cash", value=0.0, step=1000.0, key="taxable_cash_bal")
+    taxable_brokerage_bal = st.number_input("After-tax brokerage", value=0.0, step=1000.0, key="taxable_brokerage_bal")
+    brokerage_gain_pct = st.slider("Brokerage sale gain %", min_value=0.0, max_value=1.0, value=0.60, step=0.05, key="brokerage_gain_pct")
+    pretax_bal = st.number_input("Pre-tax (IRA/401k) current", value=0.0, step=1000.0, key="pretax_bal")
+    roth_bal = st.number_input("Roth balance", value=0.0, step=1000.0, key="roth_bal")
+    life_cash_value = st.number_input("Life insurance CV", value=0.0, step=1000.0, key="life_cash_value")
+    annuity_value = st.number_input("Annuity value", value=0.0, step=1000.0, key="annuity_value")
+    annuity_basis = st.number_input("Annuity cost basis", value=0.0, step=1000.0, key="annuity_basis")
     st.divider()
     st.header("Growth Rate Assumptions (%)")
     r_taxable = st.number_input("Taxable return %", value=6.0, step=0.5, format="%.1f", key="r_taxable_side") / 100
