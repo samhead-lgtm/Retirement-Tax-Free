@@ -1461,6 +1461,10 @@ def generate_pdf_report():
 
     return bytes(pdf.output())
 
+if not st.session_state.get("authenticated"):
+    st.warning("Please log in from the home page.")
+    st.stop()
+
 st.title("RTF Tax + Income Needs + LT Projection + Optimizer")
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Base Tax Estimator", "Income Needs", "Wealth Projection", "Income Optimizer", "Roth Conversion Opportunity"])
 

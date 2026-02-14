@@ -2,6 +2,22 @@ import streamlit as st
 
 st.set_page_config(page_title="RTF Financial Planning", layout="wide")
 
+# Password gate
+def check_password():
+    if st.session_state.get("authenticated"):
+        return True
+    pwd = st.text_input("Enter password to access the app:", type="password")
+    if pwd:
+        if pwd == st.secrets.get("APP_PASSWORD", ""):
+            st.session_state["authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+if not check_password():
+    st.stop()
+
 st.title("RTF Financial Planning Suite")
 st.write("Select your planning mode:")
 

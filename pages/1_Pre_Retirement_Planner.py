@@ -1663,6 +1663,10 @@ def run_retirement_projection(balances, params, spending_order):
 
 
 # ========== UI ==========
+if not st.session_state.get("authenticated"):
+    st.warning("Please log in from the home page.")
+    st.stop()
+
 st.title("Retirement Estimator – Accumulation Phase")
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Current Situation", "Savings Plan", "Projection", "Retirement Readiness", "Roth Conversion"])
 

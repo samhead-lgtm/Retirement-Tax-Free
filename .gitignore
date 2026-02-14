@@ -3,3 +3,4 @@ __pycache__/
 .claude/
 retirement_profiles/
 tax_profiles/
+.streamlit/secrets.toml
