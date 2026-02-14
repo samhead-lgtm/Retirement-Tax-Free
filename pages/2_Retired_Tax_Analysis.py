@@ -1459,7 +1459,7 @@ def generate_pdf_report():
     pdf.set_y(-10)
     pdf.cell(0, 5, "RTF Financial Planning Report - For planning purposes only. Not tax advice.", align="C")
 
-    return pdf.output()
+    return bytes(pdf.output())
 
 st.title("RTF Tax + Income Needs + LT Projection + Optimizer")
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Base Tax Estimator", "Income Needs", "Wealth Projection", "Income Optimizer", "Roth Conversion Opportunity"])
