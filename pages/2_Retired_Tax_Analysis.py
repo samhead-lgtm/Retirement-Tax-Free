@@ -1149,10 +1149,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "SS": round(ss_now, 0), "Pension": round(pen_now, 0),
             "Fixed Inc": round(ss_now + pen_now, 0),
             "Inv Inc": round(spendable_inv, 0),
-            "BOY Pre-Tax": round(boy_pretax, 0), "RMD": round(rmd_total, 0),
+            "RMD": round(rmd_total, 0),
             "Conversion": round(conversion_this_year, 0),
-            "W/D Cash": round(wd_cash, 0), "W/D Brokerage": round(wd_brokerage, 0),
-            "W/D Taxable": round(wd_cash + wd_brokerage, 0),
+            "W/D Cash": round(wd_cash, 0), "W/D Taxable": round(wd_brokerage, 0),
             "W/D Pre-Tax": round(wd_pretax, 0),
             "W/D Roth": round(wd_roth, 0), "W/D Life": round(wd_life, 0),
             "W/D Tax-Free": round(wd_roth + wd_life, 0),
@@ -1160,8 +1159,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "Cap Gains": round(cap_gains_realized, 0),
             "Total Income": round(total_income_disp, 0),
             "Taxes": round(yr_tax, 0), "Medicare": round(yr_medicare, 0),
-            "Bal Cash": round(curr_cash, 0), "Bal Brokerage": round(curr_brokerage, 0),
-            "Bal Taxable": round(curr_cash + curr_brokerage, 0),
+            "Bal Cash": round(curr_cash, 0), "Bal Taxable": round(curr_brokerage, 0),
             "Bal Pre-Tax": round(curr_pre_filer + curr_pre_spouse, 0),
             "Bal Roth": round(curr_roth, 0), "Bal Annuity": round(curr_ann, 0),
             "Bal Life": round(curr_life, 0),
@@ -1495,7 +1493,7 @@ def generate_pdf_report():
 
         # Select key columns for the table
         display_cols = ["Year", "Age", "Spending", "Fixed Inc", "RMD",
-                        "W/D Taxable", "W/D Pre-Tax", "W/D Tax-Free", "W/D Annuity",
+                        "W/D Cash", "W/D Taxable", "W/D Pre-Tax", "W/D Tax-Free", "W/D Annuity",
                         "Taxes", "Medicare", "Portfolio", "Estate (Net)"]
         # Filter to columns that exist in the data
         available_cols = [c for c in display_cols if c in tab3_rows[0]]
@@ -1701,7 +1699,7 @@ def generate_pdf_report():
             pdf.set_font("Helvetica", "B", 10)
             pdf.cell(0, 7, "Projection Summary", new_x="LMARGIN", new_y="NEXT")
             opt_proj_cols = ["Year", "Age", "Spending", "Fixed Inc", "RMD",
-                             "W/D Taxable", "W/D Pre-Tax", "W/D Tax-Free", "W/D Annuity",
+                             "W/D Cash", "W/D Taxable", "W/D Pre-Tax", "W/D Tax-Free", "W/D Annuity",
                              "Taxes", "Medicare", "Portfolio", "Estate (Net)"]
             avail_opt = [c for c in opt_proj_cols if c in best_details[0]]
             n_oc = len(avail_opt)
@@ -2042,8 +2040,8 @@ with tab3:
                 "r_annuity": r_annuity, "r_life": r_life,
             }
             # Hide detail sub-columns that are rolled up into summary columns
-            _hide_cols = ["W/D Cash", "W/D Brokerage", "W/D Roth", "W/D Life",
-                          "Bal Cash", "Bal Brokerage", "Bal Life",
+            _hide_cols = ["W/D Roth", "W/D Life",
+                          "Bal Life",
                           "Total Wealth", "Gross Estate", "_net_draw"]
             _df_display = pd.DataFrame(rows).drop(columns=[c for c in _hide_cols if c in rows[0]], errors="ignore")
             st.dataframe(_df_display, use_container_width=True, hide_index=True)
@@ -2085,10 +2083,22 @@ with tab3:
                 # This correctly reflects SS, pensions, RMDs, taxes, and surplus
                 mc_net_draws = [r["_net_draw"] for r in rows]
 
+                # Deterministic BOY portfolio for scaling surplus in MC
+                det_boy = [init_total] + [rows[i]["Portfolio"] for i in range(len(rows) - 1)]
+                while len(det_boy) < n_years:
+                    det_boy.append(det_boy[-1] if det_boy else 1.0)
+
                 for sim in range(n_sims):
                     port = init_total
                     for yr_i in range(n_years):
                         net_draw = mc_net_draws[yr_i] if yr_i < len(mc_net_draws) else mc_net_draws[-1]
+                        # Scale negative net_draws (surplus from large RMDs) by portfolio ratio.
+                        # Surplus depends on portfolio size — smaller portfolios have smaller RMDs
+                        # and therefore less surplus. Without scaling, every MC path gets the
+                        # same fixed surplus, compressing the distribution.
+                        if net_draw < 0 and det_boy[yr_i] > 0:
+                            ratio = port / det_boy[yr_i]
+                            net_draw = net_draw * ratio
                         # Random return: normal distribution around mean with given volatility
                         yr_return = rng.normal(w_avg_return, vol)
                         port = port * (1 + yr_return) - net_draw
@@ -2391,7 +2401,7 @@ with tab4:
                                 ("RMD", yr.get("RMD", 0)),
                                 ("Investment Income", yr.get("Inv Inc", 0)),
                                 ("W/D Cash", yr.get("W/D Cash", 0)),
-                                ("W/D Brokerage", yr.get("W/D Brokerage", 0)),
+                                ("W/D Taxable", yr.get("W/D Taxable", 0)),
                                 ("W/D Pre-Tax", yr.get("W/D Pre-Tax", 0)),
                                 ("Roth Conversion", yr.get("Conversion", 0)),
                                 ("W/D Roth", yr.get("W/D Roth", 0)),
