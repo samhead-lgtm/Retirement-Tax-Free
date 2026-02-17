@@ -19,7 +19,7 @@ DEFAULT_STATE = {
     "phase1_results": None, "phase1_best_order": None, "phase1_best_details": None,
     "phase1_all_details": {},  "phase1_selected_strategy": None,
     "phase1_params": None, "phase2_results": None, "phase2_best_details": None,
-    "phase2_baseline_details": None, "phase2_best_name": None,
+    "phase2_all_details": {}, "phase2_baseline_details": None, "phase2_best_name": None,
     "tab5_conv_res": None, "tab5_conv_inputs": None, "tab5_actual_conversion": None,
     "tab5_conversion_room": None, "tab5_total_additional_cost": None,
     "tab3_rows": None, "tab3_mc_results": None, "tab3_params": None,
@@ -3233,8 +3233,8 @@ with tab4:
                     "_is_blend": is_blend,
                     "_wf_order": wf_order,
                     "_strat_info": _strat_info,
+                    "_year_details": result["year_details"],
                 })
-                # Store year-by-year detail for every strategy
                 all_details[label] = result["year_details"]
                 if estate > best_estate:
                     best_estate = estate
@@ -3318,11 +3318,11 @@ with tab4:
                 with col3b: st.metric("vs Best", f"${_selected_result['after_tax_estate'] - best['after_tax_estate']:+,.0f}")
 
             # Show year-by-year detail for selected strategy
-            _all_dets = st.session_state.phase1_all_details or {}
             _opt_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "Gross Estate", "_net_draw"]
-            if _selected_label in _all_dets:
+            _sel_details = _selected_result.get("_year_details", [])
+            if _sel_details:
                 with st.expander(f"Year-by-Year Detail: {_selected_label}", expanded=True):
-                    _df_det = pd.DataFrame(_all_dets[_selected_label])
+                    _df_det = pd.DataFrame(_sel_details)
                     _df_det = _df_det.drop(columns=[c for c in _opt_hide if c in _df_det.columns], errors="ignore")
                     st.dataframe(_df_det, use_container_width=True, hide_index=True)
             elif st.session_state.phase1_best_details:
@@ -3479,6 +3479,7 @@ with tab4:
                         "final_pretax": result["final_pretax"],
                         "final_roth": result["final_roth"],
                         "final_brokerage": result["final_cash"] + result["final_brokerage"],
+                        "_year_details": result["year_details"],
                     })
                     if estate > best_estate:
                         best_estate = estate
@@ -3525,26 +3526,33 @@ with tab4:
                                         "Total Taxes", "Total Converted", "Final Pre-Tax", "Final Roth", "Final Taxable"]
                     st.dataframe(df_show2, use_container_width=True)
 
-                if st.session_state.phase2_best_details:
-                    with st.expander("Year-by-Year Detail (Best Strategy)"):
-                        _df_p2det = pd.DataFrame(st.session_state.phase2_best_details)
-                        _p2_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "Gross Estate", "_net_draw"]
+                # Strategy selector for Phase 2
+                _p2_labels = [r["strategy_name"] for r in p2_sorted]
+                _p2_selected_label = st.selectbox(
+                    "Select conversion strategy to view detail",
+                    _p2_labels, index=0, key="p2_strategy_select",
+                    help="Default is the highest-estate strategy. Pick any to see its year-by-year detail.")
+                _p2_selected_result = next(r for r in p2_sorted if r["strategy_name"] == _p2_selected_label)
+
+                _p2_sel_details = _p2_selected_result.get("_year_details", [])
+                _p2_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "Gross Estate", "_net_draw"]
+                if _p2_sel_details:
+                    with st.expander(f"Year-by-Year Detail: {_p2_selected_label}", expanded=True):
+                        _df_p2det = pd.DataFrame(_p2_sel_details)
                         _df_p2det = _df_p2det.drop(columns=[c for c in _p2_hide if c in _df_p2det.columns], errors="ignore")
                         st.dataframe(_df_p2det, use_container_width=True, hide_index=True)
 
-                if st.session_state.phase2_baseline_details and st.session_state.phase2_best_details:
+                _bl_result = next((r for r in p2 if "baseline" in r["strategy_name"].lower()), None)
+                _bl_details = _bl_result.get("_year_details", []) if _bl_result else []
+                if _bl_details and _p2_sel_details:
                     st.divider()
-                    bl_details = st.session_state.phase2_baseline_details
-                    bc_details = st.session_state.phase2_best_details
-                    best_strat_name = st.session_state.phase2_best_name or "Best Strategy"
+                    yr1_bl = _bl_details[0] if _bl_details else {}
+                    yr1_bc = _p2_sel_details[0] if _p2_sel_details else {}
 
-                    yr1_bl = bl_details[0] if bl_details else {}
-                    yr1_bc = bc_details[0] if bc_details else {}
-
-                    st.markdown(f"### Year 1 Cash Flow: No Conversion vs {best_strat_name}")
+                    st.markdown(f"### Year 1 Cash Flow: No Conversion vs {_p2_selected_label}")
                     col1, col2 = st.columns(2)
 
-                    for col, yr, label in [(col1, yr1_bl, "No Conversion"), (col2, yr1_bc, best_strat_name)]:
+                    for col, yr, label in [(col1, yr1_bl, "No Conversion"), (col2, yr1_bc, _p2_selected_label)]:
                         with col:
                             st.markdown(f"#### {label}")
                             st.markdown("**Income (Cash Received)**")
@@ -3582,8 +3590,8 @@ with tab4:
                     st.divider()
                     st.markdown("### End of Projection Comparison")
                     col1, col2 = st.columns(2)
-                    final_bl = bl_details[-1] if bl_details else {}
-                    final_bc = bc_details[-1] if bc_details else {}
+                    final_bl = _bl_details[-1] if _bl_details else {}
+                    final_bc = _p2_sel_details[-1] if _p2_sel_details else {}
                     with col1:
                         st.markdown("#### No Conversion")
                         st.metric("Final Pre-Tax", money(final_bl.get("Bal Pre-Tax", 0)))
@@ -3591,7 +3599,7 @@ with tab4:
                         st.metric("Final Taxable", money(final_bl.get("Bal Cash", 0) + final_bl.get("Bal Taxable", 0)))
                         st.metric("After-Tax Estate", money(final_bl.get("Estate (Net)", 0)))
                     with col2:
-                        st.markdown(f"#### {best_strat_name}")
+                        st.markdown(f"#### {_p2_selected_label}")
                         st.metric("Final Pre-Tax", money(final_bc.get("Bal Pre-Tax", 0)))
                         st.metric("Final Roth", money(final_bc.get("Bal Roth", 0)))
                         st.metric("Final Taxable", money(final_bc.get("Bal Cash", 0) + final_bc.get("Bal Taxable", 0)))
