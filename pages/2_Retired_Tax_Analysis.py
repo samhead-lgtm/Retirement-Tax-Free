@@ -147,7 +147,10 @@ def get_federal_traditional_extra(status, filer_65, spouse_65, inf=1.0):
     if is_joint and spouse_65: extra += 1600.0
     return extra * inf
 
-def get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf=1.0):
+def get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf=1.0, tax_year=None):
+    # Enhanced elderly deduction expires after 2028
+    if tax_year is not None and tax_year > 2028:
+        return 0.0
     extra = 0.0
     is_joint = "joint" in status.lower()
     threshold = (150000.0 if is_joint else 75000.0) * inf
@@ -260,7 +263,7 @@ def _get_bracket_top(target_bracket_rate, filing_status, inf=1.0):
 
 def compute_bracket_fill_amount(target_bracket_rate, base_non_ss_income, gross_ss,
                                  filing_status, filer_65, spouse_65, retirement_deduction,
-                                 preferential_amount=0.0, inf_factor=1.0):
+                                 preferential_amount=0.0, inf_factor=1.0, tax_year=None):
     """Binary search for the Roth conversion amount that fills ordinary income to the
     top of a specified federal bracket (e.g. 0.12, 0.22, 0.24).
 
@@ -280,7 +283,7 @@ def compute_bracket_fill_amount(target_bracket_rate, base_non_ss_income, gross_s
         agi = total_non_ss + taxable_ss
         base_std = get_federal_base_std(filing_status, inf_factor)
         trad_extra = get_federal_traditional_extra(filing_status, filer_65, spouse_65, inf_factor)
-        enh_extra = get_federal_enhanced_extra(agi, filer_65, spouse_65, filing_status, inf_factor)
+        enh_extra = get_federal_enhanced_extra(agi, filer_65, spouse_65, filing_status, inf_factor, tax_year=tax_year)
         deduction = base_std + trad_extra + enh_extra
         ordinary_taxable = max(0.0, agi - deduction) - max(0.0, preferential_amount)
         if ordinary_taxable < bracket_top:
@@ -381,13 +384,13 @@ ADAPTIVE_STRATEGIES = {
 
 def compute_taxes_only(gross_ss, taxable_pensions, rmd_amount, taxable_ira, conversion_amount,
                        ordinary_income, cap_gains, filing_status, filer_65, spouse_65,
-                       retirement_deduction, inf_factor=1.0):
+                       retirement_deduction, inf_factor=1.0, tax_year=None):
     base_non_ss = taxable_pensions + rmd_amount + taxable_ira + conversion_amount + ordinary_income + cap_gains
     taxable_ss = calculate_taxable_ss(base_non_ss, 0.0, gross_ss, filing_status)
     agi = base_non_ss + taxable_ss
     base_std = get_federal_base_std(filing_status, inf_factor)
     trad_extra = get_federal_traditional_extra(filing_status, filer_65, spouse_65, inf_factor)
-    enh_extra = get_federal_enhanced_extra(agi, filer_65, spouse_65, filing_status, inf_factor)
+    enh_extra = get_federal_enhanced_extra(agi, filer_65, spouse_65, filing_status, inf_factor, tax_year=tax_year)
     deduction = base_std + trad_extra + enh_extra
     fed_taxable = max(0.0, agi - deduction)
     preferential = max(0.0, cap_gains)
@@ -429,7 +432,8 @@ def compute_case(inputs, inflation_factor=1.0):
     agi = max(0.0, total_income_for_tax - adjustments)
     base_std = get_federal_base_std(filing_status, inflation_factor)
     traditional_extra = get_federal_traditional_extra(filing_status, filer_65_plus, spouse_65_plus, inflation_factor)
-    enhanced_extra = get_federal_enhanced_extra(agi, filer_65_plus, spouse_65_plus, filing_status, inflation_factor)
+    _tax_year = inputs.get("tax_year", None)
+    enhanced_extra = get_federal_enhanced_extra(agi, filer_65_plus, spouse_65_plus, filing_status, inflation_factor, tax_year=_tax_year)
     fed_std = base_std + traditional_extra + enhanced_extra
 
     # Calculate itemized deductions from components
@@ -1188,7 +1192,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         fill_amt = compute_bracket_fill_amount(
                             _br_rate, base_taxable, ss_now, filing_status,
                             filer_65, spouse_65, p_retirement_deduction,
-                            preferential_amount=pref_amt, inf_factor=inf_factor)
+                            preferential_amount=pref_amt, inf_factor=inf_factor, tax_year=yr)
                         conversion_this_year = min(max(0.0, fill_amt), avail_pretax)
                 elif isinstance(_yr_conv_strategy, str) and _yr_conv_strategy.startswith("fill_irmaa_"):
                     _irmaa_tier = int(_yr_conv_strategy.split("_")[-1])
@@ -1294,7 +1298,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 "property_tax": p_property_tax * inf_factor,
                 "medical_expenses": p_medical_expenses * inf_factor,
                 "charitable": p_charitable * inf_factor,
-                "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0,
+                "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0, "tax_year": yr,
             }
             blend_balances = {
                 "cash": curr_cash, "brokerage": curr_brokerage,
@@ -1340,7 +1344,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "property_tax": p_property_tax * inf_factor,
                     "medical_expenses": p_medical_expenses * inf_factor,
                     "charitable": p_charitable * inf_factor,
-                    "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0,
+                    "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0, "tax_year": yr,
                 }
                 trial_res = compute_case_cached(_serialize_inputs_for_cache(trial_inp), inf_factor)
                 taxes = trial_res["total_tax"]
@@ -1445,7 +1449,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "property_tax": p_property_tax * inf_factor,
                     "medical_expenses": p_medical_expenses * inf_factor,
                     "charitable": p_charitable * inf_factor,
-                    "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0,
+                    "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0, "tax_year": yr,
                 }
                 trial_res = compute_case_cached(_serialize_inputs_for_cache(trial_inp), inf_factor)
                 taxes = trial_res["total_tax"]
@@ -1544,7 +1548,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "property_tax": p_property_tax * inf_factor,
                     "medical_expenses": p_medical_expenses * inf_factor,
                     "charitable": p_charitable * inf_factor,
-                    "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0,
+                    "cashflow_taxfree": yr_extra_taxfree, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0, "tax_year": yr,
                 }
                 trial_res = compute_case_cached(_serialize_inputs_for_cache(trial_inp), inf_factor)
                 taxes = trial_res["total_tax"]
@@ -2509,6 +2513,7 @@ def current_inputs():
         "mortgage_payment": float(mortgage_payment), "property_tax": float(property_tax),
         "medical_expenses": float(medical_expenses), "charitable": float(charitable),
         "ordinary_tax_only": 0.0, "cashflow_taxfree": 0.0, "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0,
+        "tax_year": int(tax_year),
     }
 
 def current_assets():
