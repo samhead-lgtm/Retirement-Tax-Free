@@ -1261,6 +1261,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 wd_life += _pull
             elif _aex_src == "Annuity":
                 _pull = min(_aex_amt, max(0.0, curr_ann - wd_annuity))
+                if _pull > 0:
+                    _total_gains = max(0.0, curr_ann - curr_ann_basis)
+                    _rem_gains = max(0.0, _total_gains - ann_gains_withdrawn)
+                    ann_gains_withdrawn += min(_pull, _rem_gains)
                 wd_annuity += _pull
 
         if _yr_blend_mode:
@@ -1374,8 +1378,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     avail = max(0.0, curr_ann - wd_annuity)
                     pull = min(shortfall, avail)
                     if pull > 0:
-                        current_gains = max(0.0, (curr_ann - wd_annuity + pull) - curr_ann_basis)
-                        new_gains = min(pull, max(0.0, current_gains))
+                        total_gains = max(0.0, curr_ann - curr_ann_basis)
+                        remaining_gains = max(0.0, total_gains - ann_gains_withdrawn)
+                        new_gains = min(pull, remaining_gains)
                         wd_annuity += pull; ann_gains_withdrawn += new_gains; shortfall -= pull
 
                 # 5. Pre-tax overflow (if brokerage/annuity ran out, use more pre-tax beyond cap)
@@ -1601,8 +1606,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         avail = curr_ann - wd_annuity
                         pull = min(shortfall, max(0.0, avail))
                         if pull > 0:
-                            current_gains = max(0.0, (curr_ann - wd_annuity + pull) - curr_ann_basis)
-                            new_gains = min(pull, max(0.0, current_gains))
+                            total_gains = max(0.0, curr_ann - curr_ann_basis)
+                            remaining_gains = max(0.0, total_gains - ann_gains_withdrawn)
+                            new_gains = min(pull, remaining_gains)
                             wd_annuity += pull
                             ann_gains_withdrawn += new_gains
                             shortfall -= pull
@@ -3467,6 +3473,7 @@ with tab4:
                         "total_converted": result["total_converted"],
                         "final_pretax": result["final_pretax"],
                         "final_roth": result["final_roth"],
+                        "final_brokerage": result["final_cash"] + result["final_brokerage"],
                     })
                     if estate > best_estate:
                         best_estate = estate
@@ -3505,12 +3512,12 @@ with tab4:
                     df_p2.index = range(1, len(df_p2) + 1)
                     df_p2.index.name = "Rank"
                     display_cols2 = ["strategy_name", "after_tax_estate", "improvement", "total_wealth",
-                                     "total_taxes", "total_converted", "final_pretax", "final_roth"]
+                                     "total_taxes", "total_converted", "final_pretax", "final_roth", "final_brokerage"]
                     df_show2 = df_p2[display_cols2].copy()
                     for c in display_cols2[1:]:
                         df_show2[c] = df_show2[c].apply(lambda x: f"${x:,.0f}")
                     df_show2.columns = ["Strategy", "After-Tax Estate", "vs Baseline", "Total Wealth",
-                                        "Total Taxes", "Total Converted", "Final Pre-Tax", "Final Roth"]
+                                        "Total Taxes", "Total Converted", "Final Pre-Tax", "Final Roth", "Final Taxable"]
                     st.dataframe(df_show2, use_container_width=True)
 
                 if st.session_state.phase2_best_details:
@@ -3576,11 +3583,13 @@ with tab4:
                         st.markdown("#### No Conversion")
                         st.metric("Final Pre-Tax", money(final_bl.get("Bal Pre-Tax", 0)))
                         st.metric("Final Roth", money(final_bl.get("Bal Roth", 0)))
+                        st.metric("Final Taxable", money(final_bl.get("Bal Cash", 0) + final_bl.get("Bal Taxable", 0)))
                         st.metric("After-Tax Estate", money(final_bl.get("Estate (Net)", 0)))
                     with col2:
                         st.markdown(f"#### {best_strat_name}")
                         st.metric("Final Pre-Tax", money(final_bc.get("Bal Pre-Tax", 0)))
                         st.metric("Final Roth", money(final_bc.get("Bal Roth", 0)))
+                        st.metric("Final Taxable", money(final_bc.get("Bal Cash", 0) + final_bc.get("Bal Taxable", 0)))
                         st.metric("After-Tax Estate", money(final_bc.get("Estate (Net)", 0)))
 
 with tab5:
