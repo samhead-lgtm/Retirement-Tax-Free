@@ -2,13 +2,20 @@ import streamlit as st
 
 st.set_page_config(page_title="RTF Financial Planning", layout="wide")
 
-# Password gate
+# Password gate — only enforced when APP_PASSWORD is set (Streamlit Cloud)
 def check_password():
+    try:
+        app_pwd = st.secrets.get("APP_PASSWORD", "")
+    except FileNotFoundError:
+        app_pwd = ""
+    if not app_pwd:
+        st.session_state["authenticated"] = True
+        return True
     if st.session_state.get("authenticated"):
         return True
     pwd = st.text_input("Enter password to access the app:", type="password")
     if pwd:
-        if pwd == st.secrets.get("APP_PASSWORD", ""):
+        if pwd == app_pwd:
             st.session_state["authenticated"] = True
             st.rerun()
         else:
@@ -18,17 +25,4 @@ def check_password():
 if not check_password():
     st.stop()
 
-st.title("RTF Financial Planning Suite")
-st.write("Select your planning mode:")
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("Pre-Retirement")
-    st.write("For working clients planning for retirement.")
-    if st.button("Open Pre-Retirement Planner", type="primary"):
-        st.switch_page("pages/1_Pre_Retirement_Planner.py")
-with col2:
-    st.subheader("Already Retired")
-    st.write("For retired clients: tax analysis, income needs, Roth conversions.")
-    if st.button("Open Retired Tax Analysis", type="primary"):
-        st.switch_page("pages/2_Retired_Tax_Analysis.py")
+st.switch_page("pages/3_Financial_Plan.py")
