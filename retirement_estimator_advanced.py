@@ -674,32 +674,43 @@ def optimize_roth_conversions(balances_at_retire, base_params, spending_order,
 
 
 def run_monte_carlo(run_fn, n_sims=500, mean_return=0.07, return_std=0.12,
-                    n_years=30, seed=None):
+                    n_years=30, seed=None, mean_return_post=None, n_years_pre=0):
     """Run Monte Carlo simulation by randomizing year-by-year returns.
 
     Args:
         run_fn: callable(return_sequence) -> dict with "estate" and "final_total" keys
         n_sims: number of simulations
-        mean_return: mean annual return
+        mean_return: mean annual return (used for all years, or just pre-retirement if mean_return_post is set)
         return_std: standard deviation of annual returns
         n_years: number of years to generate returns for
         seed: optional RNG seed for reproducibility
+        mean_return_post: if set, use this mean for retirement years (after n_years_pre)
+        n_years_pre: number of pre-retirement years (only used when mean_return_post is set)
 
     Returns:
         dict with median_estate, p10, p25, p75, p90, mean_estate, success_rate, all_estates
     """
     rng = np.random.default_rng(seed)
-    all_returns = rng.normal(mean_return, return_std, (n_sims, n_years))
+    if mean_return_post is not None and n_years_pre > 0 and n_years_pre < n_years:
+        n_years_post = n_years - n_years_pre
+        pre_returns = rng.normal(mean_return, return_std, (n_sims, n_years_pre))
+        post_returns = rng.normal(mean_return_post, return_std, (n_sims, n_years_post))
+        all_returns = np.concatenate([pre_returns, post_returns], axis=1)
+    else:
+        all_returns = rng.normal(mean_return, return_std, (n_sims, n_years))
     all_returns = np.maximum(all_returns, -0.50)
 
     all_estates = []
+    all_retire_portfolios = []
     for sim in range(n_sims):
         result = run_fn(all_returns[sim].tolist())
         all_estates.append(result["estate"])
+        all_retire_portfolios.append(result.get("retire_portfolio", 0))
 
     all_estates = np.array(all_estates)
+    all_retire_portfolios = np.array(all_retire_portfolios)
     success_rate = float(np.mean(all_estates > 0))
-    return {
+    out = {
         "median_estate": float(np.median(all_estates)),
         "p10": float(np.percentile(all_estates, 10)),
         "p25": float(np.percentile(all_estates, 25)),
@@ -709,6 +720,12 @@ def run_monte_carlo(run_fn, n_sims=500, mean_return=0.07, return_std=0.12,
         "success_rate": success_rate,
         "all_estates": all_estates.tolist(),
     }
+    if np.any(all_retire_portfolios > 0):
+        out["retire_median"] = float(np.median(all_retire_portfolios))
+        out["retire_p10"] = float(np.percentile(all_retire_portfolios, 10))
+        out["retire_p90"] = float(np.percentile(all_retire_portfolios, 90))
+        out["retire_mean"] = float(np.mean(all_retire_portfolios))
+    return out
 
 
 # --- RMD (Required Minimum Distribution) ---
@@ -1231,6 +1248,30 @@ def calc_cg_tax(cap_gains, ordinary_taxable, status, inf=1.0):
     cg_at_20 = max(0.0, cg_end - max(cg_start, b1))
     return cg_at_15 * 0.15 + cg_at_20 * 0.20
 
+def estimate_medicare_premiums(agi, filing_status, inf=1.0):
+    """2026 Medicare Part B + Part D premiums with full 5-tier IRMAA.
+    Returns (annual_premium, has_irmaa). Thresholds inflate with inf for future years."""
+    is_joint = "joint" in filing_status.lower()
+    a = float(agi)
+    people = 2 if is_joint else 1
+    base_monthly = 249.40  # 2026 base Part B + avg Part D
+    irmaa_tiers = [
+        (750000, 500000, 487.00, 91.00),   # Tier 5
+        (410000, 205000, 446.30, 83.30),   # Tier 4
+        (342000, 171000, 324.60, 60.40),   # Tier 3
+        (274000, 137000, 202.90, 37.50),   # Tier 2
+        (218000, 109000,  81.20, 14.50),   # Tier 1
+    ]
+    surcharge_monthly = 0.0
+    for jt, st_thresh, partb_s, partd_s in irmaa_tiers:
+        threshold = (jt if is_joint else st_thresh) * inf
+        if a > threshold:
+            surcharge_monthly = partb_s + partd_s
+            break
+    annual = (base_monthly + surcharge_monthly) * 12 * people
+    return annual, surcharge_monthly > 0
+
+
 def calc_year_taxes(gross_ss, pretax_income, cap_gains=0.0, ord_invest_income=0.0, status="Single",
                     filer_65=False, spouse_65=False, inf=1.0, state_rate=0.05):
     """Calculate federal + state tax for a retirement year. All inputs in nominal dollars.
@@ -1473,6 +1514,7 @@ def run_retirement_projection(balances, params, spending_order):
 
         bal_tx = bal_brokerage + bal_cash  # for withdrawal limit tracking
 
+        yr_medicare = 0.0
         for iteration in range(20):
             # Compute cap gains: gains from brokerage sales + dividend income
             total_cap_gains = yr_cap_gains + inv_cap_gains_income
@@ -1482,7 +1524,12 @@ def run_retirement_projection(balances, params, spending_order):
                                          inv_ordinary_income, filing_status,
                                          filer_65, spouse_65, inf_factor, state_rate)
             taxes = tax_result["total_tax"]
-            cash_needed = expenses + taxes - conv_tax_withheld  # withheld portion already paid from conversion
+            # Medicare premiums (based on AGI, applies when 65+)
+            if filer_65:
+                yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], filing_status, inf_factor)
+            else:
+                yr_medicare = 0.0
+            cash_needed = expenses + taxes + yr_medicare - conv_tax_withheld  # withheld portion already paid from conversion
             wd_taxable = wd_cash + wd_brokerage
             cash_available = fixed_cash + wd_pretax + wd_taxable + wd_roth + wd_hsa
             shortfall = cash_needed - cash_available
@@ -1543,11 +1590,15 @@ def run_retirement_projection(balances, params, spending_order):
                                      inv_ordinary_income, filing_status,
                                      filer_65, spouse_65, inf_factor, state_rate)
         taxes = tax_result["total_tax"]
+        if filer_65:
+            yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], filing_status, inf_factor)
+        else:
+            yr_medicare = 0.0
         wd_taxable = wd_cash + wd_brokerage
 
-        # Surplus: income exceeds expenses + taxes → reinvest
+        # Surplus: income exceeds expenses + taxes + medicare → reinvest
         cash_available_final = fixed_cash + wd_pretax + wd_cash + wd_brokerage + wd_roth + wd_hsa
-        cash_needed_final = expenses + taxes - conv_tax_withheld
+        cash_needed_final = expenses + taxes + yr_medicare - conv_tax_withheld
         yr_surplus = max(0.0, cash_available_final - cash_needed_final)
 
         # Update balances
@@ -1569,7 +1620,7 @@ def run_retirement_projection(balances, params, spending_order):
                 bal_brokerage += yr_surplus
                 brokerage_basis += yr_surplus
 
-        total_taxes_paid += taxes
+        total_taxes_paid += taxes + yr_medicare
 
         # Growth
         yr_return = return_sequence[i] if return_sequence else post_return
@@ -1614,12 +1665,25 @@ def run_retirement_projection(balances, params, spending_order):
 
         row = {
             "Year": year, "Age": age,
+        }
+        if spouse_age_at_retire is not None:
+            row["Spouse Age"] = spouse_age_now
+        row.update({
             "SS Income": round(gross_ss, 0), "Pension": round(pen_income, 0),
             "Other Income": round(yr_other_income, 0),
             "Dividends": round(yr_dividends, 0),
             "Interest": round(yr_cash_interest, 0),
+        })
+        if balances["pretax"] > 0:
+            row["RMD"] = round(rmd_amount, 0)
+            row["W/D Pre-Tax"] = round(max(0, wd_pretax - rmd_amount), 0)
+        row.update({
             "W/D Taxable": round(wd_taxable, 0),
             "W/D Roth": round(wd_roth, 0), "W/D HSA": round(wd_hsa, 0),
+        })
+        if any(ira["balance"] > 0 for ira in ret_inherited_iras):
+            row["Inherited Dist"] = round(yr_inherited_dist, 0)
+        row.update({
             "Realized CG": round(yr_cap_gains, 0),
             "Conv Gross": round(conversion_this_year, 0),
             "Conv Tax": round(conv_tax_total, 0),
@@ -1629,21 +1693,23 @@ def run_retirement_projection(balances, params, spending_order):
             "Total Exp": round(expenses, 0),
             "Fed Tax": round(tax_result["fed_tax"], 0),
             "State Tax": round(tax_result["state_tax"], 0),
-            "Total Tax": round(taxes, 0),
-            "Bal Taxable": round(bal_tx, 0),
-            "Bal Roth": round(bal_ro, 0), "Bal HSA": round(bal_hs, 0),
-        }
+            "Medicare": round(yr_medicare, 0),
+            "Total Tax": round(taxes + yr_medicare, 0),
+        })
         if balances["pretax"] > 0:
             row["Bal Pre-Tax"] = round(bal_pt, 0)
-            row["RMD"] = round(rmd_amount, 0)
-            row["W/D Pre-Tax"] = round(max(0, wd_pretax - rmd_amount), 0)
+        row.update({
+            "Bal Taxable": round(bal_tx, 0),
+            "Bal Roth": round(bal_ro, 0), "Bal HSA": round(bal_hs, 0),
+        })
         if any(ira["balance"] > 0 for ira in ret_inherited_iras):
-            row["Inherited Dist"] = round(yr_inherited_dist, 0)
             row["Bal Inherited"] = round(bal_inherited_total, 0)
-        row["Portfolio"] = round(total_bal, 0)
-        row["Home Value"] = round(curr_home_val, 0)
-        row["Gross Estate"] = round(gross_estate, 0)
-        row["Estate (Net)"] = round(after_tax_estate, 0)
+        row.update({
+            "Portfolio": round(total_bal, 0),
+            "Home Value": round(curr_home_val, 0),
+            "Gross Estate": round(gross_estate, 0),
+            "Estate (Net)": round(after_tax_estate, 0),
+        })
         rows.append(row)
 
     bal_inherited_final = sum(ret_iira_bals)
@@ -3374,6 +3440,7 @@ with tab3:
                                          _contrib_dict, salary_growth, pre_retire_return, ii)
                 ar = accum["rows"]
                 af = ar[-1]
+                retire_portfolio = float(af["Total Balance"])
                 bals = {
                     "pretax": float(af["Bal Pre-Tax"]),
                     "roth": float(af["Bal Roth"]),
@@ -3385,24 +3452,35 @@ with tab3:
                 }
                 rp = _mc3_copy.deepcopy(_opt_retire_params(accum.get("inherited_iras_state", [])))
                 rp["return_sequence"] = retire_seq
-                return run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                result = run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                result["retire_portfolio"] = retire_portfolio
+                return result
 
             _mc3_progress = st.progress(0, text="Running Monte Carlo on current plan...")
             _mc3_result_current = run_monte_carlo(
                 _mc3_run_fn_current, n_sims=int(_mc3_nsims),
                 mean_return=pre_retire_return, return_std=_mc3_std,
-                n_years=_mc3_n_years, seed=_mc3_seed)
+                n_years=_mc3_n_years, seed=_mc3_seed,
+                mean_return_post=post_retire_return,
+                n_years_pre=years_to_retirement + 1)
             _mc3_progress.progress(100, text="Monte Carlo complete")
             _mc3_progress.empty()
 
             with _mc3_c2: st.metric("Success Rate", f"{_mc3_result_current['success_rate']:.0%}")
 
             st.markdown("#### Current Plan — Monte Carlo Results")
+            if "retire_median" in _mc3_result_current:
+                st.markdown("**Portfolio at Retirement**")
+                _mc3r1, _mc3r2, _mc3r3 = st.columns(3)
+                with _mc3r1: st.metric("Median", money(_mc3_result_current["retire_median"]))
+                with _mc3r2: st.metric("10th Percentile", money(_mc3_result_current["retire_p10"]))
+                with _mc3r3: st.metric("90th Percentile", money(_mc3_result_current["retire_p90"]))
+            st.markdown("**Estate at Death**")
             _mc3m1, _mc3m2, _mc3m3 = st.columns(3)
             with _mc3m1: st.metric("Median Estate", money(_mc3_result_current["median_estate"]))
             with _mc3m2: st.metric("10th Percentile", money(_mc3_result_current["p10"]))
             with _mc3m3: st.metric("90th Percentile", money(_mc3_result_current["p90"]))
-            st.caption(f"Based on {int(_mc3_nsims)} simulations, mean return {pre_retire_return:.1%}, std dev {_mc3_std:.1%}")
+            st.caption(f"Based on {int(_mc3_nsims)} simulations, pre-retire return {pre_retire_return:.1%}, post-retire return {post_retire_return:.1%}, std dev {_mc3_std:.1%}")
 
         # ── Savings Vehicle Optimizer ──
         st.divider()
@@ -3672,6 +3750,7 @@ with tab3:
                                                  cd, salary_growth, pre_retire_return, ii_mod)
                         ar = accum["rows"]
                         af = ar[-1]
+                        retire_portfolio = float(af["Total Balance"])
                         bals = {
                             "pretax": float(af["Bal Pre-Tax"]),
                             "roth": float(af["Bal Roth"]),
@@ -3683,14 +3762,18 @@ with tab3:
                         }
                         rp = _mc3o_copy.deepcopy(_opt_retire_params(accum.get("inherited_iras_state", [])))
                         rp["return_sequence"] = retire_seq
-                        return run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                        result = run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                        result["retire_portfolio"] = retire_portfolio
+                        return result
                     return _run_fn
 
                 _mc3o_fn = _mc3o_make_run_fn(_mc3o_cd_local, _mc3o_ii_local)
                 _mc3o_mc = run_monte_carlo(
                     _mc3o_fn, n_sims=int(_mc3_nsims),
                     mean_return=pre_retire_return, return_std=_mc3_std,
-                    n_years=_mc3_n_years, seed=_mc3_seed)
+                    n_years=_mc3_n_years, seed=_mc3_seed,
+                    mean_return_post=post_retire_return,
+                    n_years_pre=years_to_retirement + 1)
                 _mc3o_done += int(_mc3_nsims)
                 _mc3o_progress.progress(min(100, int(_mc3o_done / _mc3o_total * 100)),
                                          text=f"Completed {_mc3o_label}...")

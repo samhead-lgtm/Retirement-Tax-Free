@@ -5,6 +5,7 @@ import json, os
 import numpy as np
 from itertools import permutations
 
+st.set_page_config(page_title="Retirement Estimator (Accumulation)", layout="wide")
 
 DEFAULT_STATE = {
     "projection_results": None,
@@ -22,7 +23,7 @@ os.makedirs(_PROFILE_DIR, exist_ok=True)
 _PROFILE_KEYS = [
     "filer_dob", "spouse_dob", "filing_status",
     "ret_age", "spouse_ret_age", "life_exp",
-    "inflation", "pre_ret_return", "post_ret_return", "salary_growth", "state_tax_rate",
+    "inflation", "bracket_growth", "medicare_growth", "pre_ret_return", "post_ret_return", "salary_growth", "state_tax_rate",
     "salary_filer", "salary_spouse", "other_income", "other_income_years",
     "other_income_tax_free", "other_income_inflation", "other_income_recipient", "living_exp_tab1",
     "ssdi_filer", "ssdi_spouse",
@@ -44,10 +45,11 @@ _PROFILE_KEYS = [
     "backdoor_roth_s", "max_ira_s", "trad_ira_s", "roth_ira_s",
     "tax_efficient", "div_yield", "ann_cg_pct", "cash_int_rate", "reinvest_inv_income",
     "deficit_action", "itemize_ded",
-    "property_tax", "medical_exp", "charitable",
+    "property_tax", "medical_exp", "charitable", "qcd_annual",
     "surplus_dest",
     "ret_pct", "rr_so1", "rr_so2", "rr_so3", "rr_surplus_dest", "rr_heir_bracket",
     "ss_opt_life_exp",
+    "spouse_life_exp", "survivor_spend_pct", "pension_survivor_pct",
 ]
 _DATE_KEYS = {"filer_dob", "spouse_dob"}
 
@@ -71,6 +73,20 @@ def _collect_profile():
     return data
 
 def _apply_profile(data):
+    # Clear profile keys not present in loaded data (prevents stale bleed-through)
+    for k in _PROFILE_KEYS:
+        if k not in data and k in st.session_state:
+            del st.session_state[k]
+    # Clear stale future expense keys if not in loaded data
+    if "_num_future_expenses" not in data:
+        old_n = st.session_state.get("num_future_expenses", 0)
+        for i in range(old_n):
+            for pfx in ("fe_name_", "fe_amt_", "fe_start_", "fe_end_", "fe_infl_"):
+                fk = f"{pfx}{i}"
+                if fk in st.session_state:
+                    del st.session_state[fk]
+        if "num_future_expenses" in st.session_state:
+            del st.session_state["num_future_expenses"]
     for k, v in data.items():
         if k == "_num_future_expenses":
             st.session_state["num_future_expenses"] = v
@@ -673,32 +689,43 @@ def optimize_roth_conversions(balances_at_retire, base_params, spending_order,
 
 
 def run_monte_carlo(run_fn, n_sims=500, mean_return=0.07, return_std=0.12,
-                    n_years=30, seed=None):
+                    n_years=30, seed=None, mean_return_post=None, n_years_pre=0):
     """Run Monte Carlo simulation by randomizing year-by-year returns.
 
     Args:
         run_fn: callable(return_sequence) -> dict with "estate" and "final_total" keys
         n_sims: number of simulations
-        mean_return: mean annual return
+        mean_return: mean annual return (used for all years, or just pre-retirement if mean_return_post is set)
         return_std: standard deviation of annual returns
         n_years: number of years to generate returns for
         seed: optional RNG seed for reproducibility
+        mean_return_post: if set, use this mean for retirement years (after n_years_pre)
+        n_years_pre: number of pre-retirement years (only used when mean_return_post is set)
 
     Returns:
         dict with median_estate, p10, p25, p75, p90, mean_estate, success_rate, all_estates
     """
     rng = np.random.default_rng(seed)
-    all_returns = rng.normal(mean_return, return_std, (n_sims, n_years))
+    if mean_return_post is not None and n_years_pre > 0 and n_years_pre < n_years:
+        n_years_post = n_years - n_years_pre
+        pre_returns = rng.normal(mean_return, return_std, (n_sims, n_years_pre))
+        post_returns = rng.normal(mean_return_post, return_std, (n_sims, n_years_post))
+        all_returns = np.concatenate([pre_returns, post_returns], axis=1)
+    else:
+        all_returns = rng.normal(mean_return, return_std, (n_sims, n_years))
     all_returns = np.maximum(all_returns, -0.50)
 
     all_estates = []
+    all_retire_portfolios = []
     for sim in range(n_sims):
         result = run_fn(all_returns[sim].tolist())
         all_estates.append(result["estate"])
+        all_retire_portfolios.append(result.get("retire_portfolio", 0))
 
     all_estates = np.array(all_estates)
+    all_retire_portfolios = np.array(all_retire_portfolios)
     success_rate = float(np.mean(all_estates > 0))
-    return {
+    out = {
         "median_estate": float(np.median(all_estates)),
         "p10": float(np.percentile(all_estates, 10)),
         "p25": float(np.percentile(all_estates, 25)),
@@ -708,6 +735,12 @@ def run_monte_carlo(run_fn, n_sims=500, mean_return=0.07, return_std=0.12,
         "success_rate": success_rate,
         "all_estates": all_estates.tolist(),
     }
+    if np.any(all_retire_portfolios > 0):
+        out["retire_median"] = float(np.median(all_retire_portfolios))
+        out["retire_p10"] = float(np.percentile(all_retire_portfolios, 10))
+        out["retire_p90"] = float(np.percentile(all_retire_portfolios, 90))
+        out["retire_mean"] = float(np.mean(all_retire_portfolios))
+    return out
 
 
 # --- RMD (Required Minimum Distribution) ---
@@ -1230,6 +1263,33 @@ def calc_cg_tax(cap_gains, ordinary_taxable, status, inf=1.0):
     cg_at_20 = max(0.0, cg_end - max(cg_start, b1))
     return cg_at_15 * 0.15 + cg_at_20 * 0.20
 
+def estimate_medicare_premiums(agi, filing_status, inf=1.0, medicare_inf=None):
+    """2026 Medicare Part B + Part D premiums with full 5-tier IRMAA.
+    Returns (annual_premium, has_irmaa).
+    inf: bracket/threshold inflation factor.
+    medicare_inf: premium growth factor (defaults to inf if not provided)."""
+    _med_inf = medicare_inf if medicare_inf is not None else inf
+    is_joint = "joint" in filing_status.lower()
+    a = float(agi)
+    people = 2 if is_joint else 1
+    base_monthly = 249.40 * _med_inf  # 2026 base Part B + avg Part D, grown
+    irmaa_tiers = [
+        (750000, 500000, 487.00, 91.00),   # Tier 5
+        (410000, 205000, 446.30, 83.30),   # Tier 4
+        (342000, 171000, 324.60, 60.40),   # Tier 3
+        (274000, 137000, 202.90, 37.50),   # Tier 2
+        (218000, 109000,  81.20, 14.50),   # Tier 1
+    ]
+    surcharge_monthly = 0.0
+    for jt, st_thresh, partb_s, partd_s in irmaa_tiers:
+        threshold = (jt if is_joint else st_thresh) * inf
+        if a > threshold:
+            surcharge_monthly = (partb_s + partd_s) * _med_inf
+            break
+    annual = (base_monthly + surcharge_monthly) * 12 * people
+    return annual, surcharge_monthly > 0
+
+
 def calc_year_taxes(gross_ss, pretax_income, cap_gains=0.0, ord_invest_income=0.0, status="Single",
                     filer_65=False, spouse_65=False, inf=1.0, state_rate=0.05):
     """Calculate federal + state tax for a retirement year. All inputs in nominal dollars.
@@ -1262,9 +1322,14 @@ def run_retirement_projection(balances, params, spending_order):
     bal_hs = balances["hsa"]
 
     retire_age = params["retire_age"]
-    life_exp = params["life_expectancy"]
+    life_exp = params.get("filer_life_expectancy", params.get("life_expectancy", 95))
+    spouse_life_exp = params.get("spouse_life_expectancy")
+    survivor_spending_pct = params.get("survivor_spending_pct", 100) / 100.0
+    pension_survivor_pct = params.get("pension_survivor_pct", 100) / 100.0
     retire_year = params["retire_year"]
     inflation = params["inflation"]
+    bracket_growth = params.get("bracket_growth", inflation)
+    medicare_growth = params.get("medicare_growth", inflation)
     post_return = params["post_retire_return"]
     filing_status = params["filing_status"]
     state_rate = params["state_tax_rate"]
@@ -1302,6 +1367,9 @@ def run_retirement_projection(balances, params, spending_order):
     ret_iira_rmd_required = [ira.get("owner_was_taking_rmds", False) for ira in ret_inherited_iras]
     ret_iira_additional = [ira.get("additional_distribution", 0.0) for ira in ret_inherited_iras]
 
+    base_charitable = params.get("charitable", 0.0)
+    base_qcd = params.get("qcd_annual", 0.0)
+
     return_sequence = params.get("return_sequence", None)
 
     # Roth conversion params
@@ -1319,11 +1387,27 @@ def run_retirement_projection(balances, params, spending_order):
 
     spouse_age_at_retire = params.get("spouse_age_at_retire")
 
-    for i in range(life_exp - retire_age + 1):
+    # Compute projection length and first-death year for survivor logic
+    retire_years_filer = life_exp - retire_age
+    if spouse_life_exp and spouse_age_at_retire:
+        retire_years_spouse = spouse_life_exp - spouse_age_at_retire
+        total_retire_years = max(retire_years_filer, retire_years_spouse)
+        filer_death_year_idx = retire_years_filer
+        spouse_death_year_idx = retire_years_spouse
+        first_death_idx = min(filer_death_year_idx, spouse_death_year_idx)
+        filer_dies_first = filer_death_year_idx <= spouse_death_year_idx
+    else:
+        total_retire_years = retire_years_filer
+        first_death_idx = None
+        filer_dies_first = None
+
+    for i in range(total_retire_years + 1):
         age = retire_age + i
         spouse_age_now = (spouse_age_at_retire + i) if spouse_age_at_retire else age
         year = retire_year + i
         inf_factor = (1 + inflation) ** i
+        bracket_inf = (1 + bracket_growth) ** i
+        medicare_inf = (1 + medicare_growth) ** i
         filer_65 = age >= 65
         spouse_65 = (spouse_age_now >= 65) if spouse_age_at_retire else False
 
@@ -1341,23 +1425,53 @@ def run_retirement_projection(balances, params, spending_order):
 
         expenses = living_exp + mtg_pmt + yr_future_exp
 
+        # Charitable giving as real spending
+        yr_charitable = base_charitable * inf_factor
+        expenses += yr_charitable
+
+        # Survivor mode: reduce spending after first spouse death
+        _survivor_mode = first_death_idx is not None and i >= first_death_idx
+        # Filing status: year of death can still file joint; year AFTER switches to single
+        if first_death_idx is not None and i > first_death_idx and is_joint:
+            _yr_filing_status = "Single"
+            _yr_filer_65 = (age >= 65) if not filer_dies_first else (spouse_age_now >= 65 if spouse_age_at_retire else False)
+            _yr_spouse_65 = False
+        else:
+            _yr_filing_status = filing_status
+            _yr_filer_65 = filer_65
+            _yr_spouse_65 = spouse_65
+        if _survivor_mode:
+            expenses *= survivor_spending_pct
+
         # SS: fra values are in retirement-year dollars; inf_factor continues COLA from there
         # SSDI: already receiving at 100% PIA, just apply inflation
-        ss_filer = 0.0
+        ss_filer_calc = 0.0
         if ss_filer_fra > 0:
             if ssdi_filer_flag:
-                ss_filer = ss_filer_fra * inf_factor
+                ss_filer_calc = ss_filer_fra * inf_factor
             elif age >= ss_filer_claim_age:
-                ss_filer = ss_filer_fra * ss_claim_factor(ss_filer_claim_age) * inf_factor
+                ss_filer_calc = ss_filer_fra * ss_claim_factor(ss_filer_claim_age) * inf_factor
 
-        ss_spouse = 0.0
+        ss_spouse_calc = 0.0
         if ss_spouse_fra > 0:
             if ssdi_spouse_flag:
-                ss_spouse = ss_spouse_fra * inf_factor
+                ss_spouse_calc = ss_spouse_fra * inf_factor
             elif spouse_age_now >= ss_spouse_claim_age:
-                ss_spouse = ss_spouse_fra * ss_claim_factor(ss_spouse_claim_age) * inf_factor
+                ss_spouse_calc = ss_spouse_fra * ss_claim_factor(ss_spouse_claim_age) * inf_factor
 
-        gross_ss = max(0, ss_filer) + max(0, ss_spouse)
+        # Survivor SS: survivor gets the higher of the two benefits
+        if _survivor_mode:
+            if filer_dies_first:
+                ss_filer_now = 0.0
+                ss_spouse_now = max(ss_spouse_calc, ss_filer_calc)
+            else:
+                ss_spouse_now = 0.0
+                ss_filer_now = max(ss_filer_calc, ss_spouse_calc)
+        else:
+            ss_filer_now = ss_filer_calc
+            ss_spouse_now = ss_spouse_calc
+
+        gross_ss = max(0, ss_filer_now) + max(0, ss_spouse_now)
 
         # Pensions: each has its own start age and COLA
         pen_filer_income = 0.0
@@ -1369,6 +1483,13 @@ def run_retirement_projection(balances, params, spending_order):
         if pen_spouse > 0 and spouse_age_now >= pen_spouse_start:
             yrs_receiving_s = spouse_age_now - pen_spouse_start
             pen_spouse_income = pen_spouse * ((1 + pen_spouse_cola) ** yrs_receiving_s) if pen_spouse_cola > 0 else pen_spouse
+
+        # Survivor pension: apply survivor benefit percentage
+        if _survivor_mode:
+            if filer_dies_first:
+                pen_filer_income *= pension_survivor_pct
+            else:
+                pen_spouse_income *= pension_survivor_pct
 
         pen_income = pen_filer_income + pen_spouse_income
 
@@ -1427,34 +1548,51 @@ def run_retirement_projection(balances, params, spending_order):
         wd_hsa = 0.0
         yr_cap_gains = 0.0  # capital gains from brokerage sales
 
+        # QCD: direct IRA-to-charity transfer
+        yr_qcd = 0.0
+        qcd_beyond_rmd = 0.0
+        if base_qcd > 0 and age >= 70:
+            is_joint_yr = "joint" in _yr_filing_status.lower()
+            qcd_cap = (210000.0 if is_joint_yr else 105000.0) * inf_factor
+            yr_qcd_requested = min(base_qcd * inf_factor, qcd_cap)
+            qcd_within_rmd = min(yr_qcd_requested, rmd_amount)
+            qcd_beyond_rmd = max(0.0, yr_qcd_requested - rmd_amount)
+            avail_pt = bal_pt - wd_pretax  # after RMD
+            qcd_beyond_rmd = min(qcd_beyond_rmd, max(0.0, avail_pt))
+            yr_qcd = qcd_within_rmd + qcd_beyond_rmd
+
+        # QCD adjustments
+        yr_qcd_cash_offset = min(yr_qcd, rmd_amount)  # QCD within RMD reduces spendable cash
+        expenses -= yr_qcd  # QCD satisfies this portion of charitable spending directly from IRA
+
         # Roth conversion (after RMD, before waterfall)
         conversion_this_year = 0.0
         conv_tax_withheld = 0.0  # portion of conversion tax paid from the conversion itself
         conv_tax_total = 0.0  # total incremental tax from conversion
         if do_conversions and age < conv_stop_age:
-            avail_pretax = max(0, bal_pt - wd_pretax)  # what's left after RMD
+            avail_pretax = max(0, bal_pt - wd_pretax - qcd_beyond_rmd)  # what's left after RMD + QCD
             if avail_pretax > 0:
                 yr_taxable_other = yr_other_income if not ret_other_income_tax_free else 0.0
                 if conv_strategy == "fill_to_target":
-                    # Estimate current taxable income before conversion
-                    base_income = wd_pretax + pen_income + yr_inherited_dist + inv_ordinary_income + inv_cap_gains_income + yr_taxable_other
+                    # Estimate current taxable income before conversion (QCD portion excluded)
+                    base_income = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + inv_ordinary_income + inv_cap_gains_income + yr_taxable_other
                     est_taxable_ss = gross_ss * 0.85  # conservative: assume 85% taxable
-                    room = max(0, conv_target_agi * inf_factor - base_income - est_taxable_ss)
+                    room = max(0, conv_target_agi * bracket_inf - base_income - est_taxable_ss)
                     conversion_this_year = min(room, avail_pretax)
                 else:
                     conversion_this_year = min(float(conv_strategy), avail_pretax)
 
                 # Tax on conversion: withhold from conversion if no other source to pay
                 if conversion_this_year > 0:
-                    _no_conv_pretax_inc = wd_pretax + pen_income + yr_inherited_dist + yr_taxable_other
+                    _no_conv_pretax_inc = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + yr_taxable_other
                     _no_conv_tax = calc_year_taxes(gross_ss, _no_conv_pretax_inc,
                                                     inv_cap_gains_income, inv_ordinary_income,
-                                                    filing_status, filer_65, spouse_65,
-                                                    inf_factor, state_rate)["total_tax"]
+                                                    _yr_filing_status, _yr_filer_65, _yr_spouse_65,
+                                                    bracket_inf, state_rate)["total_tax"]
                     _with_conv_tax = calc_year_taxes(gross_ss, _no_conv_pretax_inc + conversion_this_year,
                                                      inv_cap_gains_income, inv_ordinary_income,
-                                                     filing_status, filer_65, spouse_65,
-                                                     inf_factor, state_rate)["total_tax"]
+                                                     _yr_filing_status, _yr_filer_65, _yr_spouse_65,
+                                                     bracket_inf, state_rate)["total_tax"]
                     _conv_tax_cost = _with_conv_tax - _no_conv_tax
                     conv_tax_total = _conv_tax_cost
                     # Available external funding: surplus income + taxable accounts
@@ -1472,18 +1610,24 @@ def run_retirement_projection(balances, params, spending_order):
 
         bal_tx = bal_brokerage + bal_cash  # for withdrawal limit tracking
 
+        yr_medicare = 0.0
         for iteration in range(20):
             # Compute cap gains: gains from brokerage sales + dividend income
             total_cap_gains = yr_cap_gains + inv_cap_gains_income
             yr_taxable_other = yr_other_income if not ret_other_income_tax_free else 0.0
-            pretax_income = wd_pretax + pen_income + yr_inherited_dist + yr_taxable_other + conversion_this_year
+            pretax_income = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + yr_taxable_other + conversion_this_year
             tax_result = calc_year_taxes(gross_ss, pretax_income, total_cap_gains,
-                                         inv_ordinary_income, filing_status,
-                                         filer_65, spouse_65, inf_factor, state_rate)
+                                         inv_ordinary_income, _yr_filing_status,
+                                         _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate)
             taxes = tax_result["total_tax"]
-            cash_needed = expenses + taxes - conv_tax_withheld  # withheld portion already paid from conversion
+            # Medicare premiums (based on AGI, applies when 65+)
+            if _yr_filer_65:
+                yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf)
+            else:
+                yr_medicare = 0.0
+            cash_needed = expenses + taxes + yr_medicare - conv_tax_withheld  # withheld portion already paid from conversion
             wd_taxable = wd_cash + wd_brokerage
-            cash_available = fixed_cash + wd_pretax + wd_taxable + wd_roth + wd_hsa
+            cash_available = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_taxable + wd_roth + wd_hsa
             shortfall = cash_needed - cash_available
 
             if shortfall <= 1.0:
@@ -1537,20 +1681,25 @@ def run_retirement_projection(balances, params, spending_order):
         # Final tax calc with settled withdrawals
         total_cap_gains = yr_cap_gains + inv_cap_gains_income
         yr_taxable_other = yr_other_income if not ret_other_income_tax_free else 0.0
-        pretax_income = wd_pretax + pen_income + yr_inherited_dist + yr_taxable_other + conversion_this_year
+        pretax_income = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + yr_taxable_other + conversion_this_year
         tax_result = calc_year_taxes(gross_ss, pretax_income, total_cap_gains,
-                                     inv_ordinary_income, filing_status,
-                                     filer_65, spouse_65, inf_factor, state_rate)
+                                     inv_ordinary_income, _yr_filing_status,
+                                     _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate)
         taxes = tax_result["total_tax"]
+        if _yr_filer_65:
+            yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf)
+        else:
+            yr_medicare = 0.0
         wd_taxable = wd_cash + wd_brokerage
 
-        # Surplus: income exceeds expenses + taxes → reinvest
-        cash_available_final = fixed_cash + wd_pretax + wd_cash + wd_brokerage + wd_roth + wd_hsa
-        cash_needed_final = expenses + taxes - conv_tax_withheld
+        # Surplus: income exceeds expenses + taxes + medicare → reinvest
+        cash_available_final = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_cash + wd_brokerage + wd_roth + wd_hsa
+        cash_needed_final = expenses + taxes + yr_medicare - conv_tax_withheld
         yr_surplus = max(0.0, cash_available_final - cash_needed_final)
 
         # Update balances
         bal_pt -= wd_pretax
+        bal_pt -= qcd_beyond_rmd  # additional IRA withdrawal for QCD beyond RMD
         # Reduce brokerage basis proportionally to withdrawal
         if wd_brokerage > 0 and bal_brokerage > 0:
             basis_reduction = brokerage_basis * (wd_brokerage / bal_brokerage)
@@ -1568,7 +1717,7 @@ def run_retirement_projection(balances, params, spending_order):
                 bal_brokerage += yr_surplus
                 brokerage_basis += yr_surplus
 
-        total_taxes_paid += taxes
+        total_taxes_paid += taxes + yr_medicare
 
         # Growth
         yr_return = return_sequence[i] if return_sequence else post_return
@@ -1613,12 +1762,33 @@ def run_retirement_projection(balances, params, spending_order):
 
         row = {
             "Year": year, "Age": age,
+        }
+        if spouse_age_at_retire is not None:
+            row["Spouse Age"] = spouse_age_now
+        if first_death_idx is not None:
+            if i == first_death_idx:
+                row["Status"] = "1st Death"
+            elif _survivor_mode:
+                row["Status"] = "Survivor"
+            else:
+                row["Status"] = ""
+        row.update({
             "SS Income": round(gross_ss, 0), "Pension": round(pen_income, 0),
             "Other Income": round(yr_other_income, 0),
             "Dividends": round(yr_dividends, 0),
             "Interest": round(yr_cash_interest, 0),
+        })
+        if balances["pretax"] > 0:
+            row["RMD"] = round(rmd_amount, 0)
+            row["QCD"] = round(yr_qcd, 0)
+            row["W/D Pre-Tax"] = round(max(0, wd_pretax - rmd_amount), 0)
+        row.update({
             "W/D Taxable": round(wd_taxable, 0),
             "W/D Roth": round(wd_roth, 0), "W/D HSA": round(wd_hsa, 0),
+        })
+        if any(ira["balance"] > 0 for ira in ret_inherited_iras):
+            row["Inherited Dist"] = round(yr_inherited_dist, 0)
+        row.update({
             "Realized CG": round(yr_cap_gains, 0),
             "Conv Gross": round(conversion_this_year, 0),
             "Conv Tax": round(conv_tax_total, 0),
@@ -1628,21 +1798,23 @@ def run_retirement_projection(balances, params, spending_order):
             "Total Exp": round(expenses, 0),
             "Fed Tax": round(tax_result["fed_tax"], 0),
             "State Tax": round(tax_result["state_tax"], 0),
-            "Total Tax": round(taxes, 0),
-            "Bal Taxable": round(bal_tx, 0),
-            "Bal Roth": round(bal_ro, 0), "Bal HSA": round(bal_hs, 0),
-        }
+            "Medicare": round(yr_medicare, 0),
+            "Total Tax": round(taxes + yr_medicare, 0),
+        })
         if balances["pretax"] > 0:
             row["Bal Pre-Tax"] = round(bal_pt, 0)
-            row["RMD"] = round(rmd_amount, 0)
-            row["W/D Pre-Tax"] = round(max(0, wd_pretax - rmd_amount), 0)
+        row.update({
+            "Bal Taxable": round(bal_tx, 0),
+            "Bal Roth": round(bal_ro, 0), "Bal HSA": round(bal_hs, 0),
+        })
         if any(ira["balance"] > 0 for ira in ret_inherited_iras):
-            row["Inherited Dist"] = round(yr_inherited_dist, 0)
             row["Bal Inherited"] = round(bal_inherited_total, 0)
-        row["Portfolio"] = round(total_bal, 0)
-        row["Home Value"] = round(curr_home_val, 0)
-        row["Gross Estate"] = round(gross_estate, 0)
-        row["Estate (Net)"] = round(after_tax_estate, 0)
+        row.update({
+            "Portfolio": round(total_bal, 0),
+            "Home Value": round(curr_home_val, 0),
+            "Gross Estate": round(gross_estate, 0),
+            "Estate (Net)": round(after_tax_estate, 0),
+        })
         rows.append(row)
 
     bal_inherited_final = sum(ret_iira_bals)
@@ -1663,10 +1835,6 @@ def run_retirement_projection(balances, params, spending_order):
 
 
 # ========== UI ==========
-if not st.session_state.get("authenticated"):
-    st.warning("Please log in from the home page.")
-    st.stop()
-
 st.title("Retirement Estimator – Accumulation Phase")
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["Current Situation", "Savings Plan", "Projection", "Retirement Readiness", "Roth Conversion"])
 
@@ -1718,11 +1886,17 @@ with st.sidebar:
     else:
         spouse_retirement_age = target_retirement_age
         spouse_years_to_retirement = years_to_retirement
-    life_expectancy = st.number_input("Plan Through Age", min_value=80, max_value=100, value=95, step=1, key="life_exp")
+    life_expectancy = st.number_input("Your Plan Through Age", min_value=80, max_value=100, value=95, step=1, key="life_exp")
+    if is_joint and spouse_age is not None:
+        spouse_life_expectancy = st.number_input("Spouse Plan Through Age", min_value=80, max_value=100, value=95, step=1, key="spouse_life_exp")
+    else:
+        spouse_life_expectancy = None
 
     st.divider()
     st.header("Assumptions")
-    inflation = st.number_input("Inflation Rate", value=0.03, step=0.005, format="%.3f", key="inflation")
+    inflation = st.number_input("Inflation / SS COLA (CPI-W)", value=0.03, step=0.005, format="%.3f", key="inflation")
+    bracket_growth = st.number_input("Tax Bracket Growth (CPI)", value=0.020, step=0.001, format="%.3f", key="bracket_growth")
+    medicare_growth = st.number_input("Medicare Premium Growth", value=0.050, step=0.005, format="%.3f", key="medicare_growth")
     pre_retire_return = st.number_input("Pre-Retirement Return", value=0.07, step=0.005, format="%.3f", key="pre_ret_return")
     post_retire_return = st.number_input("Post-Retirement Return", value=0.05, step=0.005, format="%.3f", key="post_ret_return")
     salary_growth = st.number_input("Annual Salary Growth", value=0.02, step=0.005, format="%.3f", key="salary_growth")
@@ -1951,7 +2125,7 @@ with tab1:
                         _rec = calc_inherited_ira_recommendation(
                             inherited_ira_filer, inherited_ira_years_filer, current_age,
                             inherited_ira_rmd_required_filer, total_income, filing_status,
-                            state_rate=state_tax_rate, growth_rate=pre_retire_return)
+                            state_rate=state_tax_rate, growth_rate=pre_retire_return, inflation=bracket_growth)
                         if _rec:
                             st.markdown("---")
                             st.markdown(f"**Distribution Recommendation:** Fill to top of {_rec['target_bracket_rate']:.0%} bracket")
@@ -1985,7 +2159,7 @@ with tab1:
                     _lt_rec = calc_inherited_ira_recommendation(
                         inherited_ira_filer, 0, current_age,
                         True, total_income, filing_status,
-                        state_rate=state_tax_rate, growth_rate=pre_retire_return, rule="lifetime", horizon_years=_lt_horizon)
+                        state_rate=state_tax_rate, growth_rate=pre_retire_return, inflation=bracket_growth, rule="lifetime", horizon_years=_lt_horizon)
                     if _lt_rec:
                         st.markdown("---")
                         st.markdown(f"**Distribution Recommendation:** Fill to top of {_lt_rec['target_bracket_rate']:.0%} bracket")
@@ -2044,7 +2218,7 @@ with tab1:
                             _sp_rec = calc_inherited_ira_recommendation(
                                 inherited_ira_spouse, inherited_ira_years_spouse, spouse_age or current_age,
                                 inherited_ira_rmd_required_spouse, total_income, filing_status,
-                                state_rate=state_tax_rate, growth_rate=pre_retire_return)
+                                state_rate=state_tax_rate, growth_rate=pre_retire_return, inflation=bracket_growth)
                             if _sp_rec:
                                 st.markdown("---")
                                 st.markdown(f"**Spouse Distribution Recommendation:** Fill to top of {_sp_rec['target_bracket_rate']:.0%} bracket")
@@ -2078,7 +2252,7 @@ with tab1:
                         _sp_lt_rec = calc_inherited_ira_recommendation(
                             inherited_ira_spouse, 0, _sp_age,
                             True, total_income, filing_status,
-                            state_rate=state_tax_rate, growth_rate=pre_retire_return, rule="lifetime", horizon_years=_sp_lt_horizon)
+                            state_rate=state_tax_rate, growth_rate=pre_retire_return, inflation=bracket_growth, rule="lifetime", horizon_years=_sp_lt_horizon)
                         if _sp_lt_rec:
                             st.markdown("---")
                             st.markdown(f"**Spouse Distribution Recommendation:** Fill to top of {_sp_lt_rec['target_bracket_rate']:.0%} bracket")
@@ -2257,12 +2431,16 @@ with tab1:
             _opt_base_params = {
                 "retire_age": target_retirement_age,
                 "life_expectancy": _opt_life_exp,
+                "filer_life_expectancy": _opt_life_exp,
+                "spouse_life_expectancy": spouse_life_expectancy,
+                "survivor_spending_pct": st.session_state.get("survivor_spend_pct", 100),
+                "pension_survivor_pct": st.session_state.get("pension_survivor_pct", 100),
                 "retire_year": dt.date.today().year + years_to_retirement,
                 "inflation": inflation,
                 "post_retire_return": post_retire_return,
                 "filing_status": filing_status,
                 "state_tax_rate": state_tax_rate,
-                "expenses_at_retirement": current_living_expenses * 0.8 * _opt_inf_retire,
+                "expenses_at_retirement": current_living_expenses * (st.session_state.get("ret_pct", 100) / 100) * _opt_inf_retire,
                 "ss_filer_fra": ss_filer_final * _opt_inf_retire,
                 "ss_spouse_fra": ss_spouse_final * _opt_inf_retire,
                 "ss_filer_claim_age": 67,  # placeholder, overridden by optimizer
@@ -2664,12 +2842,21 @@ with tab2:
         help="In years where total outflow exceeds income, how should the projection handle the shortfall?")
 
     st.divider()
+    st.markdown("### Charitable Giving")
+    charitable = st.number_input("Annual Charitable Contributions", value=0.0, step=500.0, key="charitable")
+    qcd_annual = st.number_input("Qualified Charitable Distribution (QCD)", value=0.0, step=500.0, key="qcd_annual",
+        help="Direct IRA-to-charity transfer. Age 70½+, up to $105k/person. Excluded from income.")
+    if qcd_annual > charitable:
+        st.warning("QCD cannot exceed total charitable giving")
+        qcd_annual = charitable
+
+    st.divider()
     st.markdown("### Deductions")
     itemize_deductions = st.checkbox("Itemize deductions (instead of standard deduction)", key="itemize_ded",
         help="Check if your itemized deductions exceed the standard deduction.")
     property_tax = 0.0
     medical_expenses = 0.0
-    charitable = 0.0
+    _yr_charitable_ded = max(0.0, charitable - qcd_annual)
     if itemize_deductions:
         _curr_mtg_interest, _ = calc_mortgage_interest_for_year(mortgage_balance, mortgage_rate, mortgage_payment_annual)
         # Estimate state tax for SALT display
@@ -2684,10 +2871,9 @@ with tab2:
             st.write(f"**Mortgage interest:** {money(_curr_mtg_interest)}")
             medical_expenses = st.number_input("Annual Medical Expenses", value=0.0, step=500.0, key="medical_exp",
                 help="Only the amount exceeding 7.5% of AGI is deductible")
-            charitable = st.number_input("Annual Charitable Contributions", value=0.0, step=500.0, key="charitable")
-        # Compute itemized total
+        # Compute itemized total (charitable deduction excludes QCD portion — no double-dipping)
         _medical_ded = max(0.0, medical_expenses - _curr_agi * 0.075)
-        _itemized_total = _salt + _curr_mtg_interest + _medical_ded + charitable
+        _itemized_total = _salt + _curr_mtg_interest + _medical_ded + _yr_charitable_ded
         st.write(f"**Itemized total:** {money(_itemized_total)}  |  **Standard deduction:** {money(_curr_std_ded)}")
         if _itemized_total > _curr_std_ded:
             st.success(f"Itemizing saves {money(_itemized_total - _curr_std_ded)} in deductions")
@@ -2703,7 +2889,7 @@ with tab2:
         _est_state_tax = calc_state_tax(max(0, _curr_agi - _curr_std_ded), state_tax_rate)
         _salt = min(10000.0, _est_state_tax + property_tax)
         _medical_ded = max(0.0, medical_expenses - _curr_agi * 0.075)
-        _itemized_total = _salt + _curr_mtg_interest + _medical_ded + charitable
+        _itemized_total = _salt + _curr_mtg_interest + _medical_ded + _yr_charitable_ded
         if _itemized_total > _curr_std_ded:
             _curr_deduction = _itemized_total
 
@@ -2796,6 +2982,8 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
     st_rate = income_info.get("state_rate", 0.05) if income_info else 0.05
     pretax_deductions = income_info.get("pretax_deductions", 0) if income_info else 0
     inf_rate = income_info.get("inflation", 0.03) if income_info else 0.03
+    bracket_growth_rate = income_info.get("bracket_growth", inf_rate) if income_info else inf_rate
+    medicare_growth_rate = income_info.get("medicare_growth", inf_rate) if income_info else inf_rate
     fut_expenses = income_info.get("future_expenses", []) if income_info else []
     div_yield = income_info.get("dividend_yield", 0.015) if income_info else 0.015
     ann_cg_pct = income_info.get("annual_cap_gain_pct", 0.0) if income_info else 0.0
@@ -2860,6 +3048,8 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         is_retire_year = (age == retire_age_accum) and years_to_ret > 0
         sf = (1 + salary_growth_rate) ** yr if yr > 0 else 1.0
         inf_f = (1 + inf_rate) ** yr
+        bracket_inf_f = (1 + bracket_growth_rate) ** yr
+        medicare_inf_f = (1 + medicare_growth_rate) ** yr
 
         # Spouse age for this year
         spouse_age_yr = (accum_spouse_age + yr) if accum_spouse_age else age
@@ -2975,7 +3165,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
                 _est_base = _est_taxable_wages + yr_cash_interest + yr_inherited_dist + yr_dividends + yr_cap_gain_dist + _est_other_taxable
                 _est_taxable_ss = yr_ss * 0.85
                 _est_agi = _est_base + _est_taxable_ss
-                room = max(0, accum_conv_target_agi * inf_f - _est_agi)
+                room = max(0, accum_conv_target_agi * bracket_inf_f - _est_agi)
                 accum_conversion_this_year = min(room, bal_pretax)
             else:
                 accum_conversion_this_year = min(float(accum_conv_strategy), bal_pretax)
@@ -2989,10 +3179,10 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
                 _ac_sp65 = spouse_age_yr >= 65 if accum_spouse_age else False
                 _ac_no_conv_tax = calc_year_taxes(yr_ss, _ac_pretax_inc, _ac_cg_inc,
                                                    yr_cash_interest, filing, _ac_filer65, _ac_sp65,
-                                                   inf_f, st_rate)["total_tax"]
+                                                   bracket_inf_f, st_rate)["total_tax"]
                 _ac_with_conv_tax = calc_year_taxes(yr_ss, _ac_pretax_inc + accum_conversion_this_year,
                                                      _ac_cg_inc, yr_cash_interest, filing,
-                                                     _ac_filer65, _ac_sp65, inf_f, st_rate)["total_tax"]
+                                                     _ac_filer65, _ac_sp65, bracket_inf_f, st_rate)["total_tax"]
                 _ac_conv_tax = _ac_with_conv_tax - _ac_no_conv_tax
                 accum_conv_tax_total = _ac_conv_tax
                 # Available external funding: surplus income + taxable accounts
@@ -3021,7 +3211,10 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         taxable_ss = calc_taxable_ss(pretax_for_ss, yr_ss, filing)
         total_ordinary = taxable_wages + yr_ordinary_inv_income + yr_inherited_dist + yr_taxable_other + taxable_ss + accum_conversion_this_year
         yr_agi = total_ordinary + yr_cap_gain_income
-        std_ded = get_std_deduction(filing, filer_65, spouse_65_yr, inf_f)
+        std_ded = get_std_deduction(filing, filer_65, spouse_65_yr, bracket_inf_f)
+
+        # Charitable spending (always a real expense, even if not itemizing)
+        yr_charitable = base_charitable * inf_f
 
         # Determine deduction: itemized vs standard
         deduction = std_ded
@@ -3029,10 +3222,9 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             yr_mtg_interest, mtg_bal_end = calc_mortgage_interest_for_year(mtg_bal_track, mtg_rate, base_mortgage)
             est_state_tax = calc_state_tax(max(0, yr_agi - std_ded), st_rate)
             yr_property_tax = base_property_tax * inf_f
-            salt = min(10000.0 * inf_f, est_state_tax + yr_property_tax)
+            salt = min(10000.0 * bracket_inf_f, est_state_tax + yr_property_tax)
             yr_medical = base_medical * inf_f
             medical_ded = max(0.0, yr_medical - yr_agi * 0.075)
-            yr_charitable = base_charitable * inf_f
             itemized = salt + yr_mtg_interest + medical_ded + yr_charitable
             if itemized > std_ded:
                 deduction = itemized
@@ -3042,8 +3234,8 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             _, mtg_bal_track = calc_mortgage_interest_for_year(mtg_bal_track, mtg_rate, base_mortgage)
 
         ordinary_taxable = max(0, total_ordinary - deduction)
-        fed_tax = calc_federal_tax(ordinary_taxable, filing, inf_f)
-        fed_tax += calc_cg_tax(yr_cap_gain_income, ordinary_taxable, filing, inf_f)
+        fed_tax = calc_federal_tax(ordinary_taxable, filing, bracket_inf_f)
+        fed_tax += calc_cg_tax(yr_cap_gain_income, ordinary_taxable, filing, bracket_inf_f)
         state_tax = calc_state_tax(max(0, yr_agi - deduction), st_rate)
         # FICA: SS 6.2% (up to wage base per worker) + Medicare 1.45% + Additional Medicare 0.9%
         yr_wages_filer = base_salary_filer * sf * work_frac
@@ -3052,7 +3244,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         yr_taxes = fed_tax + state_tax + yr_fica
 
         # Non-savings expenses (subtract any conversion tax already withheld from the conversion)
-        yr_fixed_expenses = yr_living + yr_mortgage + yr_future_exp + yr_taxes - accum_conv_tax_withheld
+        yr_fixed_expenses = yr_living + yr_mortgage + yr_future_exp + yr_charitable + yr_taxes - accum_conv_tax_withheld
         total_planned_contrib = c_pretax_plan + c_roth_plan + c_taxable_plan + c_cash_plan + c_hsa_plan
         yr_surplus = yr_income + yr_inherited_dist - yr_fixed_expenses - total_planned_contrib
 
@@ -3243,6 +3435,8 @@ _income_info = {
     "state_rate": state_tax_rate,
     "pretax_deductions": _pretax_deductions,
     "inflation": inflation,
+    "bracket_growth": bracket_growth,
+    "medicare_growth": medicare_growth,
     "future_expenses": future_expenses,
     "current_age": current_age,
     "dividend_yield": dividend_yield,
@@ -3256,6 +3450,7 @@ _income_info = {
     "property_tax": property_tax,
     "medical_expenses": medical_expenses,
     "charitable": charitable,
+    "qcd_annual": qcd_annual,
     "ss_filer_pia": ss_filer_final,
     "ss_spouse_pia": ss_spouse_final,
     "ss_filer_claim_age": ss_filer_claim_age,
@@ -3310,13 +3505,17 @@ with tab3:
             with col5: st.metric("Total", money(final["Total Balance"]))
 
         # Retirement params builder (shared by MC and Savings Vehicle Optimizer)
-        _opt_retire_exp = current_living_expenses * 0.80 * ((1 + inflation) ** years_to_retirement)
+        _opt_retire_exp = current_living_expenses * (st.session_state.get("ret_pct", 100) / 100) * ((1 + inflation) ** years_to_retirement)
         _opt_inf_retire = (1 + inflation) ** years_to_retirement
 
         def _opt_retire_params(accum_inherited_state=None):
             return {
                 "retire_age": target_retirement_age,
                 "life_expectancy": life_expectancy,
+                "filer_life_expectancy": life_expectancy,
+                "spouse_life_expectancy": spouse_life_expectancy,
+                "survivor_spending_pct": st.session_state.get("survivor_spend_pct", 100),
+                "pension_survivor_pct": st.session_state.get("pension_survivor_pct", 100),
                 "retire_year": dt.date.today().year + years_to_retirement,
                 "inflation": inflation,
                 "post_retire_return": post_retire_return,
@@ -3347,6 +3546,8 @@ with tab3:
                 "future_expenses": future_expenses,
                 "dividend_yield": dividend_yield,
                 "cash_interest_rate": cash_interest_rate,
+                "charitable": charitable,
+                "qcd_annual": qcd_annual,
                 "inherited_iras": accum_inherited_state or [],
             }
 
@@ -3363,7 +3564,10 @@ with tab3:
 
         if _mc3_run:
             import copy as _mc3_copy
-            _mc3_n_years = years_to_retirement + (life_expectancy - target_retirement_age) + 1
+            _mc3_retire_yrs = life_expectancy - target_retirement_age
+            if spouse_life_expectancy and spouse_age is not None:
+                _mc3_retire_yrs = max(_mc3_retire_yrs, spouse_life_expectancy - (spouse_age + years_to_retirement))
+            _mc3_n_years = years_to_retirement + _mc3_retire_yrs + 1
             _mc3_seed = 42
 
             def _mc3_run_fn_current(return_seq):
@@ -3377,6 +3581,7 @@ with tab3:
                                          _contrib_dict, salary_growth, pre_retire_return, ii)
                 ar = accum["rows"]
                 af = ar[-1]
+                retire_portfolio = float(af["Total Balance"])
                 bals = {
                     "pretax": float(af["Bal Pre-Tax"]),
                     "roth": float(af["Bal Roth"]),
@@ -3388,24 +3593,35 @@ with tab3:
                 }
                 rp = _mc3_copy.deepcopy(_opt_retire_params(accum.get("inherited_iras_state", [])))
                 rp["return_sequence"] = retire_seq
-                return run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                result = run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                result["retire_portfolio"] = retire_portfolio
+                return result
 
             _mc3_progress = st.progress(0, text="Running Monte Carlo on current plan...")
             _mc3_result_current = run_monte_carlo(
                 _mc3_run_fn_current, n_sims=int(_mc3_nsims),
                 mean_return=pre_retire_return, return_std=_mc3_std,
-                n_years=_mc3_n_years, seed=_mc3_seed)
+                n_years=_mc3_n_years, seed=_mc3_seed,
+                mean_return_post=post_retire_return,
+                n_years_pre=years_to_retirement + 1)
             _mc3_progress.progress(100, text="Monte Carlo complete")
             _mc3_progress.empty()
 
             with _mc3_c2: st.metric("Success Rate", f"{_mc3_result_current['success_rate']:.0%}")
 
             st.markdown("#### Current Plan — Monte Carlo Results")
+            if "retire_median" in _mc3_result_current:
+                st.markdown("**Portfolio at Retirement**")
+                _mc3r1, _mc3r2, _mc3r3 = st.columns(3)
+                with _mc3r1: st.metric("Median", money(_mc3_result_current["retire_median"]))
+                with _mc3r2: st.metric("10th Percentile", money(_mc3_result_current["retire_p10"]))
+                with _mc3r3: st.metric("90th Percentile", money(_mc3_result_current["retire_p90"]))
+            st.markdown("**Estate at Death**")
             _mc3m1, _mc3m2, _mc3m3 = st.columns(3)
             with _mc3m1: st.metric("Median Estate", money(_mc3_result_current["median_estate"]))
             with _mc3m2: st.metric("10th Percentile", money(_mc3_result_current["p10"]))
             with _mc3m3: st.metric("90th Percentile", money(_mc3_result_current["p90"]))
-            st.caption(f"Based on {int(_mc3_nsims)} simulations, mean return {pre_retire_return:.1%}, std dev {_mc3_std:.1%}")
+            st.caption(f"Based on {int(_mc3_nsims)} simulations, pre-retire return {pre_retire_return:.1%}, post-retire return {post_retire_return:.1%}, std dev {_mc3_std:.1%}")
 
         # ── Savings Vehicle Optimizer ──
         st.divider()
@@ -3675,6 +3891,7 @@ with tab3:
                                                  cd, salary_growth, pre_retire_return, ii_mod)
                         ar = accum["rows"]
                         af = ar[-1]
+                        retire_portfolio = float(af["Total Balance"])
                         bals = {
                             "pretax": float(af["Bal Pre-Tax"]),
                             "roth": float(af["Bal Roth"]),
@@ -3686,14 +3903,18 @@ with tab3:
                         }
                         rp = _mc3o_copy.deepcopy(_opt_retire_params(accum.get("inherited_iras_state", [])))
                         rp["return_sequence"] = retire_seq
-                        return run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                        result = run_retirement_projection(bals, rp, ["Pre-Tax", "Taxable", "Tax-Free"])
+                        result["retire_portfolio"] = retire_portfolio
+                        return result
                     return _run_fn
 
                 _mc3o_fn = _mc3o_make_run_fn(_mc3o_cd_local, _mc3o_ii_local)
                 _mc3o_mc = run_monte_carlo(
                     _mc3o_fn, n_sims=int(_mc3_nsims),
                     mean_return=pre_retire_return, return_std=_mc3_std,
-                    n_years=_mc3_n_years, seed=_mc3_seed)
+                    n_years=_mc3_n_years, seed=_mc3_seed,
+                    mean_return_post=post_retire_return,
+                    n_years_pre=years_to_retirement + 1)
                 _mc3o_done += int(_mc3_nsims)
                 _mc3o_progress.progress(min(100, int(_mc3o_done / _mc3o_total * 100)),
                                          text=f"Completed {_mc3o_label}...")
@@ -3753,11 +3974,20 @@ with tab4:
     col1, col2 = st.columns(2)
     with col1:
         st.write(f"**Current living expenses (from Tab 1):** {money(current_living_expenses)}")
-        retirement_pct = st.slider("% of Current Expenses in Retirement", 70, 100, 80, key="ret_pct")
+        retirement_pct = st.slider("% of Current Expenses in Retirement", 70, 100, 100, key="ret_pct")
         retirement_expenses = current_living_expenses * retirement_pct / 100
         inflated_expenses = retirement_expenses * ((1 + inflation) ** years_to_retirement)
         st.write(f"**Retirement expenses (today's $):** {money(retirement_expenses)}")
         st.write(f"**Year 1 of retirement (future $):** {money(inflated_expenses)}")
+
+        if is_joint:
+            st.divider()
+            st.markdown("**Survivor Assumptions** (after first spouse death)")
+            survivor_spending_pct = st.slider("Survivor Spending % (after first death)", 50, 100, 80, key="survivor_spend_pct")
+            pension_survivor_pct = st.slider("Pension Survivor Benefit %", 0, 100, 50, key="pension_survivor_pct")
+        else:
+            survivor_spending_pct = 100
+            pension_survivor_pct = 0
 
         if pension_filer_annual > 0 or pension_spouse_annual > 0:
             st.divider()
@@ -3843,6 +4073,10 @@ with tab4:
         return {
             "retire_age": target_retirement_age,
             "life_expectancy": life_expectancy,
+            "filer_life_expectancy": life_expectancy,
+            "spouse_life_expectancy": spouse_life_expectancy,
+            "survivor_spending_pct": survivor_spending_pct,
+            "pension_survivor_pct": pension_survivor_pct,
             "retire_year": dt.date.today().year + years_to_retirement,
             "inflation": inflation,
             "post_retire_return": post_retire_return,
@@ -3873,6 +4107,8 @@ with tab4:
             "future_expenses": future_expenses,
             "dividend_yield": dividend_yield,
             "cash_interest_rate": cash_interest_rate,
+            "charitable": charitable,
+            "qcd_annual": qcd_annual,
             "inherited_iras": _accum_result.get("inherited_iras_state", []),
             "surplus_destination": "none" if rr_surplus_dest == "Don't Reinvest" else ("cash" if rr_surplus_dest == "Cash/Savings" else "brokerage"),
             "heir_bracket_option": _bracket_map.get(rr_heir_bracket, "same"),
@@ -3914,7 +4150,8 @@ with tab4:
             if depleted:
                 st.error(f"Portfolio depleted at age {depleted['Age']} (year {depleted['Year']})")
             else:
-                st.success(f"Portfolio survives through age {life_expectancy} with {money(last['Portfolio'])} remaining")
+                _plan_age_desc = f"age {life_expectancy}" + (f" / spouse age {spouse_life_expectancy}" if spouse_life_expectancy else "")
+                st.success(f"Portfolio survives through {_plan_age_desc} with {money(last['Portfolio'])} remaining")
 
         st.session_state.retire_projection = result
 

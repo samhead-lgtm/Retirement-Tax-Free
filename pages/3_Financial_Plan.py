@@ -124,7 +124,7 @@ _FP_DEFAULTS = {
     "wages": 0.0, "tax_exempt_interest": 0.0, "other_income": 0.0,
 
     # --- Receiving: RMD ---
-    "auto_rmd": True,
+    "has_rmd": False, "auto_rmd": True,
     "pretax_bal_filer_prior": 0.0, "pretax_bal_spouse_prior": 0.0,
     "baseline_pretax_dist": 0.0, "rmd_manual": 0.0,
 
@@ -355,7 +355,9 @@ elif nav == "Growing":
             w_num("Employer match rate (%)", "ematch_rate_f", step=1.0, format="%.1f")
             w_num("Employer match up to (%)", "ematch_upto_f", step=1.0, format="%.1f")
             w_check("Backdoor Roth?", "backdoor_roth_f")
-            if not D["backdoor_roth_f"]:
+            if D["backdoor_roth_f"]:
+                w_num("Backdoor Roth amount", "contrib_roth_ira_f", step=500.0)
+            else:
                 w_check("Max IRA?", "max_ira_f")
                 if not D["max_ira_f"]:
                     w_num("Traditional IRA", "contrib_trad_ira_f", step=500.0)
@@ -370,7 +372,9 @@ elif nav == "Growing":
                 w_num("Employer match rate (%)", "ematch_rate_s", step=1.0, format="%.1f")
                 w_num("Employer match up to (%)", "ematch_upto_s", step=1.0, format="%.1f")
                 w_check("Backdoor Roth?", "backdoor_roth_s")
-                if not D["backdoor_roth_s"]:
+                if D["backdoor_roth_s"]:
+                    w_num("Backdoor Roth amount (Spouse)", "contrib_roth_ira_s", step=500.0)
+                else:
                     w_check("Max IRA?", "max_ira_s")
                     if not D["max_ira_s"]:
                         w_num("Traditional IRA (Spouse)", "contrib_trad_ira_s", step=500.0)
@@ -580,24 +584,29 @@ elif nav == "Receiving":
     st.subheader("Other Income")
     col1, col2 = st.columns(2)
     with col1:
-        w_num("Wages (if any)", "wages", step=1000.0)
+        if not D["is_working"]:
+            w_num("Wages (if any)", "wages", step=1000.0)
+        else:
+            st.info(f"Wages from salary: **{D['salary_filer'] + (D['salary_spouse'] if D.get('filing_status','') == 'Married Filing Jointly' else 0.0):,.0f}** (set on Planning tab)")
         w_num("Tax-exempt interest", "tax_exempt_interest", step=100.0)
     with col2:
         w_num("Other taxable income", "other_income", step=500.0)
 
     # --- RMD ---
     st.divider()
-    st.subheader("RMD Inputs")
-    col1, col2 = st.columns(2)
-    with col1:
-        w_check("Auto-calculate RMD", "auto_rmd")
-        w_num("Filer prior-year 12/31 pre-tax balance", "pretax_bal_filer_prior", step=1000.0)
-    with col2:
-        if is_joint:
-            w_num("Spouse prior-year 12/31 pre-tax balance", "pretax_bal_spouse_prior", step=1000.0)
-        w_num("Baseline pre-tax distributions", "baseline_pretax_dist", step=1000.0)
-        if not D["auto_rmd"]:
-            w_num("RMD manual override", "rmd_manual", step=1000.0)
+    w_check("Do you have an RMD? (e.g., inherited IRA)", "has_rmd")
+    if D["has_rmd"]:
+        st.subheader("RMD Inputs")
+        col1, col2 = st.columns(2)
+        with col1:
+            w_check("Auto-calculate RMD", "auto_rmd")
+            w_num("Filer prior-year 12/31 pre-tax balance", "pretax_bal_filer_prior", step=1000.0)
+        with col2:
+            if is_joint:
+                w_num("Spouse prior-year 12/31 pre-tax balance", "pretax_bal_spouse_prior", step=1000.0)
+            w_num("Baseline pre-tax distributions", "baseline_pretax_dist", step=1000.0)
+            if not D["auto_rmd"]:
+                w_num("RMD manual override", "rmd_manual", step=1000.0)
 
     # --- Tax Details ---
     st.divider()
@@ -728,10 +737,15 @@ elif nav == "Spending":
 elif nav == "Giving":
     st.header("Giving")
     w_num("Charitable contributions", "charitable", step=500.0)
-    w_num("Qualified Charitable Distribution (QCD)", "qcd_annual", step=500.0,
-          help="Direct IRA-to-charity transfer. Age 70½+, up to $105k/person. Counts toward RMD, excluded from income.")
-    if D["qcd_annual"] > D["charitable"]:
-        st.warning("QCD cannot exceed total charitable giving.")
+    _filer_dob_giving = D["filer_dob"]
+    if isinstance(_filer_dob_giving, str):
+        _filer_dob_giving = dt.date.fromisoformat(_filer_dob_giving)
+    _filer_age_giving = TEA.age_at_date(_filer_dob_giving, dt.date.today()) if _filer_dob_giving else 0
+    if _filer_age_giving >= 70:
+        w_num("Qualified Charitable Distribution (QCD)", "qcd_annual", step=500.0,
+              help="Direct IRA-to-charity transfer. Age 70½+, up to $105k/person. Counts toward RMD, excluded from income.")
+        if D["qcd_annual"] > D["charitable"]:
+            st.warning("QCD cannot exceed total charitable giving.")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -821,7 +835,8 @@ elif nav == "Achieving":
     annuity_basis = annuity_basis_filer + annuity_basis_spouse
 
     # Current-year tax inputs (from Receiving)
-    wages = D["wages"]
+    # If working, salary from Planning overrides manual wages on Receiving
+    wages = (D["salary_filer"] + (D["salary_spouse"] if is_joint else 0.0)) if D["is_working"] else D["wages"]
     tax_exempt_interest = D["tax_exempt_interest"]
     other_income = D["other_income"]
     interest_taxable = D["interest_taxable"]
@@ -892,11 +907,12 @@ elif nav == "Achieving":
         r_life = D["r_life"] / 100
 
     # RMD
-    auto_rmd = D["auto_rmd"]
-    pretax_balance_filer_prior = D["pretax_bal_filer_prior"]
-    pretax_balance_spouse_prior = D["pretax_bal_spouse_prior"] if is_joint else 0.0
-    baseline_pretax_distributions = D["baseline_pretax_dist"]
-    rmd_manual = D["rmd_manual"]
+    has_rmd = D["has_rmd"]
+    auto_rmd = D["auto_rmd"] and has_rmd
+    pretax_balance_filer_prior = D["pretax_bal_filer_prior"] if has_rmd else 0.0
+    pretax_balance_spouse_prior = (D["pretax_bal_spouse_prior"] if is_joint else 0.0) if has_rmd else 0.0
+    baseline_pretax_distributions = D["baseline_pretax_dist"] if has_rmd else 0.0
+    rmd_manual = D["rmd_manual"] if has_rmd else 0.0
 
     # Spending
     spending_goal = D["living_expenses"]
