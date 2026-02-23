@@ -139,18 +139,54 @@ def ira_phase_out(magi, phase_range, full_limit):
 SS_WAGE_BASE_2025 = 176100
 MEDICARE_ADDITIONAL_THRESHOLD = {"Married Filing Jointly": 250000, "Single": 200000, "Head of Household": 200000}
 
-def calc_fica(wages_filer, wages_spouse, status, inf=1.0):
-    """Calculate employee-side FICA (SS 6.2% + Medicare 1.45% + Additional Medicare 0.9%)."""
+def calc_fica(wages_filer, wages_spouse, status, inf=1.0,
+              se_filer=False, se_spouse=False):
+    """Calculate FICA taxes.
+
+    Employee-side: SS 6.2% + Medicare 1.45% + Additional Medicare 0.9%.
+    Self-employed: both halves (12.4% SS + 2.9% Medicare) on 92.35% of net SE income.
+    Returns (total_fica, se_deduction).
+    """
     wage_base = SS_WAGE_BASE_2025 * inf
-    ss_filer = min(wages_filer, wage_base) * 0.062
-    ss_spouse = min(wages_spouse, wage_base) * 0.062
-    med_filer = wages_filer * 0.0145
-    med_spouse = wages_spouse * 0.0145
-    # Additional Medicare tax on combined wages over threshold
     threshold = MEDICARE_ADDITIONAL_THRESHOLD.get(status, 200000) * inf
-    combined = wages_filer + wages_spouse
+
+    def _employee_fica(w):
+        return min(w, wage_base) * 0.062 + w * 0.0145
+
+    def _se_fica(w):
+        se_base = w * 0.9235
+        ss = min(se_base, wage_base) * 0.124
+        med = se_base * 0.029
+        return ss + med, se_base
+
+    fica_f = 0.0; se_base_f = 0.0
+    if wages_filer > 0:
+        if se_filer:
+            fica_f, se_base_f = _se_fica(wages_filer)
+        else:
+            fica_f = _employee_fica(wages_filer)
+
+    fica_s = 0.0; se_base_s = 0.0
+    if wages_spouse > 0:
+        if se_spouse:
+            fica_s, se_base_s = _se_fica(wages_spouse)
+        else:
+            fica_s = _employee_fica(wages_spouse)
+
+    combined = (se_base_f if se_filer else wages_filer) + (se_base_s if se_spouse else wages_spouse)
     add_med = max(0.0, combined - threshold) * 0.009
-    return ss_filer + ss_spouse + med_filer + med_spouse + add_med
+    total = fica_f + fica_s + add_med
+
+    se_tax_portion = 0.0
+    if se_filer and wages_filer > 0:
+        _f_se, _ = _se_fica(wages_filer)
+        se_tax_portion += _f_se
+    if se_spouse and wages_spouse > 0:
+        _s_se, _ = _se_fica(wages_spouse)
+        se_tax_portion += _s_se
+    se_deduction = se_tax_portion / 2.0
+
+    return total, se_deduction
 
 # --- SS estimation from income ---
 SS_TAXABLE_MAX_2025 = SS_WAGE_BASE_2025
@@ -1263,15 +1299,17 @@ def calc_cg_tax(cap_gains, ordinary_taxable, status, inf=1.0):
     cg_at_20 = max(0.0, cg_end - max(cg_start, b1))
     return cg_at_15 * 0.15 + cg_at_20 * 0.20
 
-def estimate_medicare_premiums(agi, filing_status, inf=1.0, medicare_inf=None):
+def estimate_medicare_premiums(agi, filing_status, inf=1.0, medicare_inf=None,
+                               filer_65=True, spouse_65=False):
     """2026 Medicare Part B + Part D premiums with full 5-tier IRMAA.
     Returns (annual_premium, has_irmaa).
     inf: bracket/threshold inflation factor.
-    medicare_inf: premium growth factor (defaults to inf if not provided)."""
+    medicare_inf: premium growth factor (defaults to inf if not provided).
+    filer_65/spouse_65: who is actually on Medicare (65+)."""
     _med_inf = medicare_inf if medicare_inf is not None else inf
     is_joint = "joint" in filing_status.lower()
     a = float(agi)
-    people = 2 if is_joint else 1
+    people = int(bool(filer_65)) + (int(bool(spouse_65)) if is_joint else 0)
     base_monthly = 249.40 * _med_inf  # 2026 base Part B + avg Part D, grown
     irmaa_tiers = [
         (750000, 500000, 487.00, 91.00),   # Tier 5
@@ -1621,8 +1659,9 @@ def run_retirement_projection(balances, params, spending_order):
                                          _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate)
             taxes = tax_result["total_tax"]
             # Medicare premiums (based on AGI, applies when 65+)
-            if _yr_filer_65:
-                yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf)
+            if _yr_filer_65 or _yr_spouse_65:
+                yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf,
+                                                            filer_65=_yr_filer_65, spouse_65=_yr_spouse_65)
             else:
                 yr_medicare = 0.0
             cash_needed = expenses + taxes + yr_medicare - conv_tax_withheld  # withheld portion already paid from conversion
@@ -1686,8 +1725,9 @@ def run_retirement_projection(balances, params, spending_order):
                                      inv_ordinary_income, _yr_filing_status,
                                      _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate)
         taxes = tax_result["total_tax"]
-        if _yr_filer_65:
-            yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf)
+        if _yr_filer_65 or _yr_spouse_65:
+            yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf,
+                                                        filer_65=_yr_filer_65, spouse_65=_yr_spouse_65)
         else:
             yr_medicare = 0.0
         wd_taxable = wd_cash + wd_brokerage
@@ -1723,7 +1763,8 @@ def run_retirement_projection(balances, params, spending_order):
         yr_return = return_sequence[i] if return_sequence else post_return
         bal_pt = max(0.0, bal_pt) * (1 + yr_return)
         bal_ro = max(0.0, bal_ro) * (1 + yr_return)
-        bal_brokerage = max(0.0, bal_brokerage) * (1 + yr_return)
+        # Brokerage: reduce by div yield since dividends flow to spending income
+        bal_brokerage = max(0.0, bal_brokerage) * (1 + yr_return - div_yield)
         bal_cash = max(0.0, bal_cash) * (1 + cash_int_rate)
         bal_hs = max(0.0, bal_hs) * (1 + yr_return)
         bal_tx = bal_brokerage + bal_cash
@@ -2897,7 +2938,7 @@ with tab2:
     _curr_fed_tax = calc_federal_tax(_curr_ordinary_taxable, filing_status)
     _curr_fed_tax += calc_cg_tax(_curr_dividends + _curr_cap_gain_dist, _curr_ordinary_taxable, filing_status)
     _curr_state_tax = calc_state_tax(max(0, _curr_agi - _curr_deduction), state_tax_rate)
-    _curr_fica = calc_fica(salary_filer, salary_spouse, filing_status)
+    _curr_fica, _curr_se_ded = calc_fica(salary_filer, salary_spouse, filing_status)
     _curr_total_tax = _curr_fed_tax + _curr_state_tax + _curr_fica
     _curr_future_exp = sum(fe["amount"] for fe in future_expenses if fe["start_age"] <= current_age < fe["end_age"])
     _curr_total_outflow = current_living_expenses + mortgage_payment_annual + _curr_future_exp + _curr_total_tax + total_annual_contrib
@@ -2985,6 +3026,11 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
     bracket_growth_rate = income_info.get("bracket_growth", inf_rate) if income_info else inf_rate
     medicare_growth_rate = income_info.get("medicare_growth", inf_rate) if income_info else inf_rate
     fut_expenses = income_info.get("future_expenses", []) if income_info else []
+    # Per-account return rates (fall back to pre_ret_return for backward compat)
+    r_pretax = income_info.get("r_pretax", pre_ret_return) if income_info else pre_ret_return
+    r_roth = income_info.get("r_roth", pre_ret_return) if income_info else pre_ret_return
+    r_taxable = income_info.get("r_taxable", pre_ret_return) if income_info else pre_ret_return
+    r_hsa = income_info.get("r_hsa", pre_ret_return) if income_info else pre_ret_return
     div_yield = income_info.get("dividend_yield", 0.015) if income_info else 0.015
     ann_cg_pct = income_info.get("annual_cap_gain_pct", 0.0) if income_info else 0.0
     cash_int_rate = income_info.get("cash_interest_rate", 0.04) if income_info else 0.04
@@ -3237,10 +3283,10 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         fed_tax = calc_federal_tax(ordinary_taxable, filing, bracket_inf_f)
         fed_tax += calc_cg_tax(yr_cap_gain_income, ordinary_taxable, filing, bracket_inf_f)
         state_tax = calc_state_tax(max(0, yr_agi - deduction), st_rate)
-        # FICA: SS 6.2% (up to wage base per worker) + Medicare 1.45% + Additional Medicare 0.9%
+        # FICA / SE tax
         yr_wages_filer = base_salary_filer * sf * work_frac
         yr_wages_spouse = base_salary_spouse * sf * spouse_work_frac
-        yr_fica = calc_fica(yr_wages_filer, yr_wages_spouse, filing, inf_f)
+        yr_fica, yr_se_ded = calc_fica(yr_wages_filer, yr_wages_spouse, filing, inf_f)
         yr_taxes = fed_tax + state_tax + yr_fica
 
         # Non-savings expenses (subtract any conversion tax already withheld from the conversion)
@@ -3310,6 +3356,12 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         total_contrib = c_pretax + c_roth + c_taxable + c_cash_contrib + c_hsa
         yr_total_expenses = yr_fixed_expenses + yr_liquidation_cg_tax + total_contrib
 
+        # Reinvest surplus (after-tax income exceeding expenses + contributions)
+        yr_actual_surplus = max(0.0, yr_surplus) if yr_surplus > 0 else 0.0
+        if yr > 0 and yr_actual_surplus > 0:
+            bal_brokerage += yr_actual_surplus
+            brokerage_basis += yr_actual_surplus  # after-tax money = 100% basis
+
         # Apply actual contributions and growth
         if yr > 0:
             bal_pretax += c_pretax
@@ -3318,15 +3370,22 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             brokerage_basis += c_taxable
             bal_cash += c_cash_contrib
             bal_hsa += c_hsa
-            yr_return = accum_return_sequence[yr] if accum_return_sequence else pre_ret_return
-            bal_pretax *= (1 + yr_return)
-            bal_roth *= (1 + yr_return)
-            bal_brokerage *= (1 + yr_return)
+            # Per-account growth (MC return sequence overrides all rates)
+            if accum_return_sequence:
+                yr_return = accum_return_sequence[yr]
+                bal_pretax *= (1 + yr_return)
+                bal_roth *= (1 + yr_return)
+                _div_drag = (div_yield + ann_cg_pct) if not reinvest_inv_income else 0.0
+                bal_brokerage *= (1 + yr_return - _div_drag)
+                bal_hsa *= (1 + yr_return)
+            else:
+                bal_pretax *= (1 + r_pretax)
+                bal_roth *= (1 + r_roth)
+                _div_drag = (div_yield + ann_cg_pct) if not reinvest_inv_income else 0.0
+                bal_brokerage *= (1 + r_taxable - _div_drag)
+                bal_hsa *= (1 + r_hsa)
             bal_cash *= (1 + cash_int_rate)
-            bal_hsa *= (1 + yr_return)
-            # If spending investment income, withdraw it from balances after growth
             if not reinvest_inv_income:
-                bal_brokerage -= (yr_dividends + yr_cap_gain_dist)
                 bal_cash -= yr_cash_interest
             # Grow remaining inherited IRA balances
             for idx in range(len(inherited_iras)):
@@ -3362,7 +3421,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             "Conv to Roth": round(accum_conversion_this_year - accum_conv_tax_withheld, 0),
             "Liquidated": round(yr_liquidation, 0),
             "Total Outflow": round(yr_total_expenses, 0),
-            "Surplus": round(yr_income + yr_inherited_dist - yr_total_expenses, 0),
+            "Surplus": round(yr_actual_surplus, 0),
             "Bal Pre-Tax": round(bal_pretax, 0), "Bal Roth": round(bal_roth, 0),
             "Bal Taxable": round(bal_taxable, 0), "Basis": round(brokerage_basis, 0),
             "Unreal Gain": round(unrealized_gain, 0),

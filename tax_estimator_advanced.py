@@ -251,15 +251,17 @@ def calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, fil
     eff = round((tax / sc_taxable * 100.0) if sc_taxable > 0 else 0.0, 2)
     return {"sc_tax": round(tax, 2), "effective_sc": eff, "sc_taxable": round(sc_taxable, 2)}
 
-def estimate_medicare_premiums(agi, filing_status, inf=1.0, medicare_inf=None):
+def estimate_medicare_premiums(agi, filing_status, inf=1.0, medicare_inf=None,
+                               filer_65=True, spouse_65=False):
     """2026 Medicare Part B + Part D premiums with full 5-tier IRMAA.
     Thresholds are MAGI cliffs (based on 2024 tax return for 2026).
     inf: bracket/threshold inflation factor.
-    medicare_inf: premium growth factor (defaults to inf if not provided)."""
+    medicare_inf: premium growth factor (defaults to inf if not provided).
+    filer_65/spouse_65: who is actually on Medicare (65+)."""
     _med_inf = medicare_inf if medicare_inf is not None else inf
     is_joint = "joint" in filing_status.lower()
     a = float(agi)
-    people = 2 if is_joint else 1
+    people = int(bool(filer_65)) + (int(bool(spouse_65)) if is_joint else 0)
     # 2026 base Part B + avg Part D = $202.90 + $46.50 = $249.40/mo
     base_monthly = 249.40 * _med_inf  # grown by medicare inflation
     # IRMAA tiers: (joint_threshold, single_threshold, partB_surcharge, partD_surcharge) per month
@@ -463,13 +465,62 @@ def compute_taxes_only(gross_ss, taxable_pensions, rmd_amount, taxable_ira, conv
     fed = calculate_federal_tax(fed_taxable, preferential, filing_status, inf_factor)
     sc = calculate_sc_tax(fed_taxable, 0, taxable_ss, 0.0, filer_65, spouse_65, 
                           retirement_deduction * inf_factor, cap_gains)
-    medicare, has_irmaa = estimate_medicare_premiums(agi, filing_status, inf_factor)
+    medicare, has_irmaa = estimate_medicare_premiums(agi, filing_status, inf_factor,
+                                                     filer_65=filer_65, spouse_65=spouse_65)
     total_tax = fed["federal_tax"] + sc["sc_tax"]
     return {
         "agi": agi, "fed_taxable": fed_taxable, "fed_tax": fed["federal_tax"],
         "sc_tax": sc["sc_tax"], "total_tax": total_tax, "medicare": medicare,
         "has_irmaa": has_irmaa, "total_outflow": total_tax + medicare
     }
+
+# --- FICA / SE tax ---
+SS_WAGE_BASE_2025 = 176100
+MEDICARE_ADDITIONAL_THRESHOLD = {"Married Filing Jointly": 250000, "Single": 200000, "Head of Household": 200000}
+
+def calc_fica(wages_filer, wages_spouse, status, inf=1.0,
+              se_filer=False, se_spouse=False):
+    """Calculate FICA taxes. Returns (total_fica, se_deduction)."""
+    wage_base = SS_WAGE_BASE_2025 * inf
+    threshold = MEDICARE_ADDITIONAL_THRESHOLD.get(status, 200000) * inf
+
+    def _employee_fica(w):
+        return min(w, wage_base) * 0.062 + w * 0.0145
+
+    def _se_fica(w):
+        se_base = w * 0.9235
+        ss = min(se_base, wage_base) * 0.124
+        med = se_base * 0.029
+        return ss + med, se_base
+
+    fica_f = 0.0; se_base_f = 0.0
+    if wages_filer > 0:
+        if se_filer:
+            fica_f, se_base_f = _se_fica(wages_filer)
+        else:
+            fica_f = _employee_fica(wages_filer)
+
+    fica_s = 0.0; se_base_s = 0.0
+    if wages_spouse > 0:
+        if se_spouse:
+            fica_s, se_base_s = _se_fica(wages_spouse)
+        else:
+            fica_s = _employee_fica(wages_spouse)
+
+    combined = (se_base_f if se_filer else wages_filer) + (se_base_s if se_spouse else wages_spouse)
+    add_med = max(0.0, combined - threshold) * 0.009
+    total = fica_f + fica_s + add_med
+
+    se_tax_portion = 0.0
+    if se_filer and wages_filer > 0:
+        _f_se, _ = _se_fica(wages_filer)
+        se_tax_portion += _f_se
+    if se_spouse and wages_spouse > 0:
+        _s_se, _ = _se_fica(wages_spouse)
+        se_tax_portion += _s_se
+    se_deduction = se_tax_portion / 2.0
+
+    return total, se_deduction
 
 def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     wages = float(inputs["wages"]); tax_exempt_interest = float(inputs["tax_exempt_interest"])
@@ -497,10 +548,20 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     taxable_rmd = max(0.0, rmd_amount - qcd_amt)
     charitable_amt = max(0.0, charitable_amt - qcd_amt)
 
+    # SE deduction: compute early so it adjusts AGI
+    _se_filer = bool(inputs.get("self_employed_filer", False))
+    _se_spouse = bool(inputs.get("self_employed_spouse", False))
+    _se_ded = 0.0
+    if wages > 0 and (_se_filer or _se_spouse):
+        _wages_f = float(inputs.get("wages_filer", wages))
+        _wages_s = float(inputs.get("wages_spouse", 0.0))
+        _, _se_ded = calc_fica(_wages_f, _wages_s, filing_status, inflation_factor,
+                               se_filer=_se_filer, se_spouse=_se_spouse)
+
     base_non_ss = wages + interest_taxable + total_ordinary_dividends + taxable_ira + taxable_rmd + taxable_pensions + ordinary_tax_only + cap_gain_loss + other_income
     taxable_ss = calculate_taxable_ss(base_non_ss, tax_exempt_interest, gross_ss, filing_status)
     total_income_for_tax = base_non_ss + taxable_ss
-    agi = max(0.0, total_income_for_tax - adjustments)
+    agi = max(0.0, total_income_for_tax - adjustments - _se_ded)
     base_std = get_federal_base_std(filing_status, inflation_factor)
     traditional_extra = get_federal_traditional_extra(filing_status, filer_65_plus, spouse_65_plus, inflation_factor)
     _tax_year = inputs.get("tax_year", None)
@@ -516,17 +577,39 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     # Medical: amount exceeding 7.5% of AGI
     medical_deduction = max(0.0, medical_exp - agi * 0.075)
     itemized_total = mortgage_interest + salt + medical_deduction + charitable_amt
-    is_itemizing = itemized_total > fed_std
-    deduction_used = itemized_total if is_itemizing else fed_std
+    # Deduction method override
+    _ded_method = inputs.get("force_deduction_method", "auto")
+    if _ded_method == "force_standard":
+        is_itemizing = False
+        deduction_used = fed_std
+    elif _ded_method == "force_itemized":
+        is_itemizing = True
+        deduction_used = itemized_total
+    elif _ded_method == "custom_itemized":
+        is_itemizing = True
+        itemized_total = float(inputs.get("custom_deduction_amount", itemized_total))
+        deduction_used = itemized_total
+    else:  # auto
+        is_itemizing = itemized_total > fed_std
+        deduction_used = itemized_total if is_itemizing else fed_std
 
     fed_taxable = max(0.0, agi - deduction_used)
     preferential_amount = qualified_dividends + max(0.0, cap_gain_loss)
     fed = calculate_federal_tax(fed_taxable, preferential_amount, filing_status, inflation_factor)
     sc = calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss)
     total_tax = fed["federal_tax"] + sc["sc_tax"]
-    if filer_65_plus:
+    # FICA / SE tax (separate from income tax; SE deduction already applied to AGI above)
+    _fica = 0.0
+    if wages > 0:
+        _wages_f = float(inputs.get("wages_filer", wages))
+        _wages_s = float(inputs.get("wages_spouse", 0.0))
+        _fica, _ = calc_fica(_wages_f, _wages_s, filing_status, inflation_factor,
+                             se_filer=_se_filer, se_spouse=_se_spouse)
+    if filer_65_plus or spouse_65_plus:
         _med_inf = medicare_inflation_factor if medicare_inflation_factor is not None else None
-        medicare_premiums, has_irmaa = estimate_medicare_premiums(agi, filing_status, inflation_factor, _med_inf)
+        medicare_premiums, has_irmaa = estimate_medicare_premiums(
+            agi, filing_status, inflation_factor, _med_inf,
+            filer_65=filer_65_plus, spouse_65=spouse_65_plus)
     else:
         medicare_premiums, has_irmaa = 0.0, False
     reinvest_int = bool(inputs.get("reinvest_interest", False))
@@ -567,6 +650,8 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
         "fed_taxable": fed_taxable, "fed_tax": fed["federal_tax"], "effective_fed": fed["effective_fed"],
         "sc_tax": sc["sc_tax"], "effective_sc": sc["effective_sc"], "sc_taxable": sc["sc_taxable"],
         "total_tax": total_tax,
+        # FICA / SE
+        "fica": _fica, "se_deduction": _se_ded,
         # SC detail
         "retirement_deduction": retirement_deduction, "dependents": dependents,
         # Medicare / cashflow
@@ -698,6 +783,9 @@ def display_tax_return(r, mortgage_pmt=0.0, filer_65=False, spouse_65=False):
     # Adjustments & AGI
     _agi_table = "| Line | Description | Amount |\n|-----:|:------------|-------:|\n"
     _agi_table += f"| 10 | Adjustments to income | {_amt(r.get('adjustments', 0))} |\n"
+    _se_ded_display = r.get("se_deduction", 0)
+    if _se_ded_display > 0:
+        _agi_table += f"| | *— 50% SE tax deduction* | *{_amt(_se_ded_display)}* |\n"
     _agi_table += f"| **11** | **Adjusted gross income (AGI)** | **{_amt(r.get('agi', 0))}** |\n"
     st.markdown(_agi_table)
 
@@ -756,17 +844,25 @@ def display_tax_return(r, mortgage_pmt=0.0, filer_65=False, spouse_65=False):
     # --- Combined Summary ---
     st.divider()
     st.markdown("### Combined Tax Summary")
+    _fica_amt = r.get("fica", 0)
     _sum_c1, _sum_c2, _sum_c3 = st.columns(3)
     with _sum_c1:
         st.metric("Federal Tax", money(r["fed_tax"]))
         st.metric("SC Tax", money(r["sc_tax"]))
     with _sum_c2:
-        st.metric("Total Tax", money(r["total_tax"]))
+        st.metric("Total Income Tax", money(r["total_tax"]))
+        if _fica_amt > 0:
+            _se_ded = r.get("se_deduction", 0)
+            _label = "FICA / SE Tax" if _se_ded > 0 else "FICA Tax"
+            st.metric(_label, money(_fica_amt))
+            if _se_ded > 0:
+                st.caption(f"50% SE deduction: {money(_se_ded)}")
         st.metric("Medicare Premiums", money(r["medicare_premiums"]))
         if r.get("has_irmaa"):
             st.warning("IRMAA surcharge applies")
     with _sum_c3:
-        st.metric("Total Tax + Medicare", money(r["total_tax"] + r["medicare_premiums"]))
+        _total_all = r["total_tax"] + _fica_amt + r["medicare_premiums"]
+        st.metric("Total Tax + FICA + Medicare", money(_total_all))
 
     # --- Cashflow View ---
     st.divider()
@@ -797,12 +893,16 @@ def display_tax_return(r, mortgage_pmt=0.0, filer_65=False, spouse_65=False):
         _cf_table += f"| **Spendable income** | **{_amt(r['spendable_gross'])}** |\n"
     _cf_table += f"| Less: Federal tax | ({_amt(r['fed_tax'])}) |\n"
     _cf_table += f"| Less: SC tax | ({_amt(r['sc_tax'])}) |\n"
+    _cf_fica = r.get("fica", 0)
+    if _cf_fica > 0:
+        _cf_table += f"| Less: FICA / SE tax | ({_amt(_cf_fica)}) |\n"
     _cf_table += f"| Less: Medicare premiums | ({_amt(r['medicare_premiums'])}) |\n"
+    _net_adj = r['net_after_tax'] - _cf_fica
     if mortgage_pmt > 0:
         _cf_table += f"| Less: Mortgage payment | ({_amt(mortgage_pmt)}) |\n"
-        _cf_table += f"| **Net after tax & mortgage** | **{_amt(r['net_after_tax'] - mortgage_pmt)}** |\n"
+        _cf_table += f"| **Net after tax & mortgage** | **{_amt(_net_adj - mortgage_pmt)}** |\n"
     else:
-        _cf_table += f"| **Net after tax** | **{_amt(r['net_after_tax'])}** |\n"
+        _cf_table += f"| **Net after tax** | **{_amt(_net_adj)}** |\n"
     st.markdown(_cf_table)
 
 def display_cashflow_comparison(before_inp, before_res, after_inp, after_res, net_needed, roth_conversion=0.0, title_before="Before", title_after="After", mortgage_payment=0.0):
@@ -1091,12 +1191,28 @@ def heir_value_annuity(value, basis, heir_tax_rate, growth_rate, dist_years=10):
     return basis + net_gains
 
 
+def compute_estate_tax(gross_estate, federal_exemption, exemption_growth, years_elapsed,
+                       is_joint, use_portability,
+                       state_rate=0.0, state_exemption=0.0):
+    """Compute combined federal + state estate tax."""
+    adj_exemption = federal_exemption * ((1 + exemption_growth / 100) ** years_elapsed)
+    if is_joint and use_portability:
+        adj_exemption *= 2
+    taxable_federal = max(0, gross_estate - adj_exemption)
+    federal_tax = taxable_federal * 0.40
+    adj_state_ex = state_exemption * ((1 + exemption_growth / 100) ** years_elapsed)
+    taxable_state = max(0, gross_estate - adj_state_ex)
+    state_tax = taxable_state * (state_rate / 100) if state_rate > 0 else 0.0
+    return federal_tax + state_tax
+
+
 def run_wealth_projection(initial_assets, params, spending_order, conversion_strategy="none",
                            target_agi=0, stop_conversion_age=100, conversion_years_limit=0,
                            blend_mode=False, pretax_annual_cap=None, prorata_blend=False,
                            prorata_weights=None, adaptive_strategy=None,
                            extra_pretax_bracket=None, annuity_depletion_years=None,
-                           annuity_gains_only=False, harvest_gains_bracket=None):
+                           annuity_gains_only=False, harvest_gains_bracket=None,
+                           agi_cap_bracket_fills=False):
     """Unified wealth projection engine used by both Tab 3 and Tab 4.
 
     Combines:
@@ -1226,6 +1342,15 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
     # Surplus destination
     surplus_dest = params.get("surplus_destination", "brokerage")
+
+    # Estate tax params
+    _estate_tax_enabled = params.get("estate_tax_enabled", False)
+    _estate_fed_exemption = params.get("federal_estate_exemption", 15000000.0)
+    _estate_exemption_growth = params.get("exemption_inflation", 2.5)
+    _estate_use_portability = params.get("use_portability", True)
+    _estate_state_rate = params.get("state_estate_tax_rate", 0.0)
+    _estate_state_exemption = params.get("state_estate_exemption", 0.0)
+    _estate_is_joint = "joint" in filing_status.lower()
 
     # Initialize balances
     curr_cash = initial_assets["taxable"]["cash"]
@@ -1414,13 +1539,18 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         conversion_this_year = 0.0
         _do_conv = (_yr_conv_strat != "none" and _yr_conv_strat != 0 and _yr_conv_strat != 0.0) if _adaptive_phases else do_conversions
         if _do_conv and (i < conversion_years_limit or _adaptive_phases) and age_f < stop_conversion_age:
-            avail_pretax = max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve)
+            # Don't apply QCD reserve to conversions — conversions move money to Roth,
+            # they don't deplete wealth.  QCD reserve only protects spending withdrawals.
+            avail_pretax = max(0.0, curr_pre_filer + curr_pre_spouse)
             if avail_pretax > 0:
                 _yr_conv_strategy = _yr_conv_strat
                 # Estimate spending-driven pre-tax withdrawal so bracket fill accounts for it
                 _est_fixed = ss_now + pen_now + taxable_rmd + spendable_inv + p_wages + p_other_income
                 _est_spending_wd = max(0.0, total_spend_need - _est_fixed)
-                base_taxable = pen_now + taxable_rmd + p_interest_taxable + yr_ordinary_div + yr_cap_gain + _est_spending_wd
+                # Use gross RMD (not taxable_rmd) so conversion room decreases by full RMD.
+                # QCD-covered RMD doesn't add to AGI, but we want total IRA outflow
+                # (RMD + conversion) to be managed conservatively.
+                base_taxable = pen_now + rmd_total + p_interest_taxable + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income + _est_spending_wd
                 if _yr_conv_strategy == "fill_to_target":
                     room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
                     conversion_this_year = min(room, avail_pretax)
@@ -1446,6 +1576,28 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         conversion_this_year = min(float(_yr_conv_strategy), avail_pretax)
                     except (ValueError, TypeError):
                         conversion_this_year = 0.0
+                # AGI cap: when enabled, cap any conversion so AGI stays at or below target
+                if agi_cap_bracket_fills and target_agi > 0 and _yr_conv_strategy != "fill_to_target":
+                    agi_room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
+                    conversion_this_year = min(conversion_this_year, agi_room)
+
+                # QCD floor: never drain IRA below the level where RMDs can fund QCDs
+                if p_qcd_annual > 0 and conversion_this_year > 0:
+                    _next_age_f = age_f + 1
+                    _next_age_s = (age_s + 1) if age_s else None
+                    _has_rmd_next = (_next_age_f >= 73) or (_next_age_s is not None and _next_age_s >= 73)
+                    if _has_rmd_next:
+                        _next_qcd = p_qcd_annual * ((1 + inflation) ** (i + 1))
+                        # Use youngest RMD-eligible spouse's divisor (most conservative)
+                        _floor_ages = []
+                        if _next_age_f >= 73: _floor_ages.append(_next_age_f)
+                        if _next_age_s is not None and _next_age_s >= 73: _floor_ages.append(_next_age_s)
+                        _floor_div = max(UNIFORM_LIFETIME.get(min(a, 120), UNIFORM_LIFETIME[120]) for a in _floor_ages)
+                        # Need: (remaining * (1 + growth)) / divisor >= next_qcd
+                        # So remaining >= next_qcd * divisor / (1 + growth)
+                        _qcd_floor = _next_qcd * _floor_div / (1 + r_pretax)
+                        _max_conv = max(0.0, avail_pretax - _qcd_floor)
+                        conversion_this_year = min(conversion_this_year, _max_conv)
 
         if conversion_this_year > 0:
             avail_pretax = curr_pre_filer + curr_pre_spouse
@@ -1529,6 +1681,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     ann_gains_withdrawn += min(_pull, _rem_gains)
                 wd_annuity += _pull
 
+        yr_agi = 0.0  # initialized before branch; set in each path below
+
         if _yr_blend_mode:
             # Dynamic blend: tax-optimal source selection
             dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
@@ -1572,6 +1726,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 yr_cap_gain, bracket_inf, conversion_this_year, medicare_inf_factor=medicare_inf)
             yr_tax = final_res["total_tax"]
             yr_medicare = final_res["medicare_premiums"]
+            yr_agi = final_res["agi"]
 
         elif _yr_pt_cap is not None:
             # Smart blend: targeted pre-tax + brokerage each year
@@ -1677,6 +1832,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             final_res = compute_case_cached(_serialize_inputs_for_cache(final_inp), bracket_inf, medicare_inflation_factor=medicare_inf)
             yr_tax = final_res["total_tax"]
             yr_medicare = final_res["medicare_premiums"]
+            yr_agi = final_res["agi"]
 
         elif _yr_prorata:
             # Pro-rata blend: pull from ALL accounts in proportion to balance (or custom weights)
@@ -1773,6 +1929,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             final_res = compute_case_cached(_serialize_inputs_for_cache(final_inp), bracket_inf, medicare_inflation_factor=medicare_inf)
             yr_tax = final_res["total_tax"]
             yr_medicare = final_res["medicare_premiums"]
+            yr_agi = final_res["agi"]
 
         else:
             # Fixed waterfall ordering
@@ -1891,6 +2048,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             final_res = compute_case_cached(_serialize_inputs_for_cache(final_inp), bracket_inf, medicare_inflation_factor=medicare_inf)
             yr_tax = final_res["total_tax"]
             yr_medicare = final_res["medicare_premiums"]
+            yr_agi = final_res["agi"]
 
         # Accelerated pre-tax bracket fill: pull extra pre-tax beyond spending needs
         _accel_pt_extra = 0.0
@@ -1946,6 +2104,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     _accel_res = compute_case_cached(_serialize_inputs_for_cache(_accel_inp), bracket_inf, medicare_inflation_factor=medicare_inf)
                     yr_tax = _accel_res["total_tax"]
                     yr_medicare = _accel_res["medicare_premiums"]
+                    yr_agi = _accel_res["agi"]
                 else:
                     _accel_pt_extra = 0.0
 
@@ -1998,6 +2157,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     }
                     _harv_res = compute_case_cached(_serialize_inputs_for_cache(_harv_inp), bracket_inf, medicare_inflation_factor=medicare_inf)
                     yr_tax = _harv_res["total_tax"]
+                    yr_agi = _harv_res["agi"]
                     yr_medicare = _harv_res["medicare_premiums"]
                 else:
                     _harvest_gains = 0.0
@@ -2068,10 +2228,18 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         _heir_ann_net = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
         at_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_life + _heir_pretax_net + _heir_roth_net + _heir_ann_net
         gross_estate_yr = total_wealth_yr + home_equity
-        net_estate_yr = at_wealth_yr + home_equity
+        # Estate tax: unlimited marital deduction → $0 while both spouses alive.
+        _estate_tax_yr = 0.0
+        _both_alive = _estate_is_joint and (first_death_idx is None or i < first_death_idx)
+        if _estate_tax_enabled and not _both_alive:
+            _estate_tax_yr = compute_estate_tax(
+                gross_estate_yr, _estate_fed_exemption, _estate_exemption_growth, i,
+                _estate_is_joint, _estate_use_portability,
+                _estate_state_rate, _estate_state_exemption)
+        net_estate_yr = at_wealth_yr + home_equity - _estate_tax_yr
 
-        # Total income for display
-        total_income_disp = ss_now + pen_now + spendable_inv + rmd_total + yr_extra_income + wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
+        # Total income for display (all taxable income sources)
+        total_income_disp = ss_now + pen_now + spendable_inv + rmd_total + conversion_this_year + _accel_pt_extra + yr_extra_income + wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
 
         _status_label = ""
         if first_death_idx is not None:
@@ -2103,6 +2271,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "Harvest Gains": round(_harvest_gains, 0),
             "Cap Gains": round(cap_gains_realized, 0),
             "Total Income": round(total_income_disp, 0),
+            "AGI": round(yr_agi, 0),
             "Taxes": round(yr_tax, 0), "Medicare": round(yr_medicare, 0),
             "Surplus": round(yr_surplus, 0),
             "Bal Cash": round(curr_cash, 0), "Bal EF": round(curr_ef, 0), "Bal Taxable": round(curr_brokerage, 0),
@@ -2117,6 +2286,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             row["Home Value"] = round(curr_home_val, 0)
             row["Home Equity"] = round(home_equity, 0)
         row["Gross Estate"] = round(gross_estate_yr, 0)
+        if _estate_tax_enabled:
+            row["Estate Tax"] = round(_estate_tax_yr, 0)
         row["Estate (Net)"] = round(net_estate_yr, 0)
         row["_net_draw"] = (wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity) - yr_surplus
         year_details.append(row)
@@ -2129,11 +2300,21 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     _final_heir_ann = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
     after_tax_estate = curr_cash + curr_ef + curr_brokerage + curr_life + _final_heir_pretax + _final_heir_roth + _final_heir_ann
     home_equity_final = max(0.0, curr_home_val - curr_mtg_bal)
+    _gross_final = total_wealth + home_equity_final
+    _final_estate_tax = 0.0
+    _both_alive_final = _estate_is_joint and (first_death_idx is None or years < first_death_idx)
+    if _estate_tax_enabled and not _both_alive_final:
+        _final_estate_tax = compute_estate_tax(
+            _gross_final, _estate_fed_exemption, _estate_exemption_growth, years,
+            _estate_is_joint, _estate_use_portability,
+            _estate_state_rate, _estate_state_exemption)
+    _net_after_estate_tax = after_tax_estate + home_equity_final - _final_estate_tax
 
     return {
-        "after_tax_estate": after_tax_estate + home_equity_final,
+        "after_tax_estate": _net_after_estate_tax,
         "total_wealth": total_wealth,
-        "gross_estate": total_wealth + home_equity_final,
+        "gross_estate": _gross_final,
+        "estate_tax": _final_estate_tax,
         "total_taxes": total_taxes_paid, "total_converted": total_converted,
         "final_cash": curr_cash + curr_ef, "final_brokerage": curr_brokerage,
         "final_pretax": curr_pre_filer + curr_pre_spouse,
@@ -3219,7 +3400,7 @@ with tab3:
                 st.caption("(Pulled from Income Needs tab)")
             heir_tax_rate = st.number_input("Heir Tax Rate (%)", value=25.0, step=1.0, key="heir_tab3",
                                            help="Heir's marginal tax rate on inherited IRA distributions. Used in 10-year SECURE Act model.") / 100
-            start_year = st.number_input("Start year", min_value=2020, max_value=2100, value=max(2026, int(tax_year) + 1), step=1)
+            start_year = st.number_input("Start year", min_value=2020, max_value=2100, value=max(2026, int(tax_year)), step=1)
             is_joint = "joint" in filing_status.lower()
             filer_plan_through_age = st.number_input("Filer Plan Through Age", min_value=70, max_value=105, value=95, step=1)
             spouse_plan_through_age = st.number_input("Spouse Plan Through Age", min_value=70, max_value=105, value=95, step=1) if is_joint else None
@@ -3400,14 +3581,14 @@ with tab3:
                 det_spending = [r["Spending"] for r in rows]
                 det_ss = [r["SS"] for r in rows]
                 det_pension = [r["Pension"] for r in rows]
+                det_inv_inc = [r.get("Inv Inc", 0) for r in rows]
+                det_extra_inc = [r.get("Extra Income", 0) for r in rows]
                 # Effective tax rate from deterministic for each year
                 det_eff_tax = []
                 for r in rows:
                     inc = r.get("Total Income", 0)
                     tx = r.get("Taxes", 0) + r.get("Medicare", 0)
                     det_eff_tax.append(tx / inc if inc > 1 else 0.15)
-                # Investment income (fixed, not inflated)
-                mc_inv_income = rows[0]["Inv Inc"] if rows else 0.0
 
 
                 rng = np.random.default_rng(42)
@@ -3432,6 +3613,8 @@ with tab3:
                         ss = det_ss[_yi]
                         pension = det_pension[_yi]
                         eff_tax = det_eff_tax[_yi]
+                        inv_inc = det_inv_inc[_yi]
+                        extra_inc = det_extra_inc[_yi]
 
                         # RMDs from actual pre-tax balances
                         _age_f = current_age_filer + yr_i
@@ -3443,11 +3626,11 @@ with tab3:
                         s_ps -= rmd_s
 
                         # Estimate taxes: apply effective rate to total income
-                        total_income = ss + pension + rmd + mc_inv_income
+                        total_income = ss + pension + rmd + inv_inc + extra_inc
                         est_taxes = total_income * eff_tax
 
                         # Cash available vs needed
-                        income_available = ss + pension + rmd + mc_inv_income
+                        income_available = total_income
                         cash_needed = spending + est_taxes
                         shortfall = cash_needed - income_available
 
@@ -3615,23 +3798,18 @@ with tab4:
                 "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none",
                 "harvest_bracket": None})
 
-            # Common waterfall orderings
-            _test_strategies.append({"key": "wf1", "label": "WF: Taxable -> Pre-Tax -> Tax-Free -> Annuity",
-                "wf": ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"], "blend": False,
-                "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none",
-                "harvest_bracket": None})
-            _test_strategies.append({"key": "wf2", "label": "WF: Pre-Tax -> Taxable -> Tax-Free -> Annuity",
-                "wf": ["Pre-Tax", "Taxable", "Tax-Free", "Tax-Deferred"], "blend": False,
-                "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none",
-                "harvest_bracket": None})
-
-            # Also include user's Tab 3 waterfall if different
-            _user_wf = spending_order
-            _user_wf_name = " -> ".join(_user_wf)
-            if _user_wf_name not in ["Taxable -> Pre-Tax -> Tax-Free -> Tax-Deferred", "Pre-Tax -> Taxable -> Tax-Free -> Tax-Deferred"]:
-                _test_strategies.append({"key": "user", "label": f"WF: {_user_wf_name} (Tab 3)", "wf": _user_wf, "blend": False,
-                    "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none",
-                    "harvest_bracket": None})
+            # Test all 24 waterfall permutations
+            from itertools import permutations
+            _wf_buckets = ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"]
+            _seen_wf = set()
+            for _perm in permutations(_wf_buckets):
+                _wf_list = list(_perm)
+                _wf_key = " -> ".join(_wf_list)
+                if _wf_key not in _seen_wf:
+                    _seen_wf.add(_wf_key)
+                    _test_strategies.append({"key": "wf", "label": f"WF: {_wf_key}", "wf": _wf_list, "blend": False,
+                        "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none",
+                        "harvest_bracket": None})
 
             # Adaptive (multi-phase) strategies
             for _akey, _adef in ADAPTIVE_STRATEGIES.items():
@@ -3750,6 +3928,15 @@ with tab4:
                                "adaptive_key": adaptive_key, "accel_bracket": accel_bracket,
                                "ann_depl_yrs": ann_depl_yrs, "ann_gains_only": ann_gains_only,
                                "conv_strat": conv_strat, "harvest_bracket": harvest_bracket}
+                # Cumulative withdrawals by source
+                _yd = result["year_details"]
+                _cum_wd = {
+                    "tot_wd_cash": sum(r.get("W/D Cash", 0) for r in _yd),
+                    "tot_wd_taxable": sum(r.get("W/D Taxable", 0) for r in _yd),
+                    "tot_wd_pretax": sum(r.get("W/D Pre-Tax", 0) for r in _yd),
+                    "tot_wd_roth": sum(r.get("W/D Roth", 0) + r.get("W/D Life", 0) for r in _yd),
+                    "tot_wd_annuity": sum(r.get("W/D Annuity", 0) for r in _yd),
+                }
                 results.append({
                     "order": order_key,
                     "waterfall": label,
@@ -3768,6 +3955,7 @@ with tab4:
                     "_wf_order": wf_order,
                     "_strat_info": _strat_info,
                     "_year_details": result["year_details"],
+                    **_cum_wd,
                 })
                 all_details[label] = result["year_details"]
                 if estate > best_estate:
@@ -3845,6 +4033,11 @@ with tab4:
                         "Net Estate": f"${r['after_tax_estate']:,.0f}",
                         "Gross Estate": f"${r.get('gross_estate', r['total_wealth']):,.0f}",
                         "Total Taxes": f"${r['total_taxes']:,.0f}",
+                        "Drew Cash": f"${r.get('tot_wd_cash', 0):,.0f}",
+                        "Drew Taxable": f"${r.get('tot_wd_taxable', 0):,.0f}",
+                        "Drew Pre-Tax": f"${r.get('tot_wd_pretax', 0):,.0f}",
+                        "Drew Tax-Free": f"${r.get('tot_wd_roth', 0):,.0f}",
+                        "Drew Annuity": f"${r.get('tot_wd_annuity', 0):,.0f}",
                         "Final Pre-Tax": f"${r['final_pretax']:,.0f}",
                         "Final Roth": f"${r['final_roth']:,.0f}",
                         "Final Brokerage": f"${r['final_brokerage']:,.0f}",
@@ -3861,7 +4054,8 @@ with tab4:
                     _comp_rows.append(_row)
                 _comp_df = pd.DataFrame(_comp_rows)
                 # Drop balance columns where no strategy has money
-                for _bcol, _bkey in [("Final Cash", "final_cash"), ("Final Annuity", "final_annuity"), ("Final Life", "final_life"),
+                for _bcol, _bkey in [("Drew Cash", "tot_wd_cash"), ("Drew Taxable", "tot_wd_taxable"), ("Drew Pre-Tax", "tot_wd_pretax"), ("Drew Tax-Free", "tot_wd_roth"), ("Drew Annuity", "tot_wd_annuity"),
+                                     ("Final Cash", "final_cash"), ("Final Annuity", "final_annuity"), ("Final Life", "final_life"),
                                      ("Final Pre-Tax", "final_pretax"), ("Final Roth", "final_roth"), ("Final Brokerage", "final_brokerage")]:
                     if _bcol in _comp_df.columns and all(r.get(_bkey, 0) < 1 for r in p1):
                         _comp_df = _comp_df.drop(columns=[_bcol])
@@ -3967,9 +4161,11 @@ with tab4:
             with col2:
                 st.markdown("**Common Thresholds**")
                 if is_joint:
-                    st.write("22% bracket: $206,700 | 24% bracket: $394,600 | IRMAA: $218,000")
+                    st.write("22%: $206,700 | 24%: $394,600")
+                    st.write("IRMAA: $218k | $274k | $342k | $410k")
                 else:
-                    st.write("22% bracket: $103,350 | 24% bracket: $197,300 | IRMAA: $109,000")
+                    st.write("22%: $103,350 | 24%: $197,300")
+                    st.write("IRMAA: $109k | $137k | $171k | $205k")
                 target_agi_input = st.number_input("Target AGI (for 'fill to bracket')",
                     value=218000.0 if is_joint else 109000.0, step=10000.0, key="opt_target")
 
@@ -3977,6 +4173,8 @@ with tab4:
                 value="25000, 50000, 75000, 100000, 150000, 200000", key="opt_amounts")
             include_fill = st.checkbox("Also test 'Fill to Target AGI' strategy", value=True, key="opt_fill")
             include_bracket_fill = st.checkbox("Also test bracket-fill strategies", value=True, key="opt_bracket_fill")
+            agi_cap_enabled = st.checkbox("Cap all strategies at Target AGI", value=True, key="opt_agi_cap",
+                help="When checked, bracket-fill and fixed-amount strategies won't exceed the Target AGI")
 
             if st.button("Run Phase 2 - Test Roth Conversions", type="primary", key="run_phase2"):
                 params = st.session_state.phase1_params or _build_opt_params()
@@ -3991,9 +4189,10 @@ with tab4:
                 if include_fill:
                     strategies.append(("fill_to_target", f"Fill to ${target_agi_input:,.0f}"))
                 if include_bracket_fill:
-                    strategies.append(("fill_bracket_12", "Fill 12% Bracket"))
-                    strategies.append(("fill_bracket_22", "Fill 22% Bracket"))
-                    strategies.append(("fill_bracket_24", "Fill 24% Bracket"))
+                    _cap_tag = f" (cap ${target_agi_input/1000:.0f}k)" if agi_cap_enabled else ""
+                    strategies.append(("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"))
+                    strategies.append(("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"))
+                    strategies.append(("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"))
                     strategies.append(("fill_irmaa_0", "Fill to IRMAA Tier 1"))
 
                 results = []
@@ -4060,6 +4259,7 @@ with tab4:
                             stop_conversion_age=opt_stop_age,
                             conversion_years_limit=opt_conv_years,
                             adaptive_strategy=_p2_adaptive_key,
+                            agi_cap_bracket_fills=agi_cap_enabled,
                             **_p2_extra_kw,
                         )
                     else:
@@ -4073,6 +4273,7 @@ with tab4:
                             pretax_annual_cap=_p2_pt_cap,
                             prorata_blend=_p2_prorata,
                             prorata_weights=_p2_prorata_weights,
+                            agi_cap_bracket_fills=agi_cap_enabled,
                             **_p2_extra_kw,
                         )
                     estate = result["after_tax_estate"]
