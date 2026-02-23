@@ -147,6 +147,9 @@ _FP_DEFAULTS = {
 
     # --- Receiving: Other Income ---
     "wages": 0.0, "tax_exempt_interest": 0.0, "other_income": 0.0,
+    "wages_start_age": 0, "wages_end_age": 0,
+    "other_income_start_age": 0, "other_income_end_age": 0,
+    "tax_exempt_start_age": 0, "tax_exempt_end_age": 0,
 
     # --- Receiving: RMD ---
     "has_rmd": False, "auto_rmd": True,
@@ -338,6 +341,9 @@ def _load_tax_profile(name):
         "auto_rmd", "pretax_bal_filer_prior", "pretax_bal_spouse_prior",
         "baseline_pretax_dist",
         "wages", "tax_exempt_interest", "interest_taxable",
+        "wages_start_age", "wages_end_age",
+        "other_income_start_age", "other_income_end_age",
+        "tax_exempt_start_age", "tax_exempt_end_age",
         "cap_gain_loss", "other_income",
         "filer_65_plus", "spouse_65_plus",
         "adjustments", "dependents", "retirement_deduction", "out_of_state_gain",
@@ -922,8 +928,14 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
         pen_f_at_ret = pension_filer * ((1 + pen_f_cola) ** years_to_ret) if pension_filer > 0 else 0.0
         pen_s_at_ret = pension_spouse * ((1 + pen_s_cola) ** years_to_ret) if pension_spouse > 0 else 0.0
         # SS inflated to retirement
-        ss_f_fra_at_ret = ss_filer_pia * inf_factor
-        ss_s_fra_at_ret = ss_spouse_pia * inf_factor
+        if filer_ss_already and filer_ss_current > 0:
+            ss_f_fra_at_ret = filer_ss_current * inf_factor
+        else:
+            ss_f_fra_at_ret = ss_filer_pia * inf_factor
+        if is_joint and spouse_ss_already and spouse_ss_current > 0:
+            ss_s_fra_at_ret = spouse_ss_current * inf_factor
+        else:
+            ss_s_fra_at_ret = ss_spouse_pia * inf_factor
         # Home value (primary residence only)
         home_val_at_ret = home_value * ((1 + home_appreciation) ** years_to_ret)
         # Mortgage at retirement
@@ -953,6 +965,8 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             "ss_filer_fra": ss_f_fra_at_ret, "ss_spouse_fra": ss_s_fra_at_ret,
             "ss_filer_claim_age": ss_filer_claim_age,
             "ss_spouse_claim_age": ss_spouse_claim_age,
+            "filer_dob": filer_dob,
+            "spouse_dob": spouse_dob if is_joint else None,
             "ssdi_filer": D["ssdi_filer"],
             "ssdi_spouse": D["ssdi_spouse"] if is_joint else False,
             "ss_filer_already": filer_ss_already,
@@ -1947,16 +1961,41 @@ elif nav == "Receiving":
     # --- Other Income ---
     st.divider()
     st.subheader("Other Income")
+    _oi_default_age = TEA.age_at_date(D["filer_dob"], dt.date.today()) if D["filer_dob"] else 70
     col1, col2 = st.columns(2)
     with col1:
         if not D["is_working"]:
             w_num("Wages (if any)", "wages", step=1000.0)
+            if D["wages"] > 0:
+                _wc1, _wc2 = st.columns(2)
+                with _wc1:
+                    if D["wages_start_age"] == 0:
+                        D["wages_start_age"] = _oi_default_age
+                    w_num("Start age", "wages_start_age", min_value=50, max_value=110, step=1, format="%d")
+                with _wc2:
+                    w_num("End age (0=ongoing)", "wages_end_age", min_value=0, max_value=110, step=1, format="%d")
         else:
             _total_wages = D['salary_filer'] + (D['salary_spouse'] if is_joint else 0.0)
             st.caption(f"Wages: {_total_wages:,.0f} (from Employment Income above)")
         w_num("Tax-exempt interest", "tax_exempt_interest", step=100.0)
+        if D["tax_exempt_interest"] > 0:
+            _tc1, _tc2 = st.columns(2)
+            with _tc1:
+                if D["tax_exempt_start_age"] == 0:
+                    D["tax_exempt_start_age"] = _oi_default_age
+                w_num("Start age", "tax_exempt_start_age", min_value=50, max_value=110, step=1, format="%d")
+            with _tc2:
+                w_num("End age (0=ongoing)", "tax_exempt_end_age", min_value=0, max_value=110, step=1, format="%d")
     with col2:
         w_num("Other taxable income", "other_income", step=500.0)
+        if D["other_income"] > 0:
+            _oc1, _oc2 = st.columns(2)
+            with _oc1:
+                if D["other_income_start_age"] == 0:
+                    D["other_income_start_age"] = _oi_default_age
+                w_num("Start age", "other_income_start_age", min_value=50, max_value=110, step=1, format="%d")
+            with _oc2:
+                w_num("End age (0=ongoing)", "other_income_end_age", min_value=0, max_value=110, step=1, format="%d")
 
     # --- Future Income ---
     st.divider()
@@ -2168,12 +2207,19 @@ elif nav == "Giving":
     _filer_dob_giving = D["filer_dob"]
     if isinstance(_filer_dob_giving, str):
         _filer_dob_giving = dt.date.fromisoformat(_filer_dob_giving)
-    _filer_age_giving = TEA.age_at_date(_filer_dob_giving, dt.date.today()) if _filer_dob_giving else 0
-    if _filer_age_giving >= 70:
-        w_num("Qualified Charitable Distribution (QCD)", "qcd_annual", step=500.0,
-              help="Direct IRA-to-charity transfer. Age 70½+, up to $105k/person. Counts toward RMD, excluded from income.")
-        if D["qcd_annual"] > D["charitable"]:
-            st.warning("QCD cannot exceed total charitable giving.")
+    # Exact 70½ check: DOB + 70 years 6 months
+    _is_70_half = False
+    if _filer_dob_giving:
+        _70h_m = _filer_dob_giving.month + 6
+        _70h_y = _filer_dob_giving.year + 70 + (_70h_m > 12)
+        _70h_m = _70h_m - 12 if _70h_m > 12 else _70h_m
+        _70h_d = min(_filer_dob_giving.day, [31,28,31,30,31,30,31,31,30,31,30,31][_70h_m - 1])
+        _is_70_half = dt.date.today() >= dt.date(_70h_y, _70h_m, _70h_d)
+    if _is_70_half and D["charitable"] > 0:
+        _qcd_cap = 210000.0 if is_joint else 105000.0
+        D["qcd_annual"] = min(D["charitable"], _qcd_cap)
+        st.info(f"Age 70½+ — ${D['qcd_annual']:,.0f} of charitable contributions automatically designated "
+                f"as QCD (direct IRA-to-charity transfer). Excluded from taxable income; counts toward RMD.")
     else:
         D["qcd_annual"] = 0.0
 
@@ -2603,6 +2649,22 @@ elif nav == "Achieving":
         pf = float(pretax_bal_filer_current)
         ps = float(pretax_bal_spouse_current)
         ratio = pf / (pf + ps) if (pf + ps) > 0 else 1.0
+        # Compute non-liquidated investment RE value and weighted appreciation
+        _t3_ire_val = 0.0
+        _t3_ire_appr = D["inv_re_appr"] / 100
+        _t3_wt_num = 0.0; _t3_wt_den = 0.0
+        if D["inv_re_value"] > 0 and not D["inv_re_liquidate"]:
+            _t3_ire_val += D["inv_re_value"]
+            _t3_wt_num += D["inv_re_value"] * (D["inv_re_appr"] / 100)
+            _t3_wt_den += D["inv_re_value"]
+        for _ri in range(1, 4):
+            if D.get(f"inv_re_{_ri}_include", False) and D[f"inv_re_{_ri}_value"] > 0 and not D.get(f"inv_re_{_ri}_liquidate", False):
+                _rv = D[f"inv_re_{_ri}_value"]
+                _t3_ire_val += _rv
+                _t3_wt_num += _rv * (D[f"inv_re_{_ri}_appr"] / 100)
+                _t3_wt_den += _rv
+        if _t3_wt_den > 0:
+            _t3_ire_appr = _t3_wt_num / _t3_wt_den
         return {
             "spending_goal": spending_goal, "start_year": int(start_year),
             "years": int(years), "inflation": float(inflation),
@@ -2646,7 +2708,11 @@ elif nav == "Achieving":
             "mortgage_payment": float(mortgage_payment),
             "wages": float(wages), "tax_exempt_interest": float(tax_exempt_interest),
             "other_income": float(other_income), "adjustments": float(adjustments),
+            "wages_start_age": int(D["wages_start_age"]), "wages_end_age": int(D["wages_end_age"]),
+            "other_income_start_age": int(D["other_income_start_age"]), "other_income_end_age": int(D["other_income_end_age"]),
+            "tax_exempt_start_age": int(D["tax_exempt_start_age"]), "tax_exempt_end_age": int(D["tax_exempt_end_age"]),
             "home_value": float(home_value), "home_appreciation": float(home_appreciation),
+            "inv_re_value": float(_t3_ire_val), "inv_re_appr": float(_t3_ire_appr),
             "additional_expenses": [dict(ae) for ae in st.session_state.additional_expenses if ae.get("net_amount", 0) > 0],
             "future_income": [dict(fi) for fi in st.session_state.future_income if fi.get("amount", 0) > 0],
             "surplus_destination": surplus_destination,
@@ -3071,6 +3137,7 @@ elif nav == "Achieving":
                     if all(r.get("Extra Income", 0) == 0 for r in rows): _hide_cols.append("Extra Income")
                     if all(r.get("Accel PT", 0) == 0 for r in rows): _hide_cols.append("Accel PT")
                     if all(r.get("Harvest Gains", 0) == 0 for r in rows): _hide_cols.append("Harvest Gains")
+                    if all(r.get("Other Inc", 0) == 0 for r in rows): _hide_cols.append("Other Inc")
                     _df_display = pd.DataFrame(rows).drop(columns=[c for c in _hide_cols if c in rows[0]], errors="ignore")
                     st.dataframe(_df_display, use_container_width=True, hide_index=True)
                     # Check for portfolio depletion / spending shortfall

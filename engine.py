@@ -202,6 +202,18 @@ def ss_claim_factor(choice):
         return 1.00 - months_early * (5 / 9 / 100)
     return 1.00 - 36 * (5 / 9 / 100) - (months_early - 36) * (5 / 12 / 100)
 
+def ss_first_year_fraction(dob):
+    """Fraction of the claim year with SS benefits based on birthday month.
+    Benefits start the first full month at claiming age.
+    Born on the 1st: benefits start in birth month.
+    Born on any other day: benefits start the month after birthday month."""
+    if dob is None:
+        return 1.0
+    first_month = dob.month if dob.day == 1 else dob.month + 1
+    if first_month > 12:
+        return 0.0
+    return (13 - first_month) / 12.0
+
 def _ss_pia_from_aime(aime):
     """Calculate monthly PIA from AIME using 2025 bend points."""
     bp1, bp2 = 1174, 7078
@@ -2762,6 +2774,14 @@ def run_retirement_projection(balances, params, spending_order):
     ss_spouse_claim_age = params["ss_spouse_claim_age"]
     ssdi_filer_flag = params.get("ssdi_filer", False)
     ssdi_spouse_flag = params.get("ssdi_spouse", False)
+    ss_filer_already = params.get("ss_filer_already", False)
+    ss_filer_current_ret = params.get("ss_filer_current_benefit", 0)
+    ss_spouse_already = params.get("ss_spouse_already", False)
+    ss_spouse_current_ret = params.get("ss_spouse_current_benefit", 0)
+    filer_dob_ret = params.get("filer_dob")
+    spouse_dob_ret = params.get("spouse_dob")
+    _ss_filer_bday_frac = ss_first_year_fraction(filer_dob_ret)
+    _ss_spouse_bday_frac = ss_first_year_fraction(spouse_dob_ret)
     pen_filer = params.get("pension_filer_at_retire", 0.0)
     pen_filer_start = params.get("pension_filer_start_age", 65)
     pen_filer_cola = params.get("pension_filer_cola", 0.0)
@@ -2892,18 +2912,26 @@ def run_retirement_projection(balances, params, spending_order):
         # SS: fra values are in retirement-year dollars; inf_factor continues COLA from there
         # SSDI: already receiving at 100% PIA, just apply inflation
         ss_filer_calc = 0.0
-        if ss_filer_fra > 0:
+        if ss_filer_already and ss_filer_current_ret > 0:
+            ss_filer_calc = ss_filer_current_ret * inf_factor
+        elif ss_filer_fra > 0:
             if ssdi_filer_flag:
                 ss_filer_calc = ss_filer_fra * inf_factor
             elif age >= ss_filer_claim_age:
                 ss_filer_calc = ss_filer_fra * ss_claim_factor(ss_filer_claim_age) * inf_factor
+                if age == ss_filer_claim_age:
+                    ss_filer_calc *= _ss_filer_bday_frac
 
         ss_spouse_calc = 0.0
-        if ss_spouse_fra > 0:
+        if ss_spouse_already and ss_spouse_current_ret > 0:
+            ss_spouse_calc = ss_spouse_current_ret * inf_factor
+        elif ss_spouse_fra > 0:
             if ssdi_spouse_flag:
                 ss_spouse_calc = ss_spouse_fra * inf_factor
             elif spouse_age_now >= ss_spouse_claim_age:
                 ss_spouse_calc = ss_spouse_fra * ss_claim_factor(ss_spouse_claim_age) * inf_factor
+                if spouse_age_now == ss_spouse_claim_age:
+                    ss_spouse_calc *= _ss_spouse_bday_frac
 
         # Survivor SS: survivor gets the higher of the two benefits
         if _survivor_mode:
@@ -3389,6 +3417,10 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
     ss_spouse_claim = income_info.get("ss_spouse_claim_age", 67) if income_info else 67
     ssdi_filer_flag = income_info.get("ssdi_filer", False) if income_info else False
     ssdi_spouse_flag = income_info.get("ssdi_spouse", False) if income_info else False
+    ss_filer_already = income_info.get("ss_filer_already", False) if income_info else False
+    ss_filer_current = income_info.get("ss_filer_current_benefit", 0) if income_info else 0
+    ss_spouse_already = income_info.get("ss_spouse_already", False) if income_info else False
+    ss_spouse_current = income_info.get("ss_spouse_current_benefit", 0) if income_info else 0
     se_filer_flag = income_info.get("self_employed_filer", False) if income_info else False
     se_spouse_flag = income_info.get("self_employed_spouse", False) if income_info else False
     accum_surplus_dest = income_info.get("surplus_destination", "brokerage") if income_info else "brokerage"
@@ -3451,6 +3483,9 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
     filer_retire_frac = _birthday_fraction(filer_dob_accum, accum_retire_age)
     spouse_retire_frac = _birthday_fraction(spouse_dob_accum, accum_spouse_retire_age) if accum_spouse_age else filer_retire_frac
 
+    _ss_filer_bday_frac = ss_first_year_fraction(filer_dob_accum)
+    _ss_spouse_bday_frac = ss_first_year_fraction(spouse_dob_accum)
+
     rows = []
     retire_age_accum = current_age + years_to_ret
     for yr in range(years_to_ret + 1):
@@ -3504,26 +3539,28 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         # Social Security (prorated if starting mid-year in retirement year)
         # SSDI: pays 100% PIA from current age, converts to regular SS at FRA
         yr_ss_filer = 0.0
-        if ss_filer_pia > 0:
+        if ss_filer_already and ss_filer_current > 0:
+            yr_ss_filer = ss_filer_current * inf_f
+        elif ss_filer_pia > 0:
             if ssdi_filer_flag:
                 # SSDI pays 100% PIA immediately, growing with inflation
                 yr_ss_filer = ss_filer_pia * inf_f
             elif age >= ss_filer_claim:
                 ss_annual = ss_filer_pia * ss_claim_factor(ss_filer_claim) * inf_f
-                # If claiming starts at retirement, prorate for post-birthday portion
-                if is_retire_year and age == ss_filer_claim:
-                    yr_ss_filer = ss_annual * retire_frac
+                if age == ss_filer_claim:
+                    yr_ss_filer = ss_annual * _ss_filer_bday_frac
                 else:
                     yr_ss_filer = ss_annual
         yr_ss_spouse = 0.0
-        if ss_spouse_pia > 0:
+        if ss_spouse_already and ss_spouse_current > 0:
+            yr_ss_spouse = ss_spouse_current * inf_f
+        elif ss_spouse_pia > 0:
             if ssdi_spouse_flag:
                 yr_ss_spouse = ss_spouse_pia * inf_f
             elif spouse_age_yr >= ss_spouse_claim:
                 ss_sp_annual = ss_spouse_pia * ss_claim_factor(ss_spouse_claim) * inf_f
-                # If spouse claiming starts at their retirement, prorate
-                if is_spouse_retire_year and spouse_age_yr == ss_spouse_claim:
-                    yr_ss_spouse = ss_sp_annual * (1.0 - spouse_work_frac)
+                if spouse_age_yr == ss_spouse_claim:
+                    yr_ss_spouse = ss_sp_annual * _ss_spouse_bday_frac
                 else:
                     yr_ss_spouse = ss_sp_annual
         yr_ss = yr_ss_filer + yr_ss_spouse

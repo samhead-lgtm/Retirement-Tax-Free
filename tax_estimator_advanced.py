@@ -42,6 +42,9 @@ _PROFILE_KEYS = [
     "wages", "tax_exempt_interest", "interest_taxable", "reinvest_interest",
     "total_ordinary_div", "qualified_div", "reinvest_dividends",
     "cap_gain_loss", "reinvest_cap_gains", "other_income",
+    "wages_start_age", "wages_end_age",
+    "other_income_start_age", "other_income_end_age",
+    "tax_exempt_start_age", "tax_exempt_end_age",
     "filer_65_plus", "spouse_65_plus",
     "adjustments", "dependents", "retirement_deduction", "out_of_state_gain",
     "home_value", "home_appreciation",
@@ -134,6 +137,18 @@ def ss_claim_factor(choice):
         return 1.00 - months_early * (5 / 9 / 100)
     return 1.00 - 36 * (5 / 9 / 100) - (months_early - 36) * (5 / 12 / 100)
 
+def ss_first_year_fraction(dob):
+    """Fraction of the claim year with SS benefits based on birthday month.
+    Benefits start the first full month at claiming age.
+    Born on the 1st: benefits start in birth month.
+    Born on any other day: benefits start the month after birthday month."""
+    if dob is None:
+        return 1.0
+    first_month = dob.month if dob.day == 1 else dob.month + 1
+    if first_month > 12:
+        return 0.0
+    return (13 - first_month) / 12.0
+
 def annual_ss_in_year(*, dob, tax_year, cola, already_receiving, current_annual, start_year, fra_annual, claim_choice, current_year):
     tax_year = int(tax_year); current_year = int(current_year); cola = float(cola)
     if already_receiving:
@@ -147,7 +162,10 @@ def annual_ss_in_year(*, dob, tax_year, cola, already_receiving, current_annual,
     if age_eoy is None or age_eoy < claim_age: return 0.0
     base = float(fra_annual) * ss_claim_factor(claim_choice)
     claim_year = dob.year + claim_age
-    return base * ((1.0 + cola) ** max(0, tax_year - claim_year))
+    annual_benefit = base * ((1.0 + cola) ** max(0, tax_year - claim_year))
+    if tax_year == claim_year:
+        annual_benefit *= ss_first_year_fraction(dob)
+    return annual_benefit
 
 UNIFORM_LIFETIME = {
     72: 27.4, 73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1,
@@ -626,7 +644,8 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
         base_cg = max(0.0, cap_gain_loss - realized_cg_from_sales)
         if base_cg > 0:
             reinvested_amount += base_cg
-    spendable_gross = wages + gross_ss + taxable_pensions + total_ordinary_dividends + interest_taxable + tax_exempt_interest + taxable_ira + taxable_rmd + other_income + cashflow_taxfree + brokerage_proceeds + annuity_proceeds
+    _cg_cashflow = max(0.0, cap_gain_loss - realized_cg_from_sales)
+    spendable_gross = wages + gross_ss + taxable_pensions + total_ordinary_dividends + interest_taxable + tax_exempt_interest + taxable_ira + taxable_rmd + other_income + cashflow_taxfree + brokerage_proceeds + annuity_proceeds + _cg_cashflow
     spendable_gross -= reinvested_amount
     net_before_tax = spendable_gross - medicare_premiums
     net_after_tax = spendable_gross - medicare_premiums - total_tax
@@ -659,6 +678,7 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
         "spendable_gross": spendable_gross, "net_before_tax": net_before_tax, "net_after_tax": net_after_tax,
         "cashflow_taxfree": cashflow_taxfree, "brokerage_proceeds": brokerage_proceeds,
         "annuity_proceeds": annuity_proceeds, "reinvested_amount": reinvested_amount,
+        "cg_cashflow": _cg_cashflow,
     }
 
 def _serialize_inputs_for_cache(d):
@@ -880,6 +900,7 @@ def display_tax_return(r, mortgage_pmt=0.0, filer_65=False, spouse_65=False):
         ("Tax-exempt interest", r.get("tax_exempt_interest", 0)),
         ("Wages", r.get("wages", 0)),
         ("Other income", r.get("other_income", 0)),
+        ("Capital gains", r.get("cg_cashflow", 0)),
         ("Brokerage proceeds", r.get("brokerage_proceeds", 0)),
         ("Annuity proceeds", r.get("annuity_proceeds", 0)),
         ("Tax-free income", r.get("cashflow_taxfree", 0)),
@@ -1293,9 +1314,15 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         filer_dies_first = None
 
     # Sidebar income/deduction items carried into projection
-    p_wages = params.get("wages", 0.0)
-    p_tax_exempt_interest = params.get("tax_exempt_interest", 0.0)
-    p_other_income = params.get("other_income", 0.0)
+    p_wages_base = params.get("wages", 0.0)
+    p_wages_start = params.get("wages_start_age", 0)
+    p_wages_end = params.get("wages_end_age", 0)
+    p_tax_exempt_base = params.get("tax_exempt_interest", 0.0)
+    p_tax_exempt_start = params.get("tax_exempt_start_age", 0)
+    p_tax_exempt_end = params.get("tax_exempt_end_age", 0)
+    p_other_income_base = params.get("other_income", 0.0)
+    p_other_income_start = params.get("other_income_start_age", 0)
+    p_other_income_end = params.get("other_income_end_age", 0)
     p_adjustments = params.get("adjustments", 0.0)
 
     # Investment income detail (for full tax calc)
@@ -1340,6 +1367,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     home_val = params.get("home_value", 0.0)
     home_appr = params.get("home_appreciation", 0.0)
 
+    # Investment Real Estate
+    inv_re_val = params.get("inv_re_value", 0.0)
+    inv_re_appr = params.get("inv_re_appr", 0.0)
+
     # Surplus destination
     surplus_dest = params.get("surplus_destination", "brokerage")
 
@@ -1366,6 +1397,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     curr_ann_basis = initial_assets["annuity"]["basis"]
     curr_mtg_bal = mtg_balance
     curr_home_val = home_val
+    curr_inv_re_val = inv_re_val
 
     # Spending: mortgage stays fixed, rest inflates
     initial_mtg_pmt = mtg_payment if curr_mtg_bal > 0 else 0.0
@@ -1391,6 +1423,14 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         medicare_inf = (1 + medicare_growth) ** i
         filer_65 = age_f >= 65
         spouse_65 = age_s >= 65 if age_s else False
+
+        # Age-gate sidebar incomes (0 end_age = ongoing)
+        _wages_end = p_wages_end if p_wages_end > p_wages_start else 999
+        p_wages = p_wages_base if (p_wages_start <= age_f < _wages_end) else 0.0
+        _other_end = p_other_income_end if p_other_income_end > p_other_income_start else 999
+        p_other_income = p_other_income_base if (p_other_income_start <= age_f < _other_end) else 0.0
+        _te_end = p_tax_exempt_end if p_tax_exempt_end > p_tax_exempt_start else 999
+        p_tax_exempt_interest = p_tax_exempt_base if (p_tax_exempt_start <= age_f < _te_end) else 0.0
 
         # Adaptive strategy: resolve per-year overrides from active phase
         _yr_blend_mode = blend_mode
@@ -1504,12 +1544,14 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         curr_pre_spouse -= rmd_s
 
         # QCD: direct IRA-to-charity transfer
+        # Auto-compute QCD from charitable when age 70+ (even if p_qcd_annual == 0)
         yr_qcd = 0.0
         qcd_beyond_rmd = 0.0
-        if p_qcd_annual > 0 and age_f >= 70:
+        _qcd_base = p_qcd_annual if p_qcd_annual > 0 else (p_charitable if p_charitable > 0 else 0.0)
+        if _qcd_base > 0 and age_f >= 70:
             is_joint_yr = "joint" in _yr_filing_status.lower()
             qcd_cap = (210000.0 if is_joint_yr else 105000.0) * inf_factor
-            yr_qcd_requested = min(p_qcd_annual * inf_factor, qcd_cap)
+            yr_qcd_requested = min(_qcd_base * inf_factor, qcd_cap)
             # QCD within RMD: no additional IRA withdrawal needed (already withdrawn via RMD)
             qcd_within_rmd = min(yr_qcd_requested, rmd_total)
             # QCD beyond RMD: additional withdrawal from pre-tax
@@ -1532,7 +1574,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         # Protect the full remaining balance from voluntary withdrawals (conversions, waterfall, accel PT).
         # The overflow / last-resort path can still tap it if all other accounts are exhausted.
         qcd_reserve = 0.0
-        if p_qcd_annual > 0 and age_f >= 70:
+        if _qcd_base > 0 and age_f >= 70:
             qcd_reserve = max(0.0, curr_pre_filer + curr_pre_spouse)
 
         # Roth conversion (after RMD, before waterfall)
@@ -1582,12 +1624,12 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     conversion_this_year = min(conversion_this_year, agi_room)
 
                 # QCD floor: never drain IRA below the level where RMDs can fund QCDs
-                if p_qcd_annual > 0 and conversion_this_year > 0:
+                if _qcd_base > 0 and conversion_this_year > 0:
                     _next_age_f = age_f + 1
                     _next_age_s = (age_s + 1) if age_s else None
                     _has_rmd_next = (_next_age_f >= 73) or (_next_age_s is not None and _next_age_s >= 73)
                     if _has_rmd_next:
-                        _next_qcd = p_qcd_annual * ((1 + inflation) ** (i + 1))
+                        _next_qcd = _qcd_base * ((1 + inflation) ** (i + 1))
                         # Use youngest RMD-eligible spouse's divisor (most conservative)
                         _floor_ages = []
                         if _next_age_f >= 73: _floor_ages.append(_next_age_f)
@@ -2220,6 +2262,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         curr_home_val *= (1 + home_appr)
         home_equity = max(0.0, curr_home_val - curr_mtg_bal)
 
+        # Investment RE appreciation
+        if curr_inv_re_val > 0:
+            curr_inv_re_val *= (1 + inv_re_appr)
+
         # Estate calculation — present-value after-tax (what heirs receive today)
         total_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + curr_life
         _pretax_yr = curr_pre_filer + curr_pre_spouse
@@ -2227,7 +2273,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         _heir_roth_net = curr_roth  # tax-free, no haircut
         _heir_ann_net = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
         at_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_life + _heir_pretax_net + _heir_roth_net + _heir_ann_net
-        gross_estate_yr = total_wealth_yr + home_equity
+        gross_estate_yr = total_wealth_yr + home_equity + curr_inv_re_val
         # Estate tax: unlimited marital deduction → $0 while both spouses alive.
         _estate_tax_yr = 0.0
         _both_alive = _estate_is_joint and (first_death_idx is None or i < first_death_idx)
@@ -2236,10 +2282,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 gross_estate_yr, _estate_fed_exemption, _estate_exemption_growth, i,
                 _estate_is_joint, _estate_use_portability,
                 _estate_state_rate, _estate_state_exemption)
-        net_estate_yr = at_wealth_yr + home_equity - _estate_tax_yr
+        net_estate_yr = at_wealth_yr + home_equity + curr_inv_re_val - _estate_tax_yr
 
         # Total income for display (all taxable income sources)
-        total_income_disp = ss_now + pen_now + spendable_inv + rmd_total + conversion_this_year + _accel_pt_extra + yr_extra_income + wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
+        total_income_disp = ss_now + pen_now + spendable_inv + rmd_total + conversion_this_year + _accel_pt_extra + yr_extra_income + p_wages + p_other_income + p_tax_exempt_interest + wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
 
         _status_label = ""
         if first_death_idx is not None:
@@ -2248,7 +2294,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             elif _survivor_mode:
                 _status_label = "Survivor"
         row = {
-            "Year": yr, "Age": age_f, "Sp Age": age_s if age_s else "",
+            "Year": yr, "Age": age_f + 1, "Sp Age": (age_s + 1) if age_s else "",
         }
         if first_death_idx is not None:
             row["Status"] = _status_label
@@ -2259,6 +2305,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "SS": round(ss_now, 0), "Pension": round(pen_now, 0),
             "Fixed Inc": round(ss_now + pen_now, 0),
             "Inv Inc": round(spendable_inv, 0),
+            "Other Inc": round(p_wages + p_other_income + p_tax_exempt_interest, 0),
             "RMD": round(rmd_total, 0),
             "QCD": round(yr_qcd, 0),
             "Conversion": round(conversion_this_year, 0),
@@ -2269,7 +2316,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "W/D Annuity": round(wd_annuity, 0),
             "Accel PT": round(_accel_pt_extra, 0),
             "Harvest Gains": round(_harvest_gains, 0),
-            "Cap Gains": round(cap_gains_realized, 0),
+            "Realized CG": round(cap_gains_realized, 0),
             "Total Income": round(total_income_disp, 0),
             "AGI": round(yr_agi, 0),
             "Taxes": round(yr_tax, 0), "Medicare": round(yr_medicare, 0),
@@ -2285,6 +2332,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         if curr_home_val > 0 or home_val > 0:
             row["Home Value"] = round(curr_home_val, 0)
             row["Home Equity"] = round(home_equity, 0)
+        if curr_inv_re_val > 0 or inv_re_val > 0:
+            row["Inv RE"] = round(curr_inv_re_val, 0)
         row["Gross Estate"] = round(gross_estate_yr, 0)
         if _estate_tax_enabled:
             row["Estate Tax"] = round(_estate_tax_yr, 0)
@@ -2300,7 +2349,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     _final_heir_ann = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
     after_tax_estate = curr_cash + curr_ef + curr_brokerage + curr_life + _final_heir_pretax + _final_heir_roth + _final_heir_ann
     home_equity_final = max(0.0, curr_home_val - curr_mtg_bal)
-    _gross_final = total_wealth + home_equity_final
+    _gross_final = total_wealth + home_equity_final + curr_inv_re_val
     _final_estate_tax = 0.0
     _both_alive_final = _estate_is_joint and (first_death_idx is None or years < first_death_idx)
     if _estate_tax_enabled and not _both_alive_final:
@@ -2308,7 +2357,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _gross_final, _estate_fed_exemption, _estate_exemption_growth, years,
             _estate_is_joint, _estate_use_portability,
             _estate_state_rate, _estate_state_exemption)
-    _net_after_estate_tax = after_tax_estate + home_equity_final - _final_estate_tax
+    _net_after_estate_tax = after_tax_estate + home_equity_final + curr_inv_re_val - _final_estate_tax
 
     return {
         "after_tax_estate": _net_after_estate_tax,
@@ -2996,8 +3045,27 @@ with st.sidebar:
     rmd_manual = st.number_input("RMD manual override", value=0.0, step=1000.0, key="rmd_manual") if not auto_rmd else 0.0
     st.divider()
     st.header("Other Income / Deductions / Assets")
+    _default_age = age_at_date(filer_dob, dt.date.today()) if filer_dob else 70
     wages = st.number_input("Wages", value=0.0, step=1000.0, key="wages")
+    if wages > 0:
+        _wc1, _wc2 = st.columns(2)
+        with _wc1:
+            wages_start_age = st.number_input("Wages start age", value=_default_age, min_value=50, max_value=110, step=1, key="wages_start_age")
+        with _wc2:
+            wages_end_age = st.number_input("Wages end age (0=ongoing)", value=0, min_value=0, max_value=110, step=1, key="wages_end_age")
+    else:
+        wages_start_age = _default_age
+        wages_end_age = 0
     tax_exempt_interest = st.number_input("Tax-exempt interest", value=0.0, step=100.0, key="tax_exempt_interest")
+    if tax_exempt_interest > 0:
+        _tc1, _tc2 = st.columns(2)
+        with _tc1:
+            tax_exempt_start_age = st.number_input("Tax-exempt start age", value=_default_age, min_value=50, max_value=110, step=1, key="tax_exempt_start_age")
+        with _tc2:
+            tax_exempt_end_age = st.number_input("Tax-exempt end age (0=ongoing)", value=0, min_value=0, max_value=110, step=1, key="tax_exempt_end_age")
+    else:
+        tax_exempt_start_age = _default_age
+        tax_exempt_end_age = 0
     interest_taxable = st.number_input("Taxable interest", value=0.0, step=100.0, key="interest_taxable")
     reinvest_interest = st.checkbox("Reinvest interest (taxable but not spendable)", key="reinvest_interest")
     total_ordinary_dividends = st.number_input("Total ordinary dividends", value=0.0, step=100.0, key="total_ordinary_div")
@@ -3006,6 +3074,15 @@ with st.sidebar:
     cap_gain_loss = st.number_input("Baseline net cap gain/(loss)", value=0.0, step=1000.0, key="cap_gain_loss")
     reinvest_cap_gains = st.checkbox("Reinvest capital gains (taxable but not spendable)", key="reinvest_cap_gains")
     other_income = st.number_input("Other taxable income", value=0.0, step=500.0, key="other_income")
+    if other_income > 0:
+        _oc1, _oc2 = st.columns(2)
+        with _oc1:
+            other_income_start_age = st.number_input("Other income start age", value=_default_age, min_value=50, max_value=110, step=1, key="other_income_start_age")
+        with _oc2:
+            other_income_end_age = st.number_input("Other income end age (0=ongoing)", value=0, min_value=0, max_value=110, step=1, key="other_income_end_age")
+    else:
+        other_income_start_age = _default_age
+        other_income_end_age = 0
     filer_65_plus = st.checkbox("Filer age 65+", key="filer_65_plus")
     spouse_65_plus = st.checkbox("Spouse age 65+", key="spouse_65_plus") if "joint" in filing_status.lower() else False
     adjustments = st.number_input("Adjustments to income", value=0.0, step=500.0, key="adjustments")
@@ -3485,6 +3562,9 @@ with tab3:
                 "mortgage_payment": float(mortgage_payment),
                 "wages": float(wages), "tax_exempt_interest": float(tax_exempt_interest),
                 "other_income": float(other_income), "adjustments": float(adjustments),
+                "wages_start_age": int(wages_start_age), "wages_end_age": int(wages_end_age),
+                "other_income_start_age": int(other_income_start_age), "other_income_end_age": int(other_income_end_age),
+                "tax_exempt_start_age": int(tax_exempt_start_age), "tax_exempt_end_age": int(tax_exempt_end_age),
                 "home_value": float(home_value), "home_appreciation": float(home_appreciation),
                 "additional_expenses": [dict(ae) for ae in st.session_state.additional_expenses if ae.get("net_amount", 0) > 0],
                 "future_income": [dict(fi) for fi in st.session_state.future_income if fi.get("amount", 0) > 0],
