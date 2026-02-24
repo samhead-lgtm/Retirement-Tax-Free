@@ -93,6 +93,12 @@ _FP_DEFAULTS = {
     "use_asset_alloc": False,
     "cma_us_equity": 10.0, "cma_intl_equity": 8.0,
     "cma_fixed_income": 4.5, "cma_real_assets": 6.0, "cma_cash": 2.5,
+    # CMA yield decomposition (components of total return)
+    "cma_us_equity_div": 1.5, "cma_us_equity_qual": 85, "cma_us_equity_int": 0.0, "cma_us_equity_cg": 1.0,
+    "cma_intl_equity_div": 2.5, "cma_intl_equity_qual": 70, "cma_intl_equity_int": 0.0, "cma_intl_equity_cg": 0.5,
+    "cma_fixed_income_div": 0.0, "cma_fixed_income_qual": 0, "cma_fixed_income_int": 4.0, "cma_fixed_income_cg": 0.0,
+    "cma_real_assets_div": 3.0, "cma_real_assets_qual": 15, "cma_real_assets_int": 0.0, "cma_real_assets_cg": 0.5,
+    "cma_cash_div": 0.0, "cma_cash_qual": 0, "cma_cash_int": 2.5, "cma_cash_cg": 0.0,
     "aa_pretax_f_eq": 60, "aa_pretax_f_intl": 15, "aa_pretax_f_fi": 20, "aa_pretax_f_re": 5,
     "aa_pretax_s_eq": 60, "aa_pretax_s_intl": 15, "aa_pretax_s_fi": 20, "aa_pretax_s_re": 5,
     "aa_roth_f_eq": 70, "aa_roth_f_intl": 15, "aa_roth_f_fi": 10, "aa_roth_f_re": 5,
@@ -1738,12 +1744,35 @@ elif nav == "Growing":
     if D["use_asset_alloc"]:
         st.caption("Computed returns from CMA + allocation will override the simple growth rates above for projections.")
         st.subheader("Capital Market Assumptions (Expected Return %)")
-        cols = st.columns(5)
         _cma_labels = ["US Equity", "Int'l Equity", "Fixed Income", "Real Assets", "Cash"]
         _cma_keys = ["cma_us_equity", "cma_intl_equity", "cma_fixed_income", "cma_real_assets", "cma_cash"]
-        for i, (lbl, ck) in enumerate(zip(_cma_labels, _cma_keys)):
-            with cols[i]:
-                w_num(lbl, ck, step=0.5, format="%.1f")
+        _cma_base = ["us_equity", "intl_equity", "fixed_income", "real_assets", "cash"]
+        # Header row
+        hdr_cma = st.columns([2, 1, 1, 1, 1, 1, 1])
+        hdr_cma[0].markdown("**Asset Class**")
+        hdr_cma[1].markdown("**Total**")
+        hdr_cma[2].markdown("**Div%**")
+        hdr_cma[3].markdown("**Qual%**")
+        hdr_cma[4].markdown("**Int%**")
+        hdr_cma[5].markdown("**CG%**")
+        hdr_cma[6].markdown("**Deferred**")
+        for _ci, (_clbl, _ck, _cb) in enumerate(zip(_cma_labels, _cma_keys, _cma_base)):
+            _cr = st.columns([2, 1, 1, 1, 1, 1, 1])
+            _cr[0].write(_clbl)
+            with _cr[1]:
+                w_num(_clbl[:3] + " Tot", _ck, step=0.5, format="%.1f", label_visibility="collapsed")
+            with _cr[2]:
+                w_num(_clbl[:3] + " Div", f"cma_{_cb}_div", step=0.1, format="%.1f", label_visibility="collapsed")
+            with _cr[3]:
+                w_num(_clbl[:3] + " Q%", f"cma_{_cb}_qual", step=5, min_value=0, max_value=100, label_visibility="collapsed")
+            with _cr[4]:
+                w_num(_clbl[:3] + " Int", f"cma_{_cb}_int", step=0.1, format="%.1f", label_visibility="collapsed")
+            with _cr[5]:
+                w_num(_clbl[:3] + " CG", f"cma_{_cb}_cg", step=0.1, format="%.1f", label_visibility="collapsed")
+            _deferred = D[_ck] - D[f"cma_{_cb}_div"] - D[f"cma_{_cb}_int"] - D[f"cma_{_cb}_cg"]
+            _cr[6].write(f"{_deferred:.1f}%")
+            if _deferred < -0.01:
+                _cr[6].caption("⚠️ yields > total")
 
         st.subheader("Account Allocations (%)")
         _AA_ACCOUNTS = [("Pre-Tax Filer", "pretax_f"), ("Pre-Tax Spouse", "pretax_s"),
@@ -1752,18 +1781,22 @@ elif nav == "Growing":
         _AA_FIELDS = [("US Eq", "eq"), ("Int'l", "intl"), ("Fixed", "fi"), ("Real", "re")]
 
         # Header row
-        hdr = st.columns([2, 1, 1, 1, 1, 1, 1])
+        hdr = st.columns([2, 1, 1, 1, 1, 1, 1, 0.7, 0.7, 0.7, 0.7])
         hdr[0].markdown("**Account**")
         for i, (fl, _) in enumerate(_AA_FIELDS):
             hdr[i + 1].markdown(f"**{fl}**")
         hdr[5].markdown("**Cash**")
         hdr[6].markdown("**Return**")
+        hdr[7].markdown("**Div**")
+        hdr[8].markdown("**Int**")
+        hdr[9].markdown("**CG**")
+        hdr[10].markdown("**Def**")
 
         _cma_returns = [D[k] for k in _cma_keys]
         for acct_label, acct_key in _AA_ACCOUNTS:
             if not is_joint and "_s" in acct_key:
                 continue
-            cols = st.columns([2, 1, 1, 1, 1, 1, 1])
+            cols = st.columns([2, 1, 1, 1, 1, 1, 1, 0.7, 0.7, 0.7, 0.7])
             cols[0].write(acct_label)
             total = 0
             for i, (_, fk) in enumerate(_AA_FIELDS):
@@ -1777,20 +1810,32 @@ elif nav == "Growing":
             allocs = [D[f"aa_{acct_key}_{fk}"] for _, fk in _AA_FIELDS] + [cash_pct]
             ret = sum(a / 100 * r / 100 for a, r in zip(allocs, _cma_returns))
             cols[6].write(f"**{ret * 100:.1f}%**")
+            # Yield breakdown from CMA decomposition
+            _yd = _yc = _yi = 0.0
+            for _ai, _cbk in enumerate(_cma_base):
+                _aw = allocs[_ai] / 100
+                _yd += _aw * D.get(f"cma_{_cbk}_div", 0.0) / 100
+                _yi += _aw * D.get(f"cma_{_cbk}_int", 0.0) / 100
+                _yc += _aw * D.get(f"cma_{_cbk}_cg", 0.0) / 100
+            cols[7].write(f"{_yd * 100:.1f}%")
+            cols[8].write(f"{_yi * 100:.1f}%")
+            cols[9].write(f"{_yc * 100:.1f}%")
+            cols[10].write(f"{(ret - _yd - _yi - _yc) * 100:.1f}%")
 
     # --- Investment Assumptions for Projections ---
-    st.divider()
-    w_check("Investment assumptions for future projections", "use_invest_assumptions")
-    if D["use_invest_assumptions"]:
-        st.caption("These rates compute annual investment income in multi-year projections. "
-                   "Current-year tax numbers are entered in Receiving.")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            w_num("Dividend yield (%)", "proj_div_yield", step=0.1, format="%.1f")
-        with col2:
-            w_num("Annual cap gain (%)", "proj_cg_pct", step=0.1, format="%.1f")
-        with col3:
-            w_num("Cash interest rate (%)", "proj_int_rate", step=0.1, format="%.1f")
+    if not D["use_asset_alloc"]:
+        st.divider()
+        w_check("Investment assumptions for future projections", "use_invest_assumptions")
+        if D["use_invest_assumptions"]:
+            st.caption("These rates compute annual investment income in multi-year projections. "
+                       "Current-year tax numbers are entered in Receiving.")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                w_num("Dividend yield (%)", "proj_div_yield", step=0.1, format="%.1f")
+            with col2:
+                w_num("Annual cap gain (%)", "proj_cg_pct", step=0.1, format="%.1f")
+            with col3:
+                w_num("Cash interest rate (%)", "proj_int_rate", step=0.1, format="%.1f")
 
     # --- Real Estate ---
     st.divider()
@@ -2445,6 +2490,41 @@ elif nav == "Achieving":
             _inv_re_rental += D[f"inv_re_{_ri}_net_income"]
     if _inv_re_rental > 0:
         other_income += _inv_re_rental
+
+    # Asset allocation helper functions (must be defined before use)
+    def _compute_aa_return(acct_key):
+        _cma = [D["cma_us_equity"], D["cma_intl_equity"], D["cma_fixed_income"], D["cma_real_assets"], D["cma_cash"]]
+        _flds = ["eq", "intl", "fi", "re"]
+        allocs = [D[f"aa_{acct_key}_{fk}"] for fk in _flds]
+        cash_pct = max(0, 100 - sum(allocs))
+        allocs.append(cash_pct)
+        return sum(a / 100 * r / 100 for a, r in zip(allocs, _cma))
+
+    def _compute_aa_yields(acct_key):
+        """Returns dict with total, div_yield, qual_pct, int_yield, cg_yield, deferred — all as decimals."""
+        _cma_k = ["us_equity", "intl_equity", "fixed_income", "real_assets", "cash"]
+        _flds = ["eq", "intl", "fi", "re"]
+        allocs = [D[f"aa_{acct_key}_{fk}"] for fk in _flds]
+        cash_pct = max(0, 100 - sum(allocs))
+        allocs.append(cash_pct)
+        total = div = qual_w = int_y = cg = 0.0
+        for _i, _ck in enumerate(_cma_k):
+            w = allocs[_i] / 100
+            t = D[f"cma_{_ck}"] / 100
+            d = D.get(f"cma_{_ck}_div", 0.0) / 100
+            q = D.get(f"cma_{_ck}_qual", 0) / 100
+            n = D.get(f"cma_{_ck}_int", 0.0) / 100
+            c = D.get(f"cma_{_ck}_cg", 0.0) / 100
+            total += w * t
+            div += w * d
+            qual_w += w * d * q
+            int_y += w * n
+            cg += w * c
+        qual_pct = qual_w / div if div > 0 else 0.0
+        deferred = total - div - int_y - cg
+        return {"total": total, "div_yield": div, "qual_pct": qual_pct,
+                "int_yield": int_y, "cg_yield": cg, "deferred": deferred}
+
     interest_taxable = D["interest_taxable"]
     total_ordinary_dividends = D["total_ordinary_dividends"]
     qualified_dividends = D["qualified_dividends"]
@@ -2478,7 +2558,13 @@ elif nav == "Achieving":
     property_tax = D["property_tax"]
 
     # Investment income for projections
-    if D["use_invest_assumptions"]:
+    if D["use_asset_alloc"]:
+        _taxable_yields = _compute_aa_yields("taxable")
+        proj_interest = taxable_brokerage_bal * _taxable_yields["int_yield"]
+        proj_dividends = taxable_brokerage_bal * _taxable_yields["div_yield"]
+        proj_qual_div = proj_dividends * _taxable_yields["qual_pct"]
+        proj_cap_gains = taxable_brokerage_bal * _taxable_yields["cg_yield"]
+    elif D["use_invest_assumptions"]:
         proj_div_yield = D["proj_div_yield"] / 100
         proj_cg_pct = D["proj_cg_pct"] / 100
         proj_int_rate = D["proj_int_rate"] / 100
@@ -2486,9 +2572,6 @@ elif nav == "Achieving":
         proj_dividends = taxable_brokerage_bal * proj_div_yield
         proj_qual_div = proj_dividends * 0.8
         proj_cap_gains = taxable_brokerage_bal * proj_cg_pct
-        reinvest_dividends = D["reinvest_dividends"]
-        reinvest_cap_gains = D["reinvest_cap_gains"]
-        reinvest_interest = D["reinvest_interest"]
     else:
         proj_interest = interest_taxable
         proj_dividends = total_ordinary_dividends
@@ -2497,15 +2580,6 @@ elif nav == "Achieving":
     reinvest_dividends = D["reinvest_dividends"]
     reinvest_cap_gains = D["reinvest_cap_gains"]
     reinvest_interest = D["reinvest_interest"]
-
-    # Growth rates (possibly overridden by asset allocation)
-    def _compute_aa_return(acct_key):
-        _cma = [D["cma_us_equity"], D["cma_intl_equity"], D["cma_fixed_income"], D["cma_real_assets"], D["cma_cash"]]
-        _flds = ["eq", "intl", "fi", "re"]
-        allocs = [D[f"aa_{acct_key}_{fk}"] for fk in _flds]
-        cash_pct = max(0, 100 - sum(allocs))
-        allocs.append(cash_pct)
-        return sum(a / 100 * r / 100 for a, r in zip(allocs, _cma))
 
     if D["use_asset_alloc"]:
         r_pretax = (_compute_aa_return("pretax_f") + _compute_aa_return("pretax_s")) / 2 if is_joint else _compute_aa_return("pretax_f")
@@ -2723,6 +2797,13 @@ elif nav == "Achieving":
             "use_portability": bool(D["use_portability"]),
             "state_estate_tax_rate": float(D["state_estate_tax_rate"]),
             "state_estate_exemption": float(D["state_estate_exemption"]),
+            # AA yield decomposition for projection
+            "aa_yields": {
+                "taxable": _compute_aa_yields("taxable"),
+                "pretax": _compute_aa_yields("pretax_f"),
+                "roth": _compute_aa_yields("roth_f"),
+                "annuity": _compute_aa_yields("annuity"),
+            } if D["use_asset_alloc"] else None,
         }
 
     # --- Auto-compute base taxes ---
@@ -3090,6 +3171,44 @@ elif nav == "Achieving":
                     mc_simulations = st.number_input("Simulations", min_value=100, max_value=5000, value=1000, step=100, key="fp_mc_sims")
                     mc_volatility = st.number_input("Annual volatility (%)", value=12.0, step=1.0, key="fp_mc_vol") / 100
 
+                    if D["use_asset_alloc"]:
+                        st.markdown("#### Portfolio Summary (from Asset Allocation)")
+                        _ps_accts = [
+                            ("Brokerage", taxable_brokerage_bal, _compute_aa_yields("taxable"), _compute_aa_return("taxable")),
+                            ("Pre-Tax", pretax_bal, _compute_aa_yields("pretax_f"), _compute_aa_return("pretax_f")),
+                            ("Roth", roth_bal, _compute_aa_yields("roth_f"), _compute_aa_return("roth_f")),
+                        ]
+                        if annuity_value > 0:
+                            _ps_accts.append(("Annuity", annuity_value, _compute_aa_yields("annuity"), _compute_aa_return("annuity")))
+                        _ps_total = sum(b for _, b, _, _ in _ps_accts)
+                        if _ps_total > 0:
+                            _cma_labels_ps = ["US Equity", "Int'l Equity", "Fixed Income", "Real Assets", "Cash"]
+                            _flds_ps = ["eq", "intl", "fi", "re"]
+                            _acct_keys_ps = [("taxable", taxable_brokerage_bal), ("pretax_f", pretax_bal), ("roth_f", roth_bal)]
+                            if annuity_value > 0:
+                                _acct_keys_ps.append(("annuity", annuity_value))
+                            _overall_alloc = [0.0] * 5
+                            for _ak, _ab in _acct_keys_ps:
+                                _w = _ab / _ps_total
+                                _aa = [D[f"aa_{_ak}_{fk}"] for fk in _flds_ps]
+                                _aa_cash = max(0, 100 - sum(_aa))
+                                _aa.append(_aa_cash)
+                                for _j in range(5):
+                                    _overall_alloc[_j] += _w * _aa[_j]
+                            _alloc_str = " | ".join(f"{lbl}: {pct:.0f}%" for lbl, pct in zip(_cma_labels_ps, _overall_alloc))
+                            _ps_ret = sum(b / _ps_total * r for _, b, _, r in _ps_accts)
+                            _ps_div = sum(b / _ps_total * y["div_yield"] for _, b, y, _ in _ps_accts)
+                            _ps_int = sum(b / _ps_total * y["int_yield"] for _, b, y, _ in _ps_accts)
+                            _ps_cg = sum(b / _ps_total * y["cg_yield"] for _, b, y, _ in _ps_accts)
+                            _ps_def = _ps_ret - _ps_div - _ps_int - _ps_cg
+                            st.write(f"**Total Portfolio:** \\${_ps_total:,.0f}")
+                            st.write(f"**Allocation:** {_alloc_str}")
+                            st.write(f"**Blended Return: {_ps_ret * 100:.2f}%** — "
+                                     f"Div: {_ps_div * 100:.2f}% (\\${_ps_total * _ps_div:,.0f}) | "
+                                     f"Int: {_ps_int * 100:.2f}% (\\${_ps_total * _ps_int:,.0f}) | "
+                                     f"CG: {_ps_cg * 100:.2f}% (\\${_ps_total * _ps_cg:,.0f}) | "
+                                     f"Deferred: {_ps_def * 100:.2f}%")
+
                 # Read-only summary of additional expenses and future income
                 _ae_active = [ae for ae in st.session_state.additional_expenses if ae.get("net_amount", 0) > 0]
                 _fi_active = [fi for fi in st.session_state.future_income if fi.get("amount", 0) > 0]
@@ -3308,9 +3427,18 @@ elif nav == "Achieving":
                     # Test all 24 waterfall permutations
                     from itertools import permutations
                     _wf_buckets = ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"]
+                    _wf_bucket_bals = {
+                        "Taxable": a0["taxable"]["cash"] + a0["taxable"]["brokerage"] + a0["taxable"]["emergency_fund"],
+                        "Pre-Tax": a0["pretax"]["balance"],
+                        "Tax-Free": a0["taxfree"]["roth"] + a0["taxfree"]["life_cash_value"],
+                        "Tax-Deferred": a0["annuity"]["value"],
+                    }
                     _seen_wf = set()
                     for _perm in permutations(_wf_buckets):
                         _wf_list = list(_perm)
+                        # Skip if first bucket is empty — equivalent strategy exists starting with next non-empty bucket
+                        if _wf_bucket_bals.get(_wf_list[0], 0) < 1:
+                            continue
                         _wf_key = " -> ".join(_wf_list)
                         if _wf_key not in _seen_wf:
                             _seen_wf.add(_wf_key)

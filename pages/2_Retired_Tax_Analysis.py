@@ -1334,16 +1334,26 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     p_reinvest_div = params.get("reinvest_dividends", False)
     p_reinvest_cg = params.get("reinvest_cap_gains", False)
 
-    # Compute implied yields so investment income scales with brokerage balance
-    _init_brok = initial_assets["taxable"]["brokerage"]
-    if _init_brok > 0:
-        _div_yield = p_total_ordinary_div / _init_brok
-        _qual_ratio = p_qualified_div / p_total_ordinary_div if p_total_ordinary_div > 0 else 0.0
-        _cg_yield = max(0.0, p_base_cap_gain) / _init_brok
+    # AA yield decomposition (from asset allocation CMA breakdown)
+    _aa_yields = params.get("aa_yields", None)
+    if _aa_yields:
+        _taxable_y = _aa_yields["taxable"]
+        _div_yield = _taxable_y["div_yield"]
+        _qual_ratio = _taxable_y["qual_pct"]
+        _cg_yield = _taxable_y["cg_yield"]
+        _int_yield = _taxable_y["int_yield"]
     else:
-        _div_yield = 0.0
-        _qual_ratio = 0.0
-        _cg_yield = 0.0
+        # Compute implied yields so investment income scales with brokerage balance
+        _init_brok = initial_assets["taxable"]["brokerage"]
+        if _init_brok > 0:
+            _div_yield = p_total_ordinary_div / _init_brok
+            _qual_ratio = p_qualified_div / p_total_ordinary_div if p_total_ordinary_div > 0 else 0.0
+            _cg_yield = max(0.0, p_base_cap_gain) / _init_brok
+        else:
+            _div_yield = 0.0
+            _qual_ratio = 0.0
+            _cg_yield = 0.0
+        _int_yield = 0.0  # legacy: interest is static (p_interest_taxable)
 
     # Growth rate = total return (includes dividend + CG yield).
     # When not reinvesting, reduce effective growth by distributed yields.
@@ -1455,15 +1465,16 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr_ordinary_div = curr_brokerage * _div_yield
         yr_qualified_div = yr_ordinary_div * _qual_ratio
         yr_cap_gain = curr_brokerage * _cg_yield
+        yr_interest = (curr_brokerage * _int_yield) if _aa_yields else p_interest_taxable
 
         reinvested_base = 0.0
         if p_reinvest_int:
-            reinvested_base += p_interest_taxable
+            reinvested_base += yr_interest
         if p_reinvest_div:
             reinvested_base += yr_ordinary_div
         if p_reinvest_cg and yr_cap_gain > 0:
             reinvested_base += yr_cap_gain
-        spendable_inv = (p_interest_taxable + yr_ordinary_div + yr_cap_gain) - reinvested_base
+        spendable_inv = (yr_interest + yr_ordinary_div + yr_cap_gain) - reinvested_base
 
         # Spending
         yr_mtg_payment = mtg_payment if curr_mtg_bal > 0 else 0.0
@@ -1592,7 +1603,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 # Use gross RMD (not taxable_rmd) so conversion room decreases by full RMD.
                 # QCD-covered RMD doesn't add to AGI, but we want total IRA outflow
                 # (RMD + conversion) to be managed conservatively.
-                base_taxable = pen_now + rmd_total + p_interest_taxable + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income + _est_spending_wd
+                base_taxable = pen_now + rmd_total + yr_interest + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income + _est_spending_wd
                 if _yr_conv_strategy == "fill_to_target":
                     room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
                     conversion_this_year = min(room, avail_pretax)
@@ -1735,7 +1746,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 "total_ordinary_dividends": yr_ordinary_div,
                 "qualified_dividends": yr_qualified_div,
                 "tax_exempt_interest": p_tax_exempt_interest,
-                "interest_taxable": p_interest_taxable,
+                "interest_taxable": yr_interest,
                 "cap_gain_loss": yr_cap_gain,
                 "other_income": yr_extra_taxable + p_other_income,
                 "ordinary_tax_only": 0.0,
@@ -1783,7 +1794,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "total_ordinary_dividends": yr_ordinary_div,
                     "qualified_dividends": yr_qualified_div,
                     "tax_exempt_interest": p_tax_exempt_interest,
-                    "interest_taxable": p_interest_taxable,
+                    "interest_taxable": yr_interest,
                     "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                     "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                     "ordinary_tax_only": 0.0,
@@ -1889,7 +1900,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "total_ordinary_dividends": yr_ordinary_div,
                     "qualified_dividends": yr_qualified_div,
                     "tax_exempt_interest": p_tax_exempt_interest,
-                    "interest_taxable": p_interest_taxable,
+                    "interest_taxable": yr_interest,
                     "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                     "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                     "ordinary_tax_only": 0.0,
@@ -1989,7 +2000,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "total_ordinary_dividends": yr_ordinary_div,
                     "qualified_dividends": yr_qualified_div,
                     "tax_exempt_interest": p_tax_exempt_interest,
-                    "interest_taxable": p_interest_taxable,
+                    "interest_taxable": yr_interest,
                     "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                     "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                     "ordinary_tax_only": 0.0,
@@ -2099,7 +2110,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             if _avail_pt_accel > 0:
                 # Build base non-SS income from already-determined components
                 _base_non_ss = (pen_now + taxable_rmd + wd_pretax + conversion_this_year +
-                                p_interest_taxable + yr_ordinary_div + yr_cap_gain +
+                                yr_interest + yr_ordinary_div + yr_cap_gain +
                                 cap_gains_realized + ann_gains_withdrawn +
                                 yr_extra_taxable + p_other_income + p_wages)
                 _pref_amt = max(0.0, yr_cap_gain + cap_gains_realized) + max(0.0, yr_qualified_div)
@@ -2124,7 +2135,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         "total_ordinary_dividends": yr_ordinary_div,
                         "qualified_dividends": yr_qualified_div,
                         "tax_exempt_interest": p_tax_exempt_interest,
-                        "interest_taxable": p_interest_taxable,
+                        "interest_taxable": yr_interest,
                         "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                         "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                         "ordinary_tax_only": 0.0,
@@ -2158,7 +2169,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _unrealized_gains = max(0.0, _remaining_brok * dyn_gain_pct)
             if dyn_gain_pct > 0.01 and _unrealized_gains > 1.0:
                 _harv_base_non_ss = (pen_now + taxable_rmd + wd_pretax + conversion_this_year +
-                                     p_interest_taxable + yr_ordinary_div + yr_cap_gain +
+                                     yr_interest + yr_ordinary_div + yr_cap_gain +
                                      cap_gains_realized + ann_gains_withdrawn +
                                      yr_extra_taxable + p_other_income + p_wages)
                 _harv_existing_pref = max(0.0, yr_cap_gain + cap_gains_realized) + max(0.0, yr_qualified_div)
@@ -2178,7 +2189,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         "total_ordinary_dividends": yr_ordinary_div,
                         "qualified_dividends": yr_qualified_div,
                         "tax_exempt_interest": p_tax_exempt_interest,
-                        "interest_taxable": p_interest_taxable,
+                        "interest_taxable": yr_interest,
                         "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                         "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                         "ordinary_tax_only": 0.0,
