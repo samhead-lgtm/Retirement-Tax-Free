@@ -211,6 +211,11 @@ _COMP_DEFAULTS = {
     "last_net_needed": None, "last_source": None, "last_withdrawal_proceeds": 0,
     "gross_from_needs": 0, "additional_expenses": [], "future_income": [],
     "tab3_rows": None, "tab3_params": None, "tab3_mc": None,
+    # Unified optimizer
+    "opt_quick_results": None, "opt_deep_results": None, "opt_all_results": None,
+    "opt_best_combo": None, "opt_best_details": None, "opt_baseline_details": None,
+    "opt_params": None, "opt_selected_combo": None,
+    # Backward compat for PDF
     "phase1_results": None, "phase1_best_order": None, "phase1_best_details": None,
     "phase1_all_details": None, "phase1_selected_strategy": None, "phase1_params": None,
     "phase2_results": None, "phase2_best_details": None, "phase2_baseline_details": None,
@@ -2823,7 +2828,7 @@ elif nav == "Achieving":
     else:
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "Base Tax Estimator", "Income Needs", "Wealth Projection",
-            "Income Optimizer", "Roth Conversion Opportunity"])
+            "Multigenerational Optimizer", "Roth Conversion Opportunity"])
 
     # ════════════════════════════════════════════════════════════════
     # TAB 1: Base Tax Estimator
@@ -3391,11 +3396,98 @@ elif nav == "Achieving":
                         st.caption("Shaded bands: 10th\u201390th percentile range. Bold line: deterministic projection.")
 
         # ════════════════════════════════════════════════════════════════
-        # TAB 4: Income Optimizer
+        # TAB 4: Multigenerational Optimizer
         # ════════════════════════════════════════════════════════════════
+
+        def _run_single_strategy(a0, params, strat, conv_strat="none",
+                                  stop_age=0, target_agi=0, conv_years=0, agi_cap=False):
+            """Run one spending+conversion combo through the engine. Returns engine result dict."""
+            order_key = strat["key"]; wf_order = strat["wf"]
+            is_blend = strat["blend"]; pt_cap = strat["pt_cap"]
+            adaptive_key = strat["adaptive"]
+            accel_bracket = strat.get("accel_bracket")
+            ann_depl_yrs = strat.get("ann_depl_yrs"); ann_gains_only = strat.get("ann_gains_only", False)
+            harvest_bracket = strat.get("harvest_bracket")
+            _extra_kw = {}
+            if accel_bracket is not None: _extra_kw["extra_pretax_bracket"] = accel_bracket
+            if ann_depl_yrs is not None:
+                _extra_kw["annuity_depletion_years"] = ann_depl_yrs
+                if ann_gains_only: _extra_kw["annuity_gains_only"] = True
+            if harvest_bracket is not None: _extra_kw["harvest_gains_bracket"] = harvest_bracket
+            # Conversion parameters
+            if conv_strat != "none":
+                _extra_kw["conversion_strategy"] = conv_strat
+                _extra_kw["conversion_years_limit"] = conv_years if conv_years > 0 else int(params["years"])
+                _extra_kw["stop_conversion_age"] = stop_age if stop_age > 0 else 200
+                if target_agi > 0: _extra_kw["target_agi"] = target_agi
+                if agi_cap: _extra_kw["agi_cap_bracket_fills"] = True
+            # Dispatch by strategy type
+            if order_key == "adaptive":
+                if conv_strat == "none":
+                    # Let built-in adaptive conversions work (pass stop_age from user or default high)
+                    return TEA.run_wealth_projection(a0, params, [], adaptive_strategy=adaptive_key,
+                                                      stop_conversion_age=stop_age if stop_age > 0 else 200, **_extra_kw)
+                else:
+                    # Override: explicit conversion strategy replaces built-in
+                    return TEA.run_wealth_projection(a0, params, [], adaptive_strategy=adaptive_key, **_extra_kw)
+            elif order_key == "blend":
+                return TEA.run_wealth_projection(a0, params, [], pretax_annual_cap=pt_cap, **_extra_kw)
+            elif order_key == "prorata":
+                return TEA.run_wealth_projection(a0, params, [], prorata_blend=True, **_extra_kw)
+            elif order_key == "prorata_pt_heavy":
+                return TEA.run_wealth_projection(a0, params, [], prorata_blend=True, prorata_weights={"pretax": 2.0, "roth": 0.25}, **_extra_kw)
+            elif order_key == "prorata_no_roth":
+                return TEA.run_wealth_projection(a0, params, [], prorata_blend=True, prorata_weights={"roth": 0.0, "life": 0.0}, **_extra_kw)
+            elif is_blend:
+                return TEA.run_wealth_projection(a0, params, wf_order, blend_mode=True, **_extra_kw)
+            else:
+                return TEA.run_wealth_projection(a0, params, wf_order, **_extra_kw)
+
+        def _package_result(result, strat, spending_label, conv_label, scan_phase):
+            """Build unified result dict from engine output."""
+            _yd = result["year_details"]
+            _pr_weights = None
+            order_key = strat["key"]
+            if order_key == "prorata_pt_heavy": _pr_weights = {"pretax": 2.0, "roth": 0.25}
+            elif order_key == "prorata_no_roth": _pr_weights = {"roth": 0.0, "life": 0.0}
+            _strat_info = {"type": order_key, "pt_cap": strat["pt_cap"], "blend": strat["blend"],
+                           "wf": strat["wf"], "prorata": order_key.startswith("prorata"),
+                           "prorata_weights": _pr_weights, "adaptive_key": strat["adaptive"],
+                           "accel_bracket": strat.get("accel_bracket"),
+                           "ann_depl_yrs": strat.get("ann_depl_yrs"),
+                           "ann_gains_only": strat.get("ann_gains_only", False),
+                           "conv_strat": strat.get("conv_strat", "none"),
+                           "harvest_bracket": strat.get("harvest_bracket")}
+            return {
+                "spending_label": spending_label,
+                "conversion_label": conv_label,
+                "scan_phase": scan_phase,
+                "after_tax_estate": result["after_tax_estate"],
+                "gross_estate": result.get("gross_estate", result["total_wealth"]),
+                "total_wealth": result["total_wealth"],
+                "total_taxes": result["total_taxes"],
+                "total_converted": result.get("total_converted", 0),
+                "final_cash": result["final_cash"],
+                "final_brokerage": result["final_brokerage"],
+                "final_pretax": result["final_pretax"],
+                "final_roth": result["final_roth"],
+                "final_annuity": result["final_annuity"],
+                "final_life": result["final_life"],
+                "tot_wd_cash": sum(r.get("W/D Cash", 0) for r in _yd),
+                "tot_wd_taxable": sum(r.get("W/D Taxable", 0) for r in _yd),
+                "tot_wd_pretax": sum(r.get("W/D Pre-Tax", 0) for r in _yd),
+                "tot_wd_roth": sum(r.get("W/D Roth", 0) + r.get("W/D Life", 0) for r in _yd),
+                "tot_wd_annuity": sum(r.get("W/D Annuity", 0) for r in _yd),
+                "_strat_info": _strat_info,
+                "_year_details": _yd,
+                # PDF backward compat
+                "waterfall": spending_label,
+                "order": strat.get("key", strat.get("type", "")),
+            }
+
         with tab4:
-            st.subheader("Income Optimizer")
-            st.write("Finds the optimal spending strategy to maximize after-tax wealth to heirs, then tests Roth conversions for further improvement.")
+            st.subheader("Multigenerational Optimizer")
+            st.write("Jointly optimizes spending strategy and Roth conversions to maximize after-tax estate to heirs.")
             if st.session_state.assets is None:
                 st.warning("Run Base Tax Estimator first.")
             else:
@@ -3408,24 +3500,47 @@ elif nav == "Achieving":
                     st.caption(f"Survivor: {survivor_spending_pct}% spending, {pension_survivor_pct}% pension benefit after first death")
 
                 st.divider()
-                st.markdown("### Phase 1: Optimal Spending Strategy")
-                st.info("Tests smart blend strategies (varying pre-tax vs brokerage mix each year) plus waterfall orderings to find what maximizes after-tax estate.")
 
-                if st.button("Run Optimizer", type="primary", key="fp_run_phase1"):
+                # ---- Controls ----
+                col1, col2 = st.columns(2)
+                with col1:
+                    target_agi_input = st.number_input("Target AGI (conversion ceiling)", value=218000.0 if is_joint else 109000.0, step=10000.0, key="fp_opt_target",
+                        help="Conversions won't push AGI above this. Controls bracket-fill and cap strategies.")
+                with col2:
+                    st.markdown("**Common Thresholds**")
+                    if is_joint:
+                        st.write("22%: $206,700 | 24%: $394,600")
+                        st.write("IRMAA: $218k | $274k | $342k | $410k")
+                    else:
+                        st.write("22%: $103,350 | 24%: $197,300")
+                        st.write("IRMAA: $109k | $137k | $171k | $205k")
+                conv_amounts_str = st.text_input("Conversion amounts to test (comma separated)", value="25000, 50000, 75000, 100000, 150000, 200000", key="fp_opt_amounts")
+                include_fill = st.checkbox("Also test 'Fill to Target AGI' strategy", value=True, key="fp_opt_fill")
+                include_bracket_fill = st.checkbox("Also test bracket-fill strategies", value=True, key="fp_opt_bracket_fill")
+                agi_cap_enabled = st.checkbox("Cap all strategies at Target AGI", value=True, key="fp_opt_agi_cap",
+                    help="When checked, bracket-fill and fixed-amount strategies won't exceed the Target AGI")
+                col_ds1, col_ds2 = st.columns(2)
+                with col_ds1:
+                    deep_top_k = st.slider("Deep Search: Top N spending strategies", min_value=3, max_value=20, value=10, key="fp_opt_top_k")
+                with col_ds2:
+                    test_adaptive_overrides = st.checkbox("Test adaptive strategies with override conversions", value=True, key="fp_opt_adaptive_overrides")
+
+                if st.button("Run Optimizer", type="primary", key="fp_run_optimizer"):
                     params = _build_tab3_params()
-                    _test_strategies = []
+                    from itertools import permutations
+
+                    # ---- Build spending strategies ----
+                    _spending_strategies = []
                     _blend_caps = [0, 10000, 25000, 50000, 75000, 100000, 150000, 200000, 999999]
                     for cap in _blend_caps:
                         if cap == 0: label = "Brokerage First (Pre-Tax $0/yr)"
                         elif cap >= 999999: label = "Pre-Tax First (Unlimited)"
                         else: label = f"Blend: Pre-Tax ${cap:,.0f}/yr + Brokerage"
-                        _test_strategies.append({"key": "blend", "label": label, "wf": [], "blend": False, "pt_cap": cap, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _test_strategies.append({"key": "prorata", "label": "Pro-Rata: All Accounts (Equal Weight)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _test_strategies.append({"key": "prorata_pt_heavy", "label": "Pro-Rata: Heavy Pre-Tax (2x), Light Roth (0.25x)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _test_strategies.append({"key": "prorata_no_roth", "label": "Pro-Rata: All Except Roth", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _test_strategies.append({"key": "dynamic", "label": "Dynamic Blend (Marginal Cost)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    # Test all 24 waterfall permutations
-                    from itertools import permutations
+                        _spending_strategies.append({"key": "blend", "label": label, "wf": [], "blend": False, "pt_cap": cap, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "prorata", "label": "Pro-Rata: All Accounts (Equal Weight)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "prorata_pt_heavy", "label": "Pro-Rata: Heavy Pre-Tax (2x), Light Roth (0.25x)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "prorata_no_roth", "label": "Pro-Rata: All Except Roth", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "dynamic", "label": "Dynamic Blend (Marginal Cost)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     _wf_buckets = ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"]
                     _wf_bucket_bals = {
                         "Taxable": a0["taxable"]["cash"] + a0["taxable"]["brokerage"] + a0["taxable"]["emergency_fund"],
@@ -3436,326 +3551,309 @@ elif nav == "Achieving":
                     _seen_wf = set()
                     for _perm in permutations(_wf_buckets):
                         _wf_list = list(_perm)
-                        # Skip if first bucket is empty — equivalent strategy exists starting with next non-empty bucket
-                        if _wf_bucket_bals.get(_wf_list[0], 0) < 1:
-                            continue
+                        if _wf_bucket_bals.get(_wf_list[0], 0) < 1: continue
                         _wf_key = " -> ".join(_wf_list)
                         if _wf_key not in _seen_wf:
                             _seen_wf.add(_wf_key)
-                            _test_strategies.append({"key": "wf", "label": f"WF: {_wf_key}", "wf": _wf_list, "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    for _akey, _adef in TEA.ADAPTIVE_STRATEGIES.items():
-                        _test_strategies.append({"key": "adaptive", "label": _adef["label"], "wf": [], "blend": False, "pt_cap": None, "adaptive": _akey, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                            _spending_strategies.append({"key": "wf", "label": f"WF: {_wf_key}", "wf": _wf_list, "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     for _ab_rate, _ab_label in [(0.12, "Accel PT: Fill 12% -> Brokerage"), (0.22, "Accel PT: Fill 22% -> Brokerage"), (0.24, "Accel PT: Fill 24% -> Brokerage"), ("irmaa", "Accel PT: Fill to IRMAA -> Brokerage")]:
-                        _test_strategies.append({"key": "blend", "label": _ab_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": _ab_rate, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                        _spending_strategies.append({"key": "blend", "label": _ab_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": _ab_rate, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     if a0["annuity"]["value"] > 0 and a0["annuity"]["value"] > a0["annuity"]["basis"]:
                         for _depl_yrs in [5, 10, 15]:
-                            _test_strategies.append({"key": "blend", "label": f"Draw Ann Gains {_depl_yrs}yr", "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": _depl_yrs, "ann_gains_only": True, "conv_strat": "none", "harvest_bracket": None})
+                            _spending_strategies.append({"key": "blend", "label": f"Draw Ann Gains {_depl_yrs}yr", "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": _depl_yrs, "ann_gains_only": True, "conv_strat": "none", "harvest_bracket": None})
                     for _hv_accel, _hv_label in [(None, "Harvest 0% LTCG Gains"), (None, "Brokerage First + Harvest 0% Gains"), (0.12, "Accel PT Fill 12% + Harvest 0% Gains"), (0.22, "Accel PT Fill 22% + Harvest 0% Gains")]:
-                        _test_strategies.append({"key": "blend", "label": _hv_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": _hv_accel, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": 0.0})
+                        _spending_strategies.append({"key": "blend", "label": _hv_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": _hv_accel, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": 0.0})
 
-                    results = []; all_details = {}; best_estate = -float("inf"); best_order = None; best_details = None
+                    # Adaptive strategies (separate list)
+                    _adaptive_strategies = []
+                    for _akey, _adef in TEA.ADAPTIVE_STRATEGIES.items():
+                        _adaptive_strategies.append({"key": "adaptive", "label": _adef["label"], "wf": [], "blend": False, "pt_cap": None, "adaptive": _akey, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+
+                    # ---- Build conversion strategies ----
+                    try: conv_amounts = [float(x.strip()) for x in conv_amounts_str.split(",")]
+                    except Exception: conv_amounts = [25000, 50000, 75000, 100000]
+                    _conv_strategies = []
+                    for amt in conv_amounts: _conv_strategies.append((amt, f"${amt:,.0f}/yr"))
+                    if include_fill: _conv_strategies.append(("fill_to_target", f"Fill to ${target_agi_input:,.0f}"))
+                    if include_bracket_fill:
+                        _cap_tag = f" (cap ${target_agi_input/1000:.0f}k)" if agi_cap_enabled else ""
+                        _conv_strategies += [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"), ("fill_irmaa_0", "Fill to IRMAA Tier 1")]
+
+                    # ---- Count total runs for progress ----
+                    _n_quick = len(_spending_strategies) + len(_adaptive_strategies)
+                    _n_deep_est = min(deep_top_k, len(_spending_strategies)) * len(_conv_strategies)
+                    if test_adaptive_overrides: _n_deep_est += min(3, len(_adaptive_strategies)) * len(_conv_strategies)
+                    _n_total = _n_quick + _n_deep_est
+
+                    all_results = []; _run_count = 0
                     progress_bar = st.progress(0); status_text = st.empty()
-                    for idx, _strat in enumerate(_test_strategies):
-                        order_key = _strat["key"]; label = _strat["label"]; wf_order = _strat["wf"]
-                        is_blend = _strat["blend"]; pt_cap = _strat["pt_cap"]
-                        adaptive_key = _strat["adaptive"]; accel_bracket = _strat["accel_bracket"]
-                        ann_depl_yrs = _strat.get("ann_depl_yrs"); ann_gains_only = _strat.get("ann_gains_only", False)
-                        conv_strat = _strat["conv_strat"]; harvest_bracket = _strat.get("harvest_bracket")
-                        status_text.text(f"Testing {idx + 1} of {len(_test_strategies)}: {label}")
-                        _extra_kw = {}
-                        if accel_bracket is not None: _extra_kw["extra_pretax_bracket"] = accel_bracket
-                        if ann_depl_yrs is not None:
-                            _extra_kw["annuity_depletion_years"] = ann_depl_yrs
-                            if ann_gains_only: _extra_kw["annuity_gains_only"] = True
-                        if harvest_bracket is not None: _extra_kw["harvest_gains_bracket"] = harvest_bracket
-                        if conv_strat != "none":
-                            _extra_kw["conversion_strategy"] = conv_strat
-                            _extra_kw["conversion_years_limit"] = int(params["years"])
-                            _extra_kw["stop_conversion_age"] = 200
-                        if order_key == "adaptive":
-                            # Phase 1: test spending strategy only — block conversions (stop_conversion_age=0)
-                            result = TEA.run_wealth_projection(a0, params, [], stop_conversion_age=0, adaptive_strategy=adaptive_key, **_extra_kw)
-                        elif order_key == "blend":
-                            result = TEA.run_wealth_projection(a0, params, [], pretax_annual_cap=pt_cap, **_extra_kw)
-                        elif order_key == "prorata":
-                            result = TEA.run_wealth_projection(a0, params, [], prorata_blend=True, **_extra_kw)
-                        elif order_key == "prorata_pt_heavy":
-                            result = TEA.run_wealth_projection(a0, params, [], prorata_blend=True, prorata_weights={"pretax": 2.0, "roth": 0.25}, **_extra_kw)
-                        elif order_key == "prorata_no_roth":
-                            result = TEA.run_wealth_projection(a0, params, [], prorata_blend=True, prorata_weights={"roth": 0.0, "life": 0.0}, **_extra_kw)
-                        elif is_blend:
-                            result = TEA.run_wealth_projection(a0, params, wf_order, blend_mode=True, **_extra_kw)
-                        else:
-                            result = TEA.run_wealth_projection(a0, params, wf_order, **_extra_kw)
-                        estate = result["after_tax_estate"]
-                        _pr_weights = None
-                        if order_key == "prorata_pt_heavy": _pr_weights = {"pretax": 2.0, "roth": 0.25}
-                        elif order_key == "prorata_no_roth": _pr_weights = {"roth": 0.0, "life": 0.0}
-                        _strat_info = {"type": order_key, "pt_cap": pt_cap, "blend": is_blend, "wf": wf_order, "prorata": order_key.startswith("prorata"), "prorata_weights": _pr_weights, "adaptive_key": adaptive_key, "accel_bracket": accel_bracket, "ann_depl_yrs": ann_depl_yrs, "ann_gains_only": ann_gains_only, "conv_strat": conv_strat, "harvest_bracket": harvest_bracket}
-                        # Cumulative withdrawals by source
-                        _yd = result["year_details"]
-                        _cum_wd = {
-                            "tot_wd_cash": sum(r.get("W/D Cash", 0) for r in _yd),
-                            "tot_wd_taxable": sum(r.get("W/D Taxable", 0) for r in _yd),
-                            "tot_wd_pretax": sum(r.get("W/D Pre-Tax", 0) for r in _yd),
-                            "tot_wd_roth": sum(r.get("W/D Roth", 0) + r.get("W/D Life", 0) for r in _yd),
-                            "tot_wd_annuity": sum(r.get("W/D Annuity", 0) for r in _yd),
-                        }
-                        results.append({"order": order_key, "waterfall": label, "after_tax_estate": estate, "total_wealth": result["total_wealth"], "gross_estate": result.get("gross_estate", result["total_wealth"]), "total_taxes": result["total_taxes"], "final_cash": result["final_cash"], "final_brokerage": result["final_brokerage"], "final_pretax": result["final_pretax"], "final_roth": result["final_roth"], "final_annuity": result["final_annuity"], "final_life": result["final_life"], "_pt_cap": pt_cap, "_is_blend": is_blend, "_wf_order": wf_order, "_strat_info": _strat_info, "_year_details": result["year_details"], **_cum_wd})
-                        all_details[label] = result["year_details"]
-                        if estate > best_estate: best_estate = estate; best_order = _strat_info; best_details = result["year_details"]
-                        progress_bar.progress((idx + 1) / len(_test_strategies))
+
+                    # ════════════════════════════════════════════
+                    # QUICK SCAN: non-adaptive with NO conversion + adaptive WITH built-in
+                    # ════════════════════════════════════════════
+                    status_text.text("Quick Scan: testing spending strategies...")
+
+                    # Non-adaptive strategies — no conversions (stop_conversion_age=0)
+                    for _strat in _spending_strategies:
+                        status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']}")
+                        result = _run_single_strategy(a0, params, _strat, conv_strat="none", stop_age=0)
+                        pkg = _package_result(result, _strat, _strat["label"], "No Conversion", "quick")
+                        all_results.append(pkg)
+                        _run_count += 1
+                        progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
+
+                    # Adaptive strategies — WITH their built-in conversions (the key fix!)
+                    for _strat in _adaptive_strategies:
+                        status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']} (built-in conversions)")
+                        result = _run_single_strategy(a0, params, _strat, conv_strat="none",
+                                                       stop_age=200, target_agi=target_agi_input)
+                        pkg = _package_result(result, _strat, _strat["label"], "Built-in", "quick")
+                        all_results.append(pkg)
+                        _run_count += 1
+                        progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
+
+                    # ---- Rank quick scan, select top K non-adaptive ----
+                    _quick_non_adaptive = [r for r in all_results if r["scan_phase"] == "quick" and r["conversion_label"] == "No Conversion"]
+                    _quick_non_adaptive.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+                    _top_k_spending = _quick_non_adaptive[:deep_top_k]
+                    _top_k_labels = set(r["spending_label"] for r in _top_k_spending)
+                    _top_k_strats = [s for s in _spending_strategies if s["label"] in _top_k_labels]
+
+                    _quick_adaptive = [r for r in all_results if r["scan_phase"] == "quick" and r["conversion_label"] == "Built-in"]
+                    _quick_adaptive.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+                    _top_adaptive_strats = []
+                    if test_adaptive_overrides:
+                        _top_adaptive_labels = set(r["spending_label"] for r in _quick_adaptive[:3])
+                        _top_adaptive_strats = [s for s in _adaptive_strategies if s["label"] in _top_adaptive_labels]
+
+                    # ════════════════════════════════════════════
+                    # DEEP SEARCH: top K spending × all conversions + top adaptive × overrides
+                    # ════════════════════════════════════════════
+                    status_text.text("Deep Search: testing spending + conversion combos...")
+
+                    for _strat in _top_k_strats:
+                        for _conv_val, _conv_label in _conv_strategies:
+                            status_text.text(f"Deep Search ({_run_count + 1 - _n_quick}/{_n_deep_est}): {_strat['label']} + {_conv_label}")
+                            result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
+                                                           stop_age=200, target_agi=target_agi_input,
+                                                           conv_years=int(params["years"]), agi_cap=agi_cap_enabled)
+                            pkg = _package_result(result, _strat, _strat["label"], _conv_label, "deep")
+                            all_results.append(pkg)
+                            _run_count += 1
+                            _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
+                            progress_bar.progress(min(1.0, _deep_pct))
+
+                    # Adaptive overrides: top 3 adaptive × all explicit conversions
+                    for _strat in _top_adaptive_strats:
+                        for _conv_val, _conv_label in _conv_strategies:
+                            status_text.text(f"Deep Search ({_run_count + 1 - _n_quick}/{_n_deep_est}): {_strat['label']} + {_conv_label}")
+                            result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
+                                                           stop_age=200, target_agi=target_agi_input,
+                                                           conv_years=int(params["years"]), agi_cap=agi_cap_enabled)
+                            pkg = _package_result(result, _strat, _strat["label"], _conv_label, "deep")
+                            all_results.append(pkg)
+                            _run_count += 1
+                            _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
+                            progress_bar.progress(min(1.0, _deep_pct))
+
+                    progress_bar.progress(1.0)
                     progress_bar.empty(); status_text.empty()
-                    results.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+
+                    # ════════════════════════════════════════════
+                    # MERGE & RANK — dedup within $100
+                    # ════════════════════════════════════════════
+                    all_results.sort(key=lambda x: x["after_tax_estate"], reverse=True)
                     _deduped = []
-                    for r in results:
+                    for r in all_results:
                         _merged = False
                         for d in _deduped:
-                            if abs(d["after_tax_estate"] - r["after_tax_estate"]) < 100:
-                                d["_group_members"].append(r["waterfall"]); d["_group_size"] += 1; _merged = True; break
-                        if not _merged: r["_group_members"] = [r["waterfall"]]; r["_group_size"] = 1; _deduped.append(r)
-                    results = _deduped
-                    st.session_state.phase1_results = results; st.session_state.phase1_best_order = best_order
-                    st.session_state.phase1_best_details = best_details; st.session_state.phase1_all_details = all_details
-                    st.session_state.phase1_selected_strategy = None; st.session_state.phase1_params = params
-                    st.session_state.phase2_results = None; st.session_state.phase2_best_details = None
-                    _estate_range = max(r["after_tax_estate"] for r in results) - min(r["after_tax_estate"] for r in results)
-                    if _estate_range < 100:
-                        st.info("Your income covers all spending needs \u2014 withdrawal strategy has no impact. The real opportunity is **Roth conversions** (Phase 2 below).")
+                            if d["spending_label"] == r["spending_label"] and abs(d["after_tax_estate"] - r["after_tax_estate"]) < 100:
+                                if "_group_members" not in d: d["_group_members"] = [d["conversion_label"]]
+                                d["_group_members"].append(r["conversion_label"]); d["_group_size"] = d.get("_group_size", 1) + 1; _merged = True; break
+                        if not _merged: r["_group_members"] = [r["conversion_label"]]; r["_group_size"] = 1; _deduped.append(r)
+                    all_results = _deduped
 
-                if st.session_state.phase1_results:
-                    p1 = st.session_state.phase1_results; best = p1[0]
-                    st.success(f"Best Strategy: **{best['waterfall']}**")
-                    _has_et = best.get("estate_tax", 0) > 0
-                    _p1_cols = st.columns(4 if _has_et else 3)
-                    with _p1_cols[0]: st.metric("Gross Estate", f"${best.get('gross_estate', best['total_wealth']):,.0f}")
-                    if _has_et:
-                        with _p1_cols[1]: st.metric("Estate Tax", f"${best['estate_tax']:,.0f}")
-                    _p1i = 2 if _has_et else 1
-                    with _p1_cols[_p1i]: st.metric("Net Estate (After All Tax)", f"${best['after_tax_estate']:,.0f}")
-                    with _p1_cols[_p1i+1]: st.metric("Total Taxes + Medicare", f"${best['total_taxes']:,.0f}")
-                    with st.expander("All Strategies Compared", expanded=True):
-                        _comp_rows = []
-                        for r in p1:
-                            _type_tag = r["order"]
-                            if _type_tag == "adaptive": _cat = "Adaptive"
-                            elif _type_tag.startswith("prorata"): _cat = "Pro-Rata"
-                            elif _type_tag == "blend": _cat = "Blend"
-                            elif _type_tag == "dynamic": _cat = "Dynamic"
-                            else: _cat = "Waterfall"
-                            _row = {"Type": _cat, "Strategy": r["waterfall"], "Net Estate": f"${r['after_tax_estate']:,.0f}", "Gross Estate": f"${r.get('gross_estate', r['total_wealth']):,.0f}", "Total Taxes": f"${r['total_taxes']:,.0f}",
-                                "Drew Cash": f"${r.get('tot_wd_cash', 0):,.0f}", "Drew Taxable": f"${r.get('tot_wd_taxable', 0):,.0f}", "Drew Pre-Tax": f"${r.get('tot_wd_pretax', 0):,.0f}", "Drew Tax-Free": f"${r.get('tot_wd_roth', 0):,.0f}", "Drew Annuity": f"${r.get('tot_wd_annuity', 0):,.0f}",
-                                "Final Pre-Tax": f"${r['final_pretax']:,.0f}", "Final Roth": f"${r['final_roth']:,.0f}", "Final Brokerage": f"${r['final_brokerage']:,.0f}", "Final Cash": f"${r.get('final_cash', 0):,.0f}", "Final Annuity": f"${r.get('final_annuity', 0):,.0f}", "Final Life": f"${r.get('final_life', 0):,.0f}", "vs Best": f"${r['after_tax_estate'] - best['after_tax_estate']:+,.0f}"}
+                    # Store in session state
+                    _quick_results = [r for r in all_results if r["scan_phase"] == "quick"]
+                    st.session_state.opt_quick_results = _quick_results
+                    st.session_state.opt_deep_results = [r for r in all_results if r["scan_phase"] == "deep"]
+                    st.session_state.opt_all_results = all_results
+                    st.session_state.opt_best_combo = all_results[0] if all_results else None
+                    st.session_state.opt_best_details = all_results[0]["_year_details"] if all_results else None
+                    st.session_state.opt_params = params
+
+                    # Baseline = best spending-only (no conversion)
+                    _spending_only = [r for r in all_results if r["conversion_label"] == "No Conversion"]
+                    _best_spending_only = _spending_only[0] if _spending_only else all_results[0]
+                    st.session_state.opt_baseline_details = _best_spending_only["_year_details"]
+
+                    # ---- Backward compat for PDF ----
+                    _p1_compat = [r for r in all_results if r["conversion_label"] in ("No Conversion", "Built-in")]
+                    st.session_state.phase1_results = _p1_compat
+                    st.session_state.phase1_best_order = _best_spending_only["_strat_info"]
+                    st.session_state.phase1_best_details = _best_spending_only["_year_details"]
+                    st.session_state.phase1_all_details = {r["spending_label"]: r["_year_details"] for r in _p1_compat}
+                    st.session_state.phase1_selected_strategy = None
+                    st.session_state.phase1_params = params
+                    _p2_compat = [r for r in all_results if r["conversion_label"] not in ("No Conversion", "Built-in")]
+                    _global_best = all_results[0]
+                    # Map deep results into phase2 format for PDF
+                    _p2_mapped = []
+                    _baseline_estate = _best_spending_only["after_tax_estate"]
+                    for r in _p2_compat:
+                        _p2_mapped.append({
+                            "strategy_name": f"{r['spending_label']} + {r['conversion_label']}",
+                            "after_tax_estate": r["after_tax_estate"],
+                            "improvement": r["after_tax_estate"] - _baseline_estate,
+                            "total_wealth": r["total_wealth"],
+                            "gross_estate": r["gross_estate"],
+                            "total_taxes": r["total_taxes"],
+                            "total_converted": r["total_converted"],
+                            "final_pretax": r["final_pretax"],
+                            "final_roth": r["final_roth"],
+                            "final_brokerage": r["final_cash"] + r["final_brokerage"],
+                            "_year_details": r["_year_details"],
+                        })
+                    st.session_state.phase2_results = _p2_mapped if _p2_mapped else None
+                    st.session_state.phase2_best_details = _global_best["_year_details"]
+                    st.session_state.phase2_baseline_details = _best_spending_only["_year_details"]
+                    st.session_state.phase2_best_name = f"{_global_best['spending_label']} + {_global_best['conversion_label']}"
+
+                    st.success(f"Tested {_run_count} combinations ({_n_quick} quick scan + {_run_count - _n_quick} deep search)")
+
+                # ════════════════════════════════════════════
+                # RESULTS DISPLAY
+                # ════════════════════════════════════════════
+                if st.session_state.opt_all_results:
+                    _all = st.session_state.opt_all_results
+                    _best = _all[0]
+                    _spending_only = [r for r in _all if r["conversion_label"] == "No Conversion"]
+                    _best_spending_only = _spending_only[0] if _spending_only else _best
+                    _baseline_estate = _best_spending_only["after_tax_estate"]
+
+                    # ---- Best Combo highlight ----
+                    _best_label = f"{_best['spending_label']} + {_best['conversion_label']}"
+                    _improvement = _best["after_tax_estate"] - _baseline_estate
+                    if _improvement > 100:
+                        st.success(f"**Best:** {_best_label} — Estate: **${_best['after_tax_estate']:,.0f}** (+${_improvement:,.0f} vs spending-only)")
+                    else:
+                        st.success(f"**Best:** {_best_label} — Estate: **${_best['after_tax_estate']:,.0f}**")
+
+                    # ---- Summary metrics ----
+                    _has_et = _best.get("estate_tax", 0) > 0
+                    _m_cols = st.columns(4)
+                    with _m_cols[0]: st.metric("Gross Estate", f"${_best['gross_estate']:,.0f}")
+                    with _m_cols[1]: st.metric("Net Estate (After All Tax)", f"${_best['after_tax_estate']:,.0f}")
+                    with _m_cols[2]: st.metric("Total Taxes + Medicare", f"${_best['total_taxes']:,.0f}")
+                    with _m_cols[3]: st.metric("Total Converted", f"${_best['total_converted']:,.0f}")
+
+                    # ---- Spending-Only Rankings ----
+                    _quick_display = [r for r in _all if r["conversion_label"] in ("No Conversion", "Built-in")]
+                    if _quick_display:
+                        with st.expander("Spending-Only Rankings (Quick Scan)", expanded=False):
+                            _comp_rows = []
+                            for r in _quick_display:
+                                _type_tag = r["order"]
+                                if _type_tag == "adaptive": _cat = "Adaptive"
+                                elif _type_tag.startswith("prorata"): _cat = "Pro-Rata"
+                                elif _type_tag == "blend": _cat = "Blend"
+                                elif _type_tag == "dynamic": _cat = "Dynamic"
+                                else: _cat = "Waterfall"
+                                _row = {"Type": _cat, "Strategy": r["spending_label"], "Conversion": r["conversion_label"],
+                                    "Net Estate": f"${r['after_tax_estate']:,.0f}", "Gross Estate": f"${r['gross_estate']:,.0f}",
+                                    "Total Taxes": f"${r['total_taxes']:,.0f}", "Converted": f"${r['total_converted']:,.0f}",
+                                    "Drew Cash": f"${r.get('tot_wd_cash', 0):,.0f}", "Drew Taxable": f"${r.get('tot_wd_taxable', 0):,.0f}",
+                                    "Drew Pre-Tax": f"${r.get('tot_wd_pretax', 0):,.0f}", "Drew Tax-Free": f"${r.get('tot_wd_roth', 0):,.0f}",
+                                    "Drew Annuity": f"${r.get('tot_wd_annuity', 0):,.0f}",
+                                    "Final Pre-Tax": f"${r['final_pretax']:,.0f}", "Final Roth": f"${r['final_roth']:,.0f}",
+                                    "Final Brokerage": f"${r['final_brokerage']:,.0f}", "Final Cash": f"${r.get('final_cash', 0):,.0f}",
+                                    "Final Annuity": f"${r.get('final_annuity', 0):,.0f}", "Final Life": f"${r.get('final_life', 0):,.0f}",
+                                    "vs Best": f"${r['after_tax_estate'] - _quick_display[0]['after_tax_estate']:+,.0f}"}
+                                _gs = r.get("_group_size", 1)
+                                _row["# Tied"] = str(_gs) if _gs > 1 else ""
+                                _comp_rows.append(_row)
+                            _comp_df = pd.DataFrame(_comp_rows)
+                            # Drop zero columns
+                            for _bcol, _bkey in [("Drew Cash", "tot_wd_cash"), ("Drew Taxable", "tot_wd_taxable"), ("Drew Pre-Tax", "tot_wd_pretax"), ("Drew Tax-Free", "tot_wd_roth"), ("Drew Annuity", "tot_wd_annuity"), ("Final Cash", "final_cash"), ("Final Annuity", "final_annuity"), ("Final Life", "final_life"), ("Final Pre-Tax", "final_pretax"), ("Final Roth", "final_roth"), ("Final Brokerage", "final_brokerage"), ("Converted", "total_converted")]:
+                                if _bcol in _comp_df.columns and all(r.get(_bkey, 0) < 1 for r in _quick_display): _comp_df = _comp_df.drop(columns=[_bcol])
+                            st.dataframe(_comp_df, use_container_width=True, hide_index=True)
+
+                    # ---- All Tested Combos ----
+                    with st.expander("All Tested Combinations", expanded=True):
+                        _combo_rows = []
+                        for r in _all:
+                            _row = {"Spending Strategy": r["spending_label"], "Conversion": r["conversion_label"],
+                                "Net Estate": f"${r['after_tax_estate']:,.0f}", "Total Taxes": f"${r['total_taxes']:,.0f}",
+                                "Converted": f"${r['total_converted']:,.0f}",
+                                "vs Best": f"${r['after_tax_estate'] - _best['after_tax_estate']:+,.0f}"}
                             _gs = r.get("_group_size", 1)
-                            _row["# Same"] = _gs if _gs > 1 else ""
-                            _comp_rows.append(_row)
-                        _comp_df = pd.DataFrame(_comp_rows)
-                        for _bcol, _bkey in [("Drew Cash", "tot_wd_cash"), ("Drew Taxable", "tot_wd_taxable"), ("Drew Pre-Tax", "tot_wd_pretax"), ("Drew Tax-Free", "tot_wd_roth"), ("Drew Annuity", "tot_wd_annuity"), ("Final Cash", "final_cash"), ("Final Annuity", "final_annuity"), ("Final Life", "final_life"), ("Final Pre-Tax", "final_pretax"), ("Final Roth", "final_roth"), ("Final Brokerage", "final_brokerage")]:
-                            if _bcol in _comp_df.columns and all(r.get(_bkey, 0) < 1 for r in p1): _comp_df = _comp_df.drop(columns=[_bcol])
-                        st.dataframe(_comp_df, use_container_width=True, hide_index=True)
+                            _row["# Tied"] = str(_gs) if _gs > 1 else ""
+                            _combo_rows.append(_row)
+                        st.dataframe(pd.DataFrame(_combo_rows), use_container_width=True, hide_index=True)
 
-                    _strat_labels = [r["waterfall"] for r in p1]
-                    _selected_label = st.selectbox("Select strategy to view detail & use for Phase 2", _strat_labels, index=0, key="fp_p1_strategy_select", help="Default is the highest-estate strategy.")
-                    _selected_result = next(r for r in p1 if r["waterfall"] == _selected_label)
-                    st.session_state.phase1_selected_strategy = _selected_result.get("_strat_info")
-                    if _selected_label != best["waterfall"]:
+                    # ---- Combo selector + year-by-year detail ----
+                    _combo_labels = [f"{r['spending_label']} + {r['conversion_label']}" for r in _all]
+                    _selected_combo_label = st.selectbox("Select combination to view detail", _combo_labels, index=0, key="fp_opt_combo_select")
+                    _selected_idx = _combo_labels.index(_selected_combo_label)
+                    _selected_combo = _all[_selected_idx]
+                    st.session_state.opt_selected_combo = _selected_combo
+
+                    if _selected_combo_label != f"{_best['spending_label']} + {_best['conversion_label']}":
                         col1b, col2b, col3b = st.columns(3)
-                        with col1b: st.metric("Selected Gross Estate", f"${_selected_result.get('gross_estate', _selected_result['total_wealth']):,.0f}")
-                        with col2b: st.metric("Selected Net Estate", f"${_selected_result['after_tax_estate']:,.0f}")
-                        with col3b: st.metric("vs Best", f"${_selected_result['after_tax_estate'] - best['after_tax_estate']:+,.0f}")
+                        with col1b: st.metric("Selected Gross Estate", f"${_selected_combo['gross_estate']:,.0f}")
+                        with col2b: st.metric("Selected Net Estate", f"${_selected_combo['after_tax_estate']:,.0f}")
+                        with col3b: st.metric("vs Best", f"${_selected_combo['after_tax_estate'] - _best['after_tax_estate']:+,.0f}")
+
                     _opt_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "_net_draw"]
                     _zero_hide = ["Accel PT", "Harvest Gains"]
-                    _sel_details = _selected_result.get("_year_details", [])
+                    _sel_details = _selected_combo.get("_year_details", [])
                     if _sel_details:
-                        with st.expander(f"Year-by-Year Detail: {_selected_label}", expanded=True):
+                        with st.expander(f"Year-by-Year Detail: {_selected_combo_label}", expanded=True):
                             _df_det = pd.DataFrame(_sel_details)
                             _df_det = _df_det.drop(columns=[c for c in _opt_hide if c in _df_det.columns], errors="ignore")
                             for _zc in _zero_hide:
                                 if _zc in _df_det.columns and (_df_det[_zc] == 0).all(): _df_det = _df_det.drop(columns=[_zc])
                             st.dataframe(_df_det, use_container_width=True, hide_index=True)
-                    elif st.session_state.phase1_best_details:
-                        with st.expander("Year-by-Year Detail (Best Strategy)"):
-                            _df_det = pd.DataFrame(st.session_state.phase1_best_details)
-                            _df_det = _df_det.drop(columns=[c for c in _opt_hide if c in _df_det.columns], errors="ignore")
-                            for _zc in _zero_hide:
-                                if _zc in _df_det.columns and (_df_det[_zc] == 0).all(): _df_det = _df_det.drop(columns=[_zc])
-                            st.dataframe(_df_det, use_container_width=True, hide_index=True)
 
-                # ---- Phase 2: Roth Conversion Layering ----
-                st.divider()
-                st.markdown("### Phase 2: Roth Conversion Layering")
-                if st.session_state.phase1_best_order is None:
-                    st.warning("Run Phase 1 first to establish the optimal spending strategy.")
-                else:
-                    winning_order = st.session_state.phase1_selected_strategy or st.session_state.phase1_best_order
-                    if isinstance(winning_order, dict):
-                        _wo_type = winning_order.get("type", "")
-                        if _wo_type == "blend":
-                            _cap = winning_order.get("pt_cap", 0)
-                            if _cap >= 999999: st.write("**Locked Strategy:** Smart Blend \u2014 Pre-Tax First (Unlimited)")
-                            elif _cap == 0: st.write("**Locked Strategy:** Smart Blend \u2014 Brokerage First")
-                            else: st.write(f"**Locked Strategy:** Smart Blend \u2014 Pre-Tax ${_cap:,.0f}/yr + Brokerage")
-                        elif _wo_type == "dynamic": st.write("**Locked Strategy:** Dynamic Blend (Marginal Cost)")
-                        elif _wo_type == "prorata": st.write("**Locked Strategy:** Pro-Rata: All Accounts (Equal Weight)")
-                        elif _wo_type == "prorata_pt_heavy": st.write("**Locked Strategy:** Pro-Rata: Heavy Pre-Tax (2x), Light Roth (0.25x)")
-                        elif _wo_type == "prorata_no_roth": st.write("**Locked Strategy:** Pro-Rata: All Except Roth")
-                        elif _wo_type == "adaptive":
-                            _ak = winning_order.get("adaptive_key", "")
-                            _alabel = TEA.ADAPTIVE_STRATEGIES.get(_ak, {}).get("label", _ak)
-                            st.write(f"**Locked Strategy:** {_alabel}")
-                            st.caption(TEA.ADAPTIVE_STRATEGIES.get(_ak, {}).get("description", ""))
-                        else:
-                            _wf = winning_order.get("wf", [])
-                            st.write(f"**Locked Strategy:** Waterfall \u2014 {' -> '.join(_wf)}")
-                    elif winning_order == "dynamic": st.write("**Locked Strategy:** Dynamic Blend")
-                    else: st.write(f"**Locked Spending Order:** {' -> '.join(winning_order)}")
-                    if isinstance(winning_order, dict):
-                        _extras = []
-                        _wo_accel = winning_order.get("accel_bracket"); _wo_depl = winning_order.get("ann_depl_yrs"); _wo_harvest = winning_order.get("harvest_bracket")
-                        if _wo_accel is not None: _extras.append(f"Accel PT: fill {_wo_accel}" if _wo_accel != "irmaa" else "Accel PT: fill to IRMAA")
-                        if _wo_depl is not None:
-                            _wo_go = winning_order.get("ann_gains_only", False)
-                            _extras.append(f"Draw ann gains: {_wo_depl}yr" if _wo_go else f"Annuity depletion: {_wo_depl}yr")
-                        if _wo_harvest is not None: _extras.append("Harvest 0% LTCG gains")
-                        if _extras: st.caption("Inherited: " + ", ".join(_extras))
+                    # ---- Side-by-side: Best combo vs spending-only baseline ----
+                    _bl_details = _best_spending_only.get("_year_details", [])
+                    if _bl_details and _sel_details:
+                        st.divider()
+                        yr1_bl = _bl_details[0] if _bl_details else {}; yr1_bc = _sel_details[0] if _sel_details else {}
+                        st.markdown(f"### Year 1 Cash Flow: No Conversion vs {_selected_combo_label}")
+                        col1, col2 = st.columns(2)
+                        for col, yr, label in [(col1, yr1_bl, f"{_best_spending_only['spending_label']} (No Conv)"), (col2, yr1_bc, _selected_combo_label)]:
+                            with col:
+                                st.markdown(f"#### {label}")
+                                st.markdown("**Income (Cash Received)**")
+                                income_rows = [("Social Security", yr.get("SS", 0)), ("Pensions", yr.get("Pension", 0)), ("RMD", yr.get("RMD", 0)), ("Investment Income", yr.get("Inv Inc", 0)), ("W/D Cash", yr.get("W/D Cash", 0)), ("W/D Taxable", yr.get("W/D Taxable", 0)), ("W/D Pre-Tax", yr.get("W/D Pre-Tax", 0)), ("Roth Conversion", yr.get("Conversion", 0)), ("W/D Roth", yr.get("W/D Roth", 0)), ("W/D Life Ins", yr.get("W/D Life", 0)), ("W/D Annuity", yr.get("W/D Annuity", 0))]
+                                income_rows = [(k, v) for k, v in income_rows if v > 0]
+                                total_inc = sum(v for _, v in income_rows)
+                                st.dataframe([{"Income": k, "Amount": TEA.money(v)} for k, v in income_rows], use_container_width=True, hide_index=True)
+                                st.metric("Total Income", TEA.money(total_inc))
+                                st.markdown("**Expenses & Outflows**")
+                                out_rows = [("Living Expenses", yr.get("Spending", 0)), ("Taxes", yr.get("Taxes", 0)), ("Medicare", yr.get("Medicare", 0))]
+                                out_rows = [(k, v) for k, v in out_rows if v > 0]
+                                total_out = sum(v for _, v in out_rows)
+                                st.dataframe([{"Expense": k, "Amount": TEA.money(v)} for k, v in out_rows], use_container_width=True, hide_index=True)
+                                st.metric("Total Outflows", TEA.money(total_out))
 
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        opt_stop_age = st.number_input("Stop Conversions at Age", min_value=60, max_value=100, value=75, step=1, key="fp_opt_stop")
-                        opt_conv_years = st.number_input("Max Years of Conversions", min_value=1, max_value=30, value=15, step=1, key="fp_opt_conv_years")
-                    with col2:
-                        st.markdown("**Common Thresholds**")
-                        if is_joint:
-                            st.write("22%: $206,700 | 24%: $394,600")
-                            st.write("IRMAA: $218k | $274k | $342k | $410k")
-                        else:
-                            st.write("22%: $103,350 | 24%: $197,300")
-                            st.write("IRMAA: $109k | $137k | $171k | $205k")
-                        target_agi_input = st.number_input("Target AGI (for 'fill to bracket')", value=218000.0 if is_joint else 109000.0, step=10000.0, key="fp_opt_target")
-                    conv_amounts_str = st.text_input("Conversion amounts to test (comma separated)", value="25000, 50000, 75000, 100000, 150000, 200000", key="fp_opt_amounts")
-                    include_fill = st.checkbox("Also test 'Fill to Target AGI' strategy", value=True, key="fp_opt_fill")
-                    include_bracket_fill = st.checkbox("Also test bracket-fill strategies", value=True, key="fp_opt_bracket_fill")
-                    agi_cap_enabled = st.checkbox("Cap all strategies at Target AGI", value=True, key="fp_opt_agi_cap",
-                        help="When checked, bracket-fill and fixed-amount strategies won't exceed the Target AGI")
-
-                    if st.button("Run Phase 2 - Test Roth Conversions", type="primary", key="fp_run_phase2"):
-                        params = st.session_state.phase1_params or _build_tab3_params()
-                        try: conv_amounts = [float(x.strip()) for x in conv_amounts_str.split(",")]
-                        except Exception: conv_amounts = [25000, 50000, 75000, 100000]
-                        strategies = [("none", "No Conversion (baseline)")]
-                        for amt in conv_amounts: strategies.append((amt, f"${amt:,.0f}/yr"))
-                        if include_fill: strategies.append(("fill_to_target", f"Fill to ${target_agi_input:,.0f}"))
-                        if include_bracket_fill:
-                            _cap_tag = f" (cap ${target_agi_input/1000:.0f}k)" if agi_cap_enabled else ""
-                            strategies += [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"), ("fill_irmaa_0", "Fill to IRMAA Tier 1")]
-                        results = []; best_details = None; baseline_details = None; best_estate = -float("inf"); best_name = ""; baseline_estate = 0.0
-                        progress_bar = st.progress(0); status_text = st.empty()
-                        _p2_blend = False; _p2_order = []; _p2_pt_cap = None; _p2_prorata = False; _p2_prorata_weights = None; _p2_adaptive_key = None
-                        _p2_accel_bracket = None; _p2_harvest_bracket = None; _p2_ann_depl_yrs = None; _p2_ann_gains_only = False
-                        if isinstance(winning_order, dict):
-                            _wo_type = winning_order.get("type", "")
-                            if _wo_type == "adaptive": _p2_adaptive_key = winning_order.get("adaptive_key")
-                            elif _wo_type == "blend": _p2_pt_cap = winning_order.get("pt_cap")
-                            elif _wo_type == "dynamic": _p2_blend = True
-                            elif winning_order.get("prorata", False): _p2_prorata = True; _p2_prorata_weights = winning_order.get("prorata_weights")
-                            else: _p2_order = winning_order.get("wf", [])
-                            _p2_accel_bracket = winning_order.get("accel_bracket"); _p2_harvest_bracket = winning_order.get("harvest_bracket")
-                            _p2_ann_depl_yrs = winning_order.get("ann_depl_yrs"); _p2_ann_gains_only = winning_order.get("ann_gains_only", False)
-                        elif winning_order == "dynamic": _p2_blend = True
-                        else: _p2_order = winning_order if isinstance(winning_order, list) else []
-                        _p2_extra_kw = {}
-                        if _p2_accel_bracket is not None: _p2_extra_kw["extra_pretax_bracket"] = _p2_accel_bracket
-                        if _p2_harvest_bracket is not None: _p2_extra_kw["harvest_gains_bracket"] = _p2_harvest_bracket
-                        if _p2_ann_depl_yrs is not None:
-                            _p2_extra_kw["annuity_depletion_years"] = _p2_ann_depl_yrs
-                            if _p2_ann_gains_only: _p2_extra_kw["annuity_gains_only"] = True
-                        for idx, (strategy, strategy_name) in enumerate(strategies):
-                            if _p2_adaptive_key:
-                                result = TEA.run_wealth_projection(a0, params, _p2_order, conversion_strategy=strategy, target_agi=target_agi_input, stop_conversion_age=opt_stop_age, conversion_years_limit=opt_conv_years, adaptive_strategy=_p2_adaptive_key, agi_cap_bracket_fills=agi_cap_enabled, **_p2_extra_kw)
-                            else:
-                                result = TEA.run_wealth_projection(a0, params, _p2_order, conversion_strategy=strategy, target_agi=target_agi_input, stop_conversion_age=opt_stop_age, conversion_years_limit=opt_conv_years, blend_mode=_p2_blend, pretax_annual_cap=_p2_pt_cap, prorata_blend=_p2_prorata, prorata_weights=_p2_prorata_weights, agi_cap_bracket_fills=agi_cap_enabled, **_p2_extra_kw)
-                            estate = result["after_tax_estate"]
-                            if strategy == "none": baseline_estate = estate; baseline_details = result["year_details"]
-                            results.append({"strategy_name": strategy_name, "after_tax_estate": estate, "improvement": estate - baseline_estate, "total_wealth": result["total_wealth"], "gross_estate": result.get("gross_estate", result["total_wealth"]), "total_taxes": result["total_taxes"], "total_converted": result["total_converted"], "final_pretax": result["final_pretax"], "final_roth": result["final_roth"], "final_brokerage": result["final_cash"] + result["final_brokerage"], "_year_details": result["year_details"]})
-                            if estate > best_estate: best_estate = estate; best_details = result["year_details"]; best_name = strategy_name
-                            progress_bar.progress((idx + 1) / len(strategies)); status_text.text(f"Testing strategy {idx + 1} of {len(strategies)}...")
-                        progress_bar.empty(); status_text.empty()
-                        st.session_state.phase2_results = results; st.session_state.phase2_best_details = best_details
-                        st.session_state.phase2_baseline_details = baseline_details; st.session_state.phase2_best_name = best_name
-
-                    if st.session_state.phase2_results:
-                        p2 = st.session_state.phase2_results
-                        p2_sorted = sorted(p2, key=lambda x: x["after_tax_estate"], reverse=True)
-                        best_conv = p2_sorted[0]; baseline = next((r for r in p2 if "baseline" in r["strategy_name"].lower()), p2[0])
-                        if best_conv["strategy_name"] != baseline["strategy_name"]:
-                            improvement = best_conv["after_tax_estate"] - baseline["after_tax_estate"]
-                            st.success(f"Best Strategy: **{best_conv['strategy_name']}** adds **${improvement:,.0f}** to after-tax estate vs no conversion")
-                        else: st.info("No Roth conversion strategy improves upon the baseline (no conversions).")
-                        col1, col2, col3 = st.columns(3)
-                        with col1: st.metric("Baseline Estate (No Conv)", f"${baseline['after_tax_estate']:,.0f}")
-                        with col2: st.metric("Best Estate (With Conv)", f"${best_conv['after_tax_estate']:,.0f}")
-                        with col3: st.metric("Improvement", f"${best_conv['after_tax_estate'] - baseline['after_tax_estate']:,.0f}")
-                        with st.expander("All Conversion Strategies Compared"):
-                            df_p2 = pd.DataFrame(p2_sorted); df_p2.index = range(1, len(df_p2) + 1); df_p2.index.name = "Rank"
-                            display_cols2 = ["strategy_name", "after_tax_estate", "improvement", "total_wealth", "total_taxes", "total_converted", "final_pretax", "final_roth", "final_brokerage"]
-                            df_show2 = df_p2[display_cols2].copy()
-                            for c in display_cols2[1:]: df_show2[c] = df_show2[c].apply(lambda x: f"${x:,.0f}")
-                            df_show2.columns = ["Strategy", "After-Tax Estate", "vs Baseline", "Total Wealth", "Total Taxes", "Total Converted", "Final Pre-Tax", "Final Roth", "Final Taxable"]
-                            st.dataframe(df_show2, use_container_width=True)
-
-                        _p2_labels = [r["strategy_name"] for r in p2_sorted]
-                        _p2_selected_label = st.selectbox("Select conversion strategy to view detail", _p2_labels, index=0, key="fp_p2_strategy_select")
-                        _p2_selected_result = next(r for r in p2_sorted if r["strategy_name"] == _p2_selected_label)
-                        _p2_sel_details = _p2_selected_result.get("_year_details", [])
-                        _p2_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "_net_draw"]
-                        _p2_zero_hide = ["Accel PT", "Harvest Gains"]
-                        if _p2_sel_details:
-                            with st.expander(f"Year-by-Year Detail: {_p2_selected_label}", expanded=True):
-                                _df_p2det = pd.DataFrame(_p2_sel_details)
-                                _df_p2det = _df_p2det.drop(columns=[c for c in _p2_hide if c in _df_p2det.columns], errors="ignore")
-                                for _zc in _p2_zero_hide:
-                                    if _zc in _df_p2det.columns and (_df_p2det[_zc] == 0).all(): _df_p2det = _df_p2det.drop(columns=[_zc])
-                                st.dataframe(_df_p2det, use_container_width=True, hide_index=True)
-
-                        _bl_result = next((r for r in p2 if "baseline" in r["strategy_name"].lower()), None)
-                        _bl_details = _bl_result.get("_year_details", []) if _bl_result else []
-                        if _bl_details and _p2_sel_details:
-                            st.divider()
-                            yr1_bl = _bl_details[0] if _bl_details else {}; yr1_bc = _p2_sel_details[0] if _p2_sel_details else {}
-                            st.markdown(f"### Year 1 Cash Flow: No Conversion vs {_p2_selected_label}")
-                            col1, col2 = st.columns(2)
-                            for col, yr, label in [(col1, yr1_bl, "No Conversion"), (col2, yr1_bc, _p2_selected_label)]:
-                                with col:
-                                    st.markdown(f"#### {label}")
-                                    st.markdown("**Income (Cash Received)**")
-                                    income_rows = [("Social Security", yr.get("SS", 0)), ("Pensions", yr.get("Pension", 0)), ("RMD", yr.get("RMD", 0)), ("Investment Income", yr.get("Inv Inc", 0)), ("W/D Cash", yr.get("W/D Cash", 0)), ("W/D Taxable", yr.get("W/D Taxable", 0)), ("W/D Pre-Tax", yr.get("W/D Pre-Tax", 0)), ("Roth Conversion", yr.get("Conversion", 0)), ("W/D Roth", yr.get("W/D Roth", 0)), ("W/D Life Ins", yr.get("W/D Life", 0)), ("W/D Annuity", yr.get("W/D Annuity", 0))]
-                                    income_rows = [(k, v) for k, v in income_rows if v > 0]
-                                    total_inc = sum(v for _, v in income_rows)
-                                    st.dataframe([{"Income": k, "Amount": TEA.money(v)} for k, v in income_rows], use_container_width=True, hide_index=True)
-                                    st.metric("Total Income", TEA.money(total_inc))
-                                    st.markdown("**Expenses & Outflows**")
-                                    out_rows = [("Living Expenses", yr.get("Spending", 0)), ("Taxes", yr.get("Taxes", 0)), ("Medicare", yr.get("Medicare", 0))]
-                                    out_rows = [(k, v) for k, v in out_rows if v > 0]
-                                    total_out = sum(v for _, v in out_rows)
-                                    st.dataframe([{"Expense": k, "Amount": TEA.money(v)} for k, v in out_rows], use_container_width=True, hide_index=True)
-                                    st.metric("Total Outflows", TEA.money(total_out))
-
-                            st.divider()
-                            st.markdown("### End of Projection Comparison")
-                            col1, col2 = st.columns(2)
-                            final_bl = _bl_details[-1] if _bl_details else {}; final_bc = _p2_sel_details[-1] if _p2_sel_details else {}
-                            with col1:
-                                st.markdown("#### No Conversion")
-                                st.metric("Final Pre-Tax", TEA.money(final_bl.get("Bal Pre-Tax", 0)))
-                                st.metric("Final Roth", TEA.money(final_bl.get("Bal Roth", 0)))
-                                st.metric("Final Taxable", TEA.money(final_bl.get("Bal Cash", 0) + final_bl.get("Bal Taxable", 0)))
-                                st.metric("After-Tax Estate", TEA.money(final_bl.get("Estate (Net)", 0)))
-                            with col2:
-                                st.markdown(f"#### {_p2_selected_label}")
-                                st.metric("Final Pre-Tax", TEA.money(final_bc.get("Bal Pre-Tax", 0)))
-                                st.metric("Final Roth", TEA.money(final_bc.get("Bal Roth", 0)))
-                                st.metric("Final Taxable", TEA.money(final_bc.get("Bal Cash", 0) + final_bc.get("Bal Taxable", 0)))
-                                st.metric("After-Tax Estate", TEA.money(final_bc.get("Estate (Net)", 0)))
+                        st.divider()
+                        st.markdown("### End of Projection Comparison")
+                        col1, col2 = st.columns(2)
+                        final_bl = _bl_details[-1] if _bl_details else {}; final_bc = _sel_details[-1] if _sel_details else {}
+                        with col1:
+                            st.markdown(f"#### {_best_spending_only['spending_label']} (No Conv)")
+                            st.metric("Final Pre-Tax", TEA.money(final_bl.get("Bal Pre-Tax", 0)))
+                            st.metric("Final Roth", TEA.money(final_bl.get("Bal Roth", 0)))
+                            st.metric("Final Taxable", TEA.money(final_bl.get("Bal Cash", 0) + final_bl.get("Bal Taxable", 0)))
+                            st.metric("After-Tax Estate", TEA.money(final_bl.get("Estate (Net)", 0)))
+                        with col2:
+                            st.markdown(f"#### {_selected_combo_label}")
+                            st.metric("Final Pre-Tax", TEA.money(final_bc.get("Bal Pre-Tax", 0)))
+                            st.metric("Final Roth", TEA.money(final_bc.get("Bal Roth", 0)))
+                            st.metric("Final Taxable", TEA.money(final_bc.get("Bal Cash", 0) + final_bc.get("Bal Taxable", 0)))
+                            st.metric("After-Tax Estate", TEA.money(final_bc.get("Estate (Net)", 0)))
 
     # ════════════════════════════════════════════════════════════════
     # TAB 5: Roth Conversion Opportunity
