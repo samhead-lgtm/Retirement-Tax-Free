@@ -3504,8 +3504,8 @@ elif nav == "Achieving":
                 # ---- Controls ----
                 col1, col2 = st.columns(2)
                 with col1:
-                    target_agi_input = st.number_input("Target AGI (conversion ceiling)", value=218000.0 if is_joint else 109000.0, step=10000.0, key="fp_opt_target",
-                        help="Conversions won't push AGI above this. Controls bracket-fill and cap strategies.")
+                    opt_stop_age = st.number_input("Stop Conversions at Age", min_value=60, max_value=100, value=75, step=1, key="fp_opt_stop")
+                    opt_conv_years = st.number_input("Max Years of Conversions", min_value=1, max_value=30, value=15, step=1, key="fp_opt_conv_years")
                 with col2:
                     st.markdown("**Common Thresholds**")
                     if is_joint:
@@ -3514,6 +3514,7 @@ elif nav == "Achieving":
                     else:
                         st.write("22%: $103,350 | 24%: $197,300")
                         st.write("IRMAA: $109k | $137k | $171k | $205k")
+                    target_agi_input = st.number_input("Target AGI (for 'fill to bracket')", value=218000.0 if is_joint else 109000.0, step=10000.0, key="fp_opt_target")
                 conv_amounts_str = st.text_input("Conversion amounts to test (comma separated)", value="25000, 50000, 75000, 100000, 150000, 200000", key="fp_opt_amounts")
                 include_fill = st.checkbox("Also test 'Fill to Target AGI' strategy", value=True, key="fp_opt_fill")
                 include_bracket_fill = st.checkbox("Also test bracket-fill strategies", value=True, key="fp_opt_bracket_fill")
@@ -3606,7 +3607,7 @@ elif nav == "Achieving":
                     for _strat in _adaptive_strategies:
                         status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']} (built-in conversions)")
                         result = _run_single_strategy(a0, params, _strat, conv_strat="none",
-                                                       stop_age=200, target_agi=target_agi_input)
+                                                       stop_age=opt_stop_age, target_agi=target_agi_input)
                         pkg = _package_result(result, _strat, _strat["label"], "Built-in", "quick")
                         all_results.append(pkg)
                         _run_count += 1
@@ -3635,8 +3636,8 @@ elif nav == "Achieving":
                         for _conv_val, _conv_label in _conv_strategies:
                             status_text.text(f"Deep Search ({_run_count + 1 - _n_quick}/{_n_deep_est}): {_strat['label']} + {_conv_label}")
                             result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
-                                                           stop_age=200, target_agi=target_agi_input,
-                                                           conv_years=int(params["years"]), agi_cap=agi_cap_enabled)
+                                                           stop_age=opt_stop_age, target_agi=target_agi_input,
+                                                           conv_years=opt_conv_years, agi_cap=agi_cap_enabled)
                             pkg = _package_result(result, _strat, _strat["label"], _conv_label, "deep")
                             all_results.append(pkg)
                             _run_count += 1
@@ -3648,8 +3649,8 @@ elif nav == "Achieving":
                         for _conv_val, _conv_label in _conv_strategies:
                             status_text.text(f"Deep Search ({_run_count + 1 - _n_quick}/{_n_deep_est}): {_strat['label']} + {_conv_label}")
                             result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
-                                                           stop_age=200, target_agi=target_agi_input,
-                                                           conv_years=int(params["years"]), agi_cap=agi_cap_enabled)
+                                                           stop_age=opt_stop_age, target_agi=target_agi_input,
+                                                           conv_years=opt_conv_years, agi_cap=agi_cap_enabled)
                             pkg = _package_result(result, _strat, _strat["label"], _conv_label, "deep")
                             all_results.append(pkg)
                             _run_count += 1
