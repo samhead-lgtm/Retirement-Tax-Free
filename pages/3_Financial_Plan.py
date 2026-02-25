@@ -80,6 +80,10 @@ _FP_DEFAULTS = {
     "curr_cash": 0.0, "emergency_fund": 0.0,
     "curr_hsa": 0.0,
 
+    # --- Growing: Inherited IRAs ---
+    "inh_ira_f": 0.0, "inh_rule_f": "10-Year Rule", "inh_yrs_f": 10, "inh_rmd_req_f": False, "inh_add_f": 0.0,
+    "inh_ira_s": 0.0, "inh_rule_s": "10-Year Rule", "inh_yrs_s": 10, "inh_rmd_req_s": False, "inh_add_s": 0.0,
+
     # --- Growing: Insurance Products ---
     "annuity_value_f": 0.0, "annuity_basis_f": 0.0, "annuity_monthly_f": 0.0,
     "annuity_value_s": 0.0, "annuity_basis_s": 0.0, "annuity_monthly_s": 0.0,
@@ -771,7 +775,21 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                          contrib_trad_ira + contrib_trad_ira_spouse + contrib_hsa)
 
     # Inherited IRAs from Growing tab
-    inherited_iras = []  # TODO: wire if Growing tab gets inherited IRA inputs
+    inherited_iras = []
+    if D["inh_ira_f"] > 0:
+        _rule_f = "10_year" if D["inh_rule_f"] == "10-Year Rule" else "lifetime"
+        inherited_iras.append({"balance": D["inh_ira_f"], "rule": _rule_f,
+            "years_remaining": int(D["inh_yrs_f"]) if _rule_f == "10_year" else 0,
+            "owner_age": current_age_filer,
+            "owner_was_taking_rmds": bool(D["inh_rmd_req_f"]),
+            "additional_distribution": float(D["inh_add_f"])})
+    if is_joint and D["inh_ira_s"] > 0:
+        _rule_s = "10_year" if D["inh_rule_s"] == "10-Year Rule" else "lifetime"
+        inherited_iras.append({"balance": D["inh_ira_s"], "rule": _rule_s,
+            "years_remaining": int(D["inh_yrs_s"]) if _rule_s == "10_year" else 0,
+            "owner_age": current_age_spouse,
+            "owner_was_taking_rmds": bool(D["inh_rmd_req_s"]),
+            "additional_distribution": float(D["inh_add_s"])})
 
     # Future expenses from Spending tab
     _ae_active = [ae for ae in st.session_state.additional_expenses if ae.get("net_amount", 0) > 0]
@@ -1709,6 +1727,27 @@ elif nav == "Growing":
               help="Fixed rainy day reserve excluded from available cash for withdrawals.")
         if is_working:
             w_num("HSA Balance", "curr_hsa", step=1000.0)
+
+    # --- Inherited IRAs ---
+    with st.expander("Inherited IRA(s)"):
+        st.caption("Inherited IRAs have mandatory distribution rules separate from regular IRAs.")
+        w_num("Inherited IRA — Filer", "inh_ira_f", step=5000.0)
+        if D["inh_ira_f"] > 0:
+            w_select("Distribution Rule — Filer", ["10-Year Rule", "Lifetime RMDs"], "inh_rule_f")
+            if D["inh_rule_f"] == "10-Year Rule":
+                w_num("Years Remaining — Filer", "inh_yrs_f", min_value=1, max_value=10, step=1)
+                w_check("Original owner was taking RMDs? — Filer", "inh_rmd_req_f")
+            w_num("Additional Annual Distribution — Filer", "inh_add_f", step=1000.0,
+                  help="Extra amount to distribute each year beyond the minimum.")
+        if is_joint:
+            w_num("Inherited IRA — Spouse", "inh_ira_s", step=5000.0)
+            if D["inh_ira_s"] > 0:
+                w_select("Distribution Rule — Spouse", ["10-Year Rule", "Lifetime RMDs"], "inh_rule_s")
+                if D["inh_rule_s"] == "10-Year Rule":
+                    w_num("Years Remaining — Spouse", "inh_yrs_s", min_value=1, max_value=10, step=1)
+                    w_check("Original owner was taking RMDs? — Spouse", "inh_rmd_req_s")
+                w_num("Additional Annual Distribution — Spouse", "inh_add_s", step=1000.0,
+                      help="Extra amount to distribute each year beyond the minimum.")
 
     # --- Insurance Products ---
     st.divider()
@@ -3578,7 +3617,26 @@ elif nav == "Achieving":
                     if include_fill: _conv_strategies.append(("fill_to_target", f"Fill to ${target_agi_input:,.0f}"))
                     if include_bracket_fill:
                         _cap_tag = f" (cap ${target_agi_input/1000:.0f}k)" if agi_cap_enabled else ""
-                        _conv_strategies += [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"), ("fill_irmaa_0", "Fill to IRMAA Tier 1")]
+                        # Estimate base AGI to skip bracket-fill strategies the client already exceeds
+                        _base_agi_est = (params.get("gross_ss_total", 0) * 0.85
+                                         + params.get("taxable_pensions_total", 0)
+                                         + params.get("wages", 0)
+                                         + params.get("other_income", 0)
+                                         + params.get("total_ordinary_dividends", 0)
+                                         + params.get("cap_gain_loss", 0)
+                                         + params.get("interest_taxable", 0))
+                        _is_jt = "joint" in params.get("filing_status", "").lower()
+                        # Bracket tops (taxable income) + approximate standard deduction = AGI threshold
+                        _std_ded = 32300 if _is_jt else 16150  # approx 2025 std deduction for 65+
+                        _bracket_agi_tops = {
+                            "fill_bracket_12": (96950 if _is_jt else 48475) + _std_ded,
+                            "fill_bracket_22": (206700 if _is_jt else 103350) + _std_ded,
+                            "fill_bracket_24": (394600 if _is_jt else 197300) + _std_ded,
+                            "fill_irmaa_0": 218000 if _is_jt else 109000,
+                        }
+                        for _bkey, _blabel in [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"), ("fill_irmaa_0", "Fill to IRMAA Tier 1")]:
+                            if _base_agi_est < _bracket_agi_tops[_bkey]:
+                                _conv_strategies.append((_bkey, _blabel))
 
                     # ---- Count total runs for progress ----
                     _n_quick = len(_spending_strategies) + len(_adaptive_strategies)
