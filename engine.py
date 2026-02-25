@@ -3811,7 +3811,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             # Grow remaining inherited IRA balances
             for idx in range(len(inherited_iras)):
                 if iira_bals[idx] > 0:
-                    iira_bals[idx] *= (1 + yr_return)
+                    iira_bals[idx] *= (1 + (accum_return_sequence[yr] if accum_return_sequence else r_pretax))
 
         bal_taxable = bal_brokerage + bal_cash
         bal_inherited_total = sum(iira_bals)
