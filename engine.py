@@ -397,11 +397,14 @@ def calculate_taxable_ss(base_non_ss, tax_exempt, gross_ss, status):
     if provisional > base2: taxable += (provisional - base2) * 0.85
     return min(taxable, 0.85 * float(gross_ss))
 
-def calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss):
-    sc_start = max(0.0, float(fed_taxable))
-    sub = max(0.0, float(taxable_ss)) + max(0.0, float(retirement_deduction))
-    if filer_65_plus: sub += 5000.0
-    if spouse_65_plus: sub += 5000.0
+def calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_income, cap_gain_loss, enhanced_elderly_addback=0.0):
+    sc_start = max(0.0, float(fed_taxable)) + max(0.0, float(enhanced_elderly_addback))
+    # Retirement deduction: auto-compute based on age
+    ret_ded_limit = 10000.0 if filer_65_plus else 3000.0
+    ret_ded = min(ret_ded_limit, max(0.0, float(retirement_income)))
+    sub = max(0.0, float(taxable_ss)) + ret_ded
+    if filer_65_plus: sub += 15000.0
+    if spouse_65_plus: sub += 15000.0
     sub += 0.44 * max(0.0, float(cap_gain_loss)) + max(0.0, float(out_of_state_gain)) + 4930.0 * max(0, int(dependents))
     sc_taxable = max(0.0, sc_start - sub)
     brackets = [(0,3560,0.00),(3560,17830,0.03),(17830,float("inf"),0.06)]
@@ -547,10 +550,11 @@ def calc_cg_tax(cap_gains, ordinary_taxable, status, inf=1.0):
     return cg_at_15 * 0.15 + cg_at_20 * 0.20
 
 def calc_year_taxes(gross_ss, pretax_income, cap_gains=0.0, ord_invest_income=0.0, status="Single",
-                    filer_65=False, spouse_65=False, inf=1.0, state_rate=0.05):
+                    filer_65=False, spouse_65=False, inf=1.0, state_rate=0.05, sc_params=None):
     """Calculate federal + state tax for a retirement year. All inputs in nominal dollars.
     cap_gains: long-term capital gains + qualified dividends (0%/15%/20% brackets)
-    ord_invest_income: cash interest and other ordinary investment income"""
+    ord_invest_income: cash interest and other ordinary investment income
+    sc_params: optional dict for SC bracket-based tax instead of flat rate"""
     base_other = pretax_income + cap_gains + ord_invest_income
     taxable_ss = calc_taxable_ss(base_other, gross_ss, status)
     agi = base_other + taxable_ss
@@ -562,7 +566,19 @@ def calc_year_taxes(gross_ss, pretax_income, cap_gains=0.0, ord_invest_income=0.
     fed_ord_tax = calc_federal_tax(ordinary_taxable, status, inf)
     fed_cg_tax = calc_cg_tax(cg_in_taxable, ordinary_taxable, status, inf)
     fed_tax = fed_ord_tax + fed_cg_tax
-    st_tax = calc_state_tax(fed_taxable, state_rate)
+    if sc_params is not None:
+        _tax_yr = sc_params.get("tax_year")
+        _enh = get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf, tax_year=_tax_yr)
+        _ret_inc = sc_params.get("retirement_income", 0.0)
+        sc_result = calculate_sc_tax(
+            fed_taxable, sc_params.get("dependents", 0), taxable_ss,
+            sc_params.get("out_of_state_gain", 0.0),
+            filer_65, spouse_65,
+            _ret_inc, cap_gains,
+            enhanced_elderly_addback=_enh)
+        st_tax = sc_result["sc_tax"]
+    else:
+        st_tax = calc_state_tax(fed_taxable, state_rate)
     marginal = get_marginal_fed_rate(ordinary_taxable, status, inf)
     return {"fed_tax": fed_tax, "state_tax": st_tax, "total_tax": fed_tax + st_tax,
             "agi": agi, "taxable_ss": taxable_ss, "fed_taxable": fed_taxable,
@@ -776,8 +792,10 @@ def compute_taxes_only(gross_ss, taxable_pensions, rmd_amount, taxable_ira, conv
     fed_taxable = max(0.0, agi - deduction)
     preferential = max(0.0, cap_gains)
     fed = calculate_federal_tax(fed_taxable, preferential, filing_status, inf_factor)
+    retirement_income = taxable_ira + rmd_amount + taxable_pensions
     sc = calculate_sc_tax(fed_taxable, 0, taxable_ss, 0.0, filer_65, spouse_65,
-                          retirement_deduction * inf_factor, cap_gains)
+                          retirement_income * inf_factor, cap_gains,
+                          enhanced_elderly_addback=enh_extra)
     medicare, has_irmaa = estimate_medicare_premiums(agi, filing_status, inf_factor,
                                                      filer_65=filer_65, spouse_65=spouse_65)
     total_tax = fed["federal_tax"] + sc["sc_tax"]
@@ -823,11 +841,15 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     enhanced_extra = get_federal_enhanced_extra(agi, filer_65_plus, spouse_65_plus, filing_status, inflation_factor, tax_year=_tax_year)
     fed_std = base_std + traditional_extra + enhanced_extra
 
+    # SC retirement income = IRA/401k distributions + pension
+    retirement_income = taxable_ira + rmd_amount + taxable_pensions
+
     # Calculate itemized deductions from components
     mortgage_interest = calc_mortgage_interest_for_year(mtg_balance, mtg_rate, mtg_payment)[0] if mtg_balance > 0 else 0.0
     # SALT: estimate state tax using standard deduction, add property tax, cap at $10k
     est_sc = calculate_sc_tax(max(0.0, agi - fed_std), dependents, taxable_ss, out_of_state_gain,
-                              filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss)
+                              filer_65_plus, spouse_65_plus, retirement_income, cap_gain_loss,
+                              enhanced_elderly_addback=enhanced_extra)
     salt = min(10000.0 * inflation_factor, est_sc["sc_tax"] + prop_tax)
     # Medical: amount exceeding 7.5% of AGI
     medical_deduction = max(0.0, medical_exp - agi * 0.075)
@@ -851,7 +873,7 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     fed_taxable = max(0.0, agi - deduction_used)
     preferential_amount = qualified_dividends + max(0.0, cap_gain_loss)
     fed = calculate_federal_tax(fed_taxable, preferential_amount, filing_status, inflation_factor)
-    sc = calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss)
+    sc = calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_income, cap_gain_loss, enhanced_elderly_addback=enhanced_extra)
     total_tax = fed["federal_tax"] + sc["sc_tax"]
     if filer_65_plus or spouse_65_plus:
         _med_inf = medicare_inflation_factor if medicare_inflation_factor is not None else None
@@ -1379,9 +1401,15 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         _qual_ratio = 0.0
         _cg_yield = 0.0
 
-    # Growth rate = total return (includes dividend + CG yield).
+    # Derive brokerage interest yield: total interest minus estimated cash interest
+    _cash_int_est = params.get("emergency_fund", 0.0) * r_cash
+    _int_yield = max(0.0, p_interest_taxable - _cash_int_est) / _init_brok if _init_brok > 0 else 0.0
+
+    # Growth rate = total return (includes dividend + CG + interest yield).
     # When not reinvesting, reduce effective growth by distributed yields.
-    _div_drag = (_div_yield if not p_reinvest_div else 0.0) + (_cg_yield if not p_reinvest_cg else 0.0)
+    _div_drag = ((_div_yield if not p_reinvest_div else 0.0)
+                 + (_cg_yield if not p_reinvest_cg else 0.0)
+                 + (_int_yield if not p_reinvest_int else 0.0))
 
     # Deduction inputs
     p_retirement_deduction = params.get("retirement_deduction", 0.0)
@@ -1476,15 +1504,16 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr_ordinary_div = curr_brokerage * _div_yield
         yr_qualified_div = yr_ordinary_div * _qual_ratio
         yr_cap_gain = curr_brokerage * _cg_yield
+        yr_interest = curr_brokerage * _int_yield + curr_cash * r_cash
 
         reinvested_base = 0.0
         if p_reinvest_int:
-            reinvested_base += p_interest_taxable
+            reinvested_base += yr_interest
         if p_reinvest_div:
             reinvested_base += yr_ordinary_div
         if p_reinvest_cg and yr_cap_gain > 0:
             reinvested_base += yr_cap_gain
-        spendable_inv = (p_interest_taxable + yr_ordinary_div + yr_cap_gain) - reinvested_base
+        spendable_inv = (yr_interest + yr_ordinary_div + yr_cap_gain) - reinvested_base
 
         # Spending
         yr_mtg_payment = mtg_payment if curr_mtg_bal > 0 else 0.0
@@ -1606,7 +1635,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 # Estimate spending-driven pre-tax withdrawal so bracket fill accounts for it
                 _est_fixed = ss_now + pen_now + taxable_rmd + spendable_inv + p_wages + p_other_income
                 _est_spending_wd = max(0.0, total_spend_need - _est_fixed)
-                base_taxable = pen_now + taxable_rmd + p_interest_taxable + yr_ordinary_div + yr_cap_gain + _est_spending_wd
+                base_taxable = pen_now + taxable_rmd + yr_interest + yr_ordinary_div + yr_cap_gain + _est_spending_wd
                 if _yr_conv_strategy == "fill_to_target":
                     room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
                     conversion_this_year = min(room, avail_pretax)
@@ -1727,7 +1756,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 "total_ordinary_dividends": yr_ordinary_div,
                 "qualified_dividends": yr_qualified_div,
                 "tax_exempt_interest": p_tax_exempt_interest,
-                "interest_taxable": p_interest_taxable,
+                "interest_taxable": yr_interest,
                 "cap_gain_loss": yr_cap_gain,
                 "other_income": yr_extra_taxable + p_other_income,
                 "ordinary_tax_only": 0.0,
@@ -1775,7 +1804,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "total_ordinary_dividends": yr_ordinary_div,
                     "qualified_dividends": yr_qualified_div,
                     "tax_exempt_interest": p_tax_exempt_interest,
-                    "interest_taxable": p_interest_taxable,
+                    "interest_taxable": yr_interest,
                     "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                     "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                     "ordinary_tax_only": 0.0,
@@ -1881,7 +1910,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "total_ordinary_dividends": yr_ordinary_div,
                     "qualified_dividends": yr_qualified_div,
                     "tax_exempt_interest": p_tax_exempt_interest,
-                    "interest_taxable": p_interest_taxable,
+                    "interest_taxable": yr_interest,
                     "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                     "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                     "ordinary_tax_only": 0.0,
@@ -1981,7 +2010,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     "total_ordinary_dividends": yr_ordinary_div,
                     "qualified_dividends": yr_qualified_div,
                     "tax_exempt_interest": p_tax_exempt_interest,
-                    "interest_taxable": p_interest_taxable,
+                    "interest_taxable": yr_interest,
                     "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                     "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                     "ordinary_tax_only": 0.0,
@@ -2091,7 +2120,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             if _avail_pt_accel > 0:
                 # Build base non-SS income from already-determined components
                 _base_non_ss = (pen_now + taxable_rmd + wd_pretax + conversion_this_year +
-                                p_interest_taxable + yr_ordinary_div + yr_cap_gain +
+                                yr_interest + yr_ordinary_div + yr_cap_gain +
                                 cap_gains_realized + ann_gains_withdrawn +
                                 yr_extra_taxable + p_other_income + p_wages)
                 _pref_amt = max(0.0, yr_cap_gain + cap_gains_realized) + max(0.0, yr_qualified_div)
@@ -2116,7 +2145,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         "total_ordinary_dividends": yr_ordinary_div,
                         "qualified_dividends": yr_qualified_div,
                         "tax_exempt_interest": p_tax_exempt_interest,
-                        "interest_taxable": p_interest_taxable,
+                        "interest_taxable": yr_interest,
                         "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                         "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                         "ordinary_tax_only": 0.0,
@@ -2150,7 +2179,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _unrealized_gains = max(0.0, _remaining_brok * dyn_gain_pct)
             if dyn_gain_pct > 0.01 and _unrealized_gains > 1.0:
                 _harv_base_non_ss = (pen_now + taxable_rmd + wd_pretax + conversion_this_year +
-                                     p_interest_taxable + yr_ordinary_div + yr_cap_gain +
+                                     yr_interest + yr_ordinary_div + yr_cap_gain +
                                      cap_gains_realized + ann_gains_withdrawn +
                                      yr_extra_taxable + p_other_income + p_wages)
                 _harv_existing_pref = max(0.0, yr_cap_gain + cap_gains_realized) + max(0.0, yr_qualified_div)
@@ -2170,7 +2199,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         "total_ordinary_dividends": yr_ordinary_div,
                         "qualified_dividends": yr_qualified_div,
                         "tax_exempt_interest": p_tax_exempt_interest,
-                        "interest_taxable": p_interest_taxable,
+                        "interest_taxable": yr_interest,
                         "cap_gain_loss": yr_cap_gain + cap_gains_realized,
                         "other_income": ann_gains_withdrawn + yr_extra_taxable + p_other_income,
                         "ordinary_tax_only": 0.0,
@@ -2241,7 +2270,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _, curr_mtg_bal = calc_mortgage_interest_for_year(curr_mtg_bal, mtg_rate, mtg_payment)
 
         # Growth with negative balance protection
-        curr_cash = max(0.0, curr_cash) * (1 + r_cash)
+        _cash_before_growth = max(0.0, curr_cash)
+        curr_cash = _cash_before_growth * (1 + r_cash)
+        if not p_reinvest_int:
+            curr_cash -= _cash_before_growth * r_cash  # interest already counted as income
         curr_ef = max(0.0, curr_ef) * (1 + r_cash)
         curr_brokerage = max(0.0, curr_brokerage) * (1 + r_taxable - _div_drag)
         curr_pre_filer = max(0.0, curr_pre_filer) * (1 + r_pretax)
@@ -2767,6 +2799,9 @@ def run_retirement_projection(balances, params, spending_order):
     post_return = params["post_retire_return"]
     filing_status = params["filing_status"]
     state_rate = params["state_tax_rate"]
+    _sc_dependents = params.get("dependents", 0)
+    _sc_out_of_state = params.get("out_of_state_gain", 0.0)
+    _sc_base_tax_year = params.get("base_tax_year", 2026)
     living_expenses_yr1 = params["expenses_at_retirement"]
     ss_filer_fra = params["ss_filer_fra"]
     ss_spouse_fra = params["ss_spouse_fra"]
@@ -3051,6 +3086,13 @@ def run_retirement_projection(balances, params, spending_order):
         yr_qcd_cash_offset = min(yr_qcd, rmd_amount)  # QCD within RMD reduces spendable cash
         expenses -= yr_qcd  # QCD satisfies this portion of charitable spending directly from IRA
 
+        # SC tax params for this year (retirement_income updated before each calc_year_taxes call)
+        _yr_sc_params = {
+            "dependents": _sc_dependents,
+            "out_of_state_gain": _sc_out_of_state,
+            "tax_year": _sc_base_tax_year + i,
+        }
+
         # Roth conversion (after RMD, before waterfall)
         conversion_this_year = 0.0
         conv_tax_withheld = 0.0  # portion of conversion tax paid from the conversion itself
@@ -3071,14 +3113,16 @@ def run_retirement_projection(balances, params, spending_order):
                 # Tax on conversion: withhold from conversion if no other source to pay
                 if conversion_this_year > 0:
                     _no_conv_pretax_inc = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + yr_taxable_other
+                    _yr_sc_params["retirement_income"] = wd_pretax + pen_income + yr_inherited_dist
                     _no_conv_tax = calc_year_taxes(gross_ss, _no_conv_pretax_inc,
                                                     inv_cap_gains_income, inv_ordinary_income,
                                                     _yr_filing_status, _yr_filer_65, _yr_spouse_65,
-                                                    bracket_inf, state_rate)["total_tax"]
+                                                    bracket_inf, state_rate, sc_params=_yr_sc_params)["total_tax"]
+                    _yr_sc_params["retirement_income"] = wd_pretax + pen_income + yr_inherited_dist + conversion_this_year
                     _with_conv_tax = calc_year_taxes(gross_ss, _no_conv_pretax_inc + conversion_this_year,
                                                      inv_cap_gains_income, inv_ordinary_income,
                                                      _yr_filing_status, _yr_filer_65, _yr_spouse_65,
-                                                     bracket_inf, state_rate)["total_tax"]
+                                                     bracket_inf, state_rate, sc_params=_yr_sc_params)["total_tax"]
                     _conv_tax_cost = _with_conv_tax - _no_conv_tax
                     conv_tax_total = _conv_tax_cost
                     # Available external funding: surplus income + taxable accounts
@@ -3102,9 +3146,11 @@ def run_retirement_projection(balances, params, spending_order):
             total_cap_gains = yr_cap_gains + inv_cap_gains_income
             yr_taxable_other = yr_other_income if not ret_other_income_tax_free else 0.0
             pretax_income = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + yr_taxable_other + conversion_this_year
+            _yr_sc_params["retirement_income"] = wd_pretax + pen_income + yr_inherited_dist + conversion_this_year
             tax_result = calc_year_taxes(gross_ss, pretax_income, total_cap_gains,
                                          inv_ordinary_income, _yr_filing_status,
-                                         _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate)
+                                         _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate,
+                                         sc_params=_yr_sc_params)
             taxes = tax_result["total_tax"]
             # Medicare premiums (based on AGI, applies when 65+)
             if _yr_filer_65 or _yr_spouse_65:
@@ -3169,9 +3215,11 @@ def run_retirement_projection(balances, params, spending_order):
         total_cap_gains = yr_cap_gains + inv_cap_gains_income
         yr_taxable_other = yr_other_income if not ret_other_income_tax_free else 0.0
         pretax_income = (wd_pretax - yr_qcd_cash_offset) + pen_income + yr_inherited_dist + yr_taxable_other + conversion_this_year
+        _yr_sc_params["retirement_income"] = wd_pretax + pen_income + yr_inherited_dist + conversion_this_year
         tax_result = calc_year_taxes(gross_ss, pretax_income, total_cap_gains,
                                      inv_ordinary_income, _yr_filing_status,
-                                     _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate)
+                                     _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate,
+                                     sc_params=_yr_sc_params)
         taxes = tax_result["total_tax"]
         if _yr_filer_65 or _yr_spouse_65:
             yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf,
@@ -3373,6 +3421,8 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         mortgage_yrs_left = years_to_ret + 1
     filing = income_info.get("filing_status", "Single") if income_info else "Single"
     st_rate = income_info.get("state_rate", 0.05) if income_info else 0.05
+    _accum_sc_dependents = income_info.get("dependents", 0) if income_info else 0
+    _accum_sc_base_tax_year = income_info.get("base_tax_year", 2026) if income_info else 2026
     pretax_deductions = income_info.get("pretax_deductions", 0) if income_info else 0
     inf_rate = income_info.get("inflation", 0.03) if income_info else 0.03
     bracket_growth_rate = income_info.get("bracket_growth", inf_rate) if income_info else inf_rate
@@ -3637,12 +3687,17 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
                 _ac_cg_inc = yr_dividends + yr_cap_gain_dist
                 _ac_filer65 = age >= 65
                 _ac_sp65 = spouse_age_yr >= 65 if accum_spouse_age else False
+                _ac_sc_params = {"dependents": _accum_sc_dependents, "out_of_state_gain": 0.0,
+                                 "tax_year": _accum_sc_base_tax_year + yr,
+                                 "retirement_income": yr_inherited_dist}
                 _ac_no_conv_tax = calc_year_taxes(yr_ss, _ac_pretax_inc, _ac_cg_inc,
                                                    yr_interest, filing, _ac_filer65, _ac_sp65,
-                                                   bracket_inf_f, st_rate)["total_tax"]
+                                                   bracket_inf_f, st_rate, sc_params=_ac_sc_params)["total_tax"]
+                _ac_sc_params["retirement_income"] = yr_inherited_dist + accum_conversion_this_year
                 _ac_with_conv_tax = calc_year_taxes(yr_ss, _ac_pretax_inc + accum_conversion_this_year,
                                                      _ac_cg_inc, yr_interest, filing,
-                                                     _ac_filer65, _ac_sp65, bracket_inf_f, st_rate)["total_tax"]
+                                                     _ac_filer65, _ac_sp65, bracket_inf_f, st_rate,
+                                                     sc_params=_ac_sc_params)["total_tax"]
                 _ac_conv_tax = _ac_with_conv_tax - _ac_no_conv_tax
                 accum_conv_tax_total = _ac_conv_tax
                 # Available external funding: surplus income + taxable accounts
@@ -3683,11 +3738,22 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         # Charitable spending (always a real expense, even if not itemizing)
         yr_charitable = base_charitable * inf_f
 
+        # SC params for this accumulation year
+        _accum_yr_ret_income = yr_inherited_dist + accum_conversion_this_year
+        _accum_yr_sc_params = {"dependents": _accum_sc_dependents, "out_of_state_gain": 0.0,
+                               "tax_year": _accum_sc_base_tax_year + yr,
+                               "retirement_income": _accum_yr_ret_income}
+
         # Determine deduction: itemized vs standard
         deduction = std_ded
         if use_itemize and yr < mortgage_yrs_left + 5:  # itemize while it helps
             yr_mtg_interest, mtg_bal_end = calc_mortgage_interest_for_year(mtg_bal_track, mtg_rate, base_mortgage)
-            est_state_tax = calc_state_tax(max(0, yr_agi - std_ded), st_rate)
+            _enh_for_salt = get_federal_enhanced_extra(yr_agi, filer_65, spouse_65_yr, filing, bracket_inf_f,
+                                                       tax_year=_accum_sc_base_tax_year + yr)
+            est_sc_result = calculate_sc_tax(max(0, yr_agi - std_ded), _accum_sc_dependents, taxable_ss,
+                                             0.0, filer_65, spouse_65_yr, _accum_yr_ret_income,
+                                             yr_cap_gain_income, enhanced_elderly_addback=_enh_for_salt)
+            est_state_tax = est_sc_result["sc_tax"]
             yr_property_tax = base_property_tax * inf_f
             salt = min(10000.0 * bracket_inf_f, est_state_tax + yr_property_tax)
             yr_medical = base_medical * inf_f
@@ -3704,7 +3770,13 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         ordinary_taxable = max(0, total_ordinary - yr_se_ded - deduction)
         fed_tax = calc_federal_tax(ordinary_taxable, filing, bracket_inf_f)
         fed_tax += calc_cg_tax(yr_cap_gain_income, ordinary_taxable, filing, bracket_inf_f)
-        state_tax = calc_state_tax(max(0, yr_agi - deduction), st_rate)
+        _accum_fed_taxable = max(0, yr_agi - deduction)
+        _accum_enh = get_federal_enhanced_extra(yr_agi, filer_65, spouse_65_yr, filing, bracket_inf_f,
+                                                 tax_year=_accum_sc_base_tax_year + yr)
+        _accum_sc = calculate_sc_tax(_accum_fed_taxable, _accum_sc_dependents, taxable_ss, 0.0,
+                                      filer_65, spouse_65_yr, _accum_yr_ret_income, yr_cap_gain_income,
+                                      enhanced_elderly_addback=_accum_enh)
+        state_tax = _accum_sc["sc_tax"]
         yr_taxes = fed_tax + state_tax + yr_fica
 
         # Non-savings expenses (subtract any conversion tax already withheld from the conversion)

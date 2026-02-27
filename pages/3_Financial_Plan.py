@@ -818,6 +818,8 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
         "living_expenses": D["living_expenses"],
         "mortgage_annual": mtg_payment_annual, "mortgage_years": mtg_years,
         "filing_status": filing_status, "state_rate": state_rate,
+        "dependents": int(D["dependents"]),
+        "base_tax_year": int(D["tax_year"]),
         "pretax_deductions": pretax_deductions,
         "inflation": inflation, "bracket_growth": bracket_growth,
         "medicare_growth": medicare_growth,
@@ -990,6 +992,9 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             "post_retire_return": post_ret_return,
             "filing_status": filing_status,
             "state_tax_rate": state_rate,
+            "dependents": int(D["dependents"]),
+            "out_of_state_gain": float(D["out_of_state_gain"]),
+            "base_tax_year": int(D["tax_year"]),
             "expenses_at_retirement": ret_expenses,
             "ss_filer_fra": ss_f_fra_at_ret, "ss_spouse_fra": ss_s_fra_at_ret,
             "ss_filer_claim_age": ss_filer_claim_age,
@@ -2787,7 +2792,7 @@ elif nav == "Achieving":
             "spending_goal": spending_goal, "start_year": int(start_year),
             "years": int(years), "inflation": float(inflation),
             "bracket_growth": float(bracket_growth), "medicare_growth": float(medicare_growth),
-            "pension_cola": float(pension_cola), "heir_tax_rate": heir_tax_rate,
+            "pension_cola": float(pension_cola), "heir_tax_rate": heir_tax_rate, "state_tax_rate": D["state_tax_rate"] / 100,
             "r_cash": r_cash, "r_taxable": r_taxable, "r_pretax": r_pretax, "r_roth": r_roth,
             "r_annuity": r_annuity, "r_life": r_life,
             "gross_ss_total": gross_ss_total, "taxable_pensions_total": taxable_pensions_total,
@@ -3637,6 +3642,7 @@ elif nav == "Achieving":
                         for _bkey, _blabel in [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"), ("fill_irmaa_0", "Fill to IRMAA Tier 1")]:
                             if _base_agi_est < _bracket_agi_tops[_bkey]:
                                 _conv_strategies.append((_bkey, _blabel))
+                        _conv_strategies.append(("fill_heir_rate", f"Fill to Heir Rate ({heir_tax_rate:.0%})"))
 
                     # ---- Count total runs for progress ----
                     _n_quick = len(_spending_strategies) + len(_adaptive_strategies)

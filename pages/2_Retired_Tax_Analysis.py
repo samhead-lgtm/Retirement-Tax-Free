@@ -253,11 +253,14 @@ def calculate_taxable_ss(base_non_ss, tax_exempt, gross_ss, status):
     if provisional > base2: taxable += (provisional - base2) * 0.85
     return min(taxable, 0.85 * float(gross_ss))
 
-def calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss):
-    sc_start = max(0.0, float(fed_taxable))
-    sub = max(0.0, float(taxable_ss)) + max(0.0, float(retirement_deduction))
-    if filer_65_plus: sub += 5000.0
-    if spouse_65_plus: sub += 5000.0
+def calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_income, cap_gain_loss, enhanced_elderly_addback=0.0):
+    sc_start = max(0.0, float(fed_taxable)) + max(0.0, float(enhanced_elderly_addback))
+    # Retirement deduction: auto-compute based on age
+    ret_ded_limit = 10000.0 if filer_65_plus else 3000.0
+    ret_ded = min(ret_ded_limit, max(0.0, float(retirement_income)))
+    sub = max(0.0, float(taxable_ss)) + ret_ded
+    if filer_65_plus: sub += 15000.0
+    if spouse_65_plus: sub += 15000.0
     sub += 0.44 * max(0.0, float(cap_gain_loss)) + max(0.0, float(out_of_state_gain)) + 4930.0 * max(0, int(dependents))
     sc_taxable = max(0.0, sc_start - sub)
     brackets = [(0,3560,0.00),(3560,17830,0.03),(17830,float("inf"),0.06)]
@@ -382,6 +385,17 @@ def compute_irmaa_safe_amount(target_irmaa_tier, base_non_ss_income, gross_ss,
     return max(0.0, result)
 
 
+def _heir_rate_to_federal_bracket(heir_rate, state_rate):
+    """Find the highest federal bracket rate where bracket + state <= heir rate.
+    Returns the bracket rate (e.g. 0.32) or None if no bracket qualifies."""
+    federal_brackets = [0.10, 0.12, 0.22, 0.24, 0.32, 0.35, 0.37]
+    best = None
+    for rate in federal_brackets:
+        if rate + state_rate <= heir_rate + 0.001:
+            best = rate
+    return best
+
+
 def compute_gains_harvest_amount(base_non_ss_income, existing_preferential, gross_ss,
                                   filing_status, filer_65, spouse_65, retirement_deduction,
                                   inf_factor=1.0, tax_year=None):
@@ -481,8 +495,10 @@ def compute_taxes_only(gross_ss, taxable_pensions, rmd_amount, taxable_ira, conv
     fed_taxable = max(0.0, agi - deduction)
     preferential = max(0.0, cap_gains)
     fed = calculate_federal_tax(fed_taxable, preferential, filing_status, inf_factor)
-    sc = calculate_sc_tax(fed_taxable, 0, taxable_ss, 0.0, filer_65, spouse_65, 
-                          retirement_deduction * inf_factor, cap_gains)
+    retirement_income = taxable_ira + rmd_amount + taxable_pensions
+    sc = calculate_sc_tax(fed_taxable, 0, taxable_ss, 0.0, filer_65, spouse_65,
+                          retirement_income * inf_factor, cap_gains,
+                          enhanced_elderly_addback=enh_extra)
     medicare, has_irmaa = estimate_medicare_premiums(agi, filing_status, inf_factor,
                                                      filer_65=filer_65, spouse_65=spouse_65)
     total_tax = fed["federal_tax"] + sc["sc_tax"]
@@ -586,11 +602,15 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     enhanced_extra = get_federal_enhanced_extra(agi, filer_65_plus, spouse_65_plus, filing_status, inflation_factor, tax_year=_tax_year)
     fed_std = base_std + traditional_extra + enhanced_extra
 
+    # SC retirement income = IRA/401k distributions + pension
+    retirement_income = taxable_ira + rmd_amount + taxable_pensions
+
     # Calculate itemized deductions from components
     mortgage_interest = calc_mortgage_interest_for_year(mtg_balance, mtg_rate, mtg_payment)[0] if mtg_balance > 0 else 0.0
     # SALT: estimate state tax using standard deduction, add property tax, cap at $10k
     est_sc = calculate_sc_tax(max(0.0, agi - fed_std), dependents, taxable_ss, out_of_state_gain,
-                              filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss)
+                              filer_65_plus, spouse_65_plus, retirement_income, cap_gain_loss,
+                              enhanced_elderly_addback=enhanced_extra)
     salt = min(10000.0 * inflation_factor, est_sc["sc_tax"] + prop_tax)
     # Medical: amount exceeding 7.5% of AGI
     medical_deduction = max(0.0, medical_exp - agi * 0.075)
@@ -614,7 +634,7 @@ def compute_case(inputs, inflation_factor=1.0, medicare_inflation_factor=None):
     fed_taxable = max(0.0, agi - deduction_used)
     preferential_amount = qualified_dividends + max(0.0, cap_gain_loss)
     fed = calculate_federal_tax(fed_taxable, preferential_amount, filing_status, inflation_factor)
-    sc = calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_deduction, cap_gain_loss)
+    sc = calculate_sc_tax(fed_taxable, dependents, taxable_ss, out_of_state_gain, filer_65_plus, spouse_65_plus, retirement_income, cap_gain_loss, enhanced_elderly_addback=enhanced_extra)
     total_tax = fed["federal_tax"] + sc["sc_tax"]
     # FICA / SE tax (separate from income tax; SE deduction already applied to AGI above)
     _fica = 0.0
@@ -847,12 +867,14 @@ def display_tax_return(r, mortgage_pmt=0.0, filer_65=False, spouse_65=False):
     if _sc_dep > 0:
         _sc_table += f"| Less: dependent exemption ({_sc_dep} x $4,930) | ({_amt(_sc_dep * 4930)}) |\n"
     _sc_table += f"| Less: taxable SS (SC exempt) | ({_amt(r.get('taxable_ss', 0))}) |\n"
-    _ret_ded = r.get("retirement_deduction", 0)
+    _ret_income = r.get("taxable_ira", 0) + r.get("rmd_amount", 0) + r.get("taxable_pensions", 0)
+    _ret_limit = 10000.0 if filer_65 else 3000.0
+    _ret_ded = min(_ret_limit, max(0.0, _ret_income))
     if _ret_ded > 0:
         _sc_table += f"| Less: retirement deduction | ({_amt(_ret_ded)}) |\n"
     _65_count = int(bool(filer_65)) + int(bool(spouse_65))
     if _65_count > 0:
-        _sc_table += f"| Less: 65+ deduction | ({_amt(5000 * _65_count)}) |\n"
+        _sc_table += f"| Less: 65+ deduction | ({_amt(15000 * _65_count)}) |\n"
     _cg = r.get("cap_gain_loss", 0)
     if _cg > 0:
         _sc_table += f"| Less: 44% capital gains exclusion | ({_amt(_cg * 0.44)}) |\n"
@@ -1353,11 +1375,15 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _div_yield = 0.0
             _qual_ratio = 0.0
             _cg_yield = 0.0
-        _int_yield = 0.0  # legacy: interest is static (p_interest_taxable)
+        # Derive brokerage interest yield: total interest minus estimated cash interest
+        _cash_int_est = params.get("emergency_fund", 0.0) * r_cash
+        _int_yield = max(0.0, p_interest_taxable - _cash_int_est) / _init_brok if _init_brok > 0 else 0.0
 
-    # Growth rate = total return (includes dividend + CG yield).
+    # Growth rate = total return (includes dividend + CG + interest yield).
     # When not reinvesting, reduce effective growth by distributed yields.
-    _div_drag = (_div_yield if not p_reinvest_div else 0.0) + (_cg_yield if not p_reinvest_cg else 0.0)
+    _div_drag = ((_div_yield if not p_reinvest_div else 0.0)
+                 + (_cg_yield if not p_reinvest_cg else 0.0)
+                 + (_int_yield if not p_reinvest_int else 0.0))
 
     # Deduction inputs
     p_retirement_deduction = params.get("retirement_deduction", 0.0)
@@ -1367,6 +1393,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     p_medical_expenses = params.get("medical_expenses", 0.0)
     p_charitable = params.get("charitable", 0.0)
     p_qcd_annual = params.get("qcd_annual", 0.0)
+    p_state_tax_rate = params.get("state_tax_rate", 0.055)
 
     # Mortgage
     mtg_balance = params.get("mortgage_balance", 0.0)
@@ -1465,7 +1492,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr_ordinary_div = curr_brokerage * _div_yield
         yr_qualified_div = yr_ordinary_div * _qual_ratio
         yr_cap_gain = curr_brokerage * _cg_yield
-        yr_interest = (curr_brokerage * _int_yield) if _aa_yields else p_interest_taxable
+        yr_interest = curr_brokerage * _int_yield + curr_cash * r_cash
 
         reinvested_base = 0.0
         if p_reinvest_int:
@@ -1581,12 +1608,42 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr_charitable_deduction = max(0.0, yr_charitable - yr_qcd)
         total_spend_need -= yr_qcd  # QCD pays this portion of charitable directly from IRA
 
-        # QCD reserve: when QCD is active, the IRA is occupied funding charitable gifts.
-        # Protect the full remaining balance from voluntary withdrawals (conversions, waterfall, accel PT).
-        # The overflow / last-resort path can still tap it if all other accounts are exhausted.
+        # QCD reserve: find the minimum IRA balance from which the account can
+        # self-sustain all future QCDs (via RMDs + beyond-RMD draws + growth).
+        # Binary search: simulate forward from a trial balance; if the IRA never
+        # goes negative, the trial is sufficient.  Find the lowest such balance.
         qcd_reserve = 0.0
         if _qcd_base > 0 and age_f >= 70:
-            qcd_reserve = max(0.0, curr_pre_filer + curr_pre_spouse)
+            _curr_pt = curr_pre_filer + curr_pre_spouse
+            _rem = years - i
+            if _rem <= 1:
+                qcd_reserve = 0.0  # last year — no future to protect
+            else:
+                def _qcd_sim_ok(start_bal):
+                    s = start_bal
+                    for _fy in range(1, _rem):
+                        s *= (1 + r_pretax)
+                        _sa = age_f + _fy
+                        _sr = compute_rmd_uniform_start73(s, _sa)
+                        s -= _sr
+                        _fq = _qcd_base * ((1 + inflation) ** (i + _fy))
+                        s -= max(0.0, _fq - _sr)
+                        if s < -0.01:
+                            return False
+                    return True
+                _lo, _hi = 0.0, _curr_pt
+                if _qcd_sim_ok(0.0):
+                    qcd_reserve = 0.0  # IRA not needed at all for future QCDs
+                elif not _qcd_sim_ok(_curr_pt):
+                    qcd_reserve = _curr_pt  # even full balance can't sustain — protect all
+                else:
+                    for _ in range(30):  # ~$1 precision
+                        _mid = (_lo + _hi) * 0.5
+                        if _qcd_sim_ok(_mid):
+                            _hi = _mid
+                        else:
+                            _lo = _mid
+                    qcd_reserve = _hi
 
         # Roth conversion (after RMD, before waterfall)
         conversion_this_year = 0.0
@@ -1622,6 +1679,17 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     safe_amt = compute_irmaa_safe_amount(
                         _irmaa_tier, base_taxable, ss_now, _yr_filing_status, inf_factor=bracket_inf)
                     conversion_this_year = min(max(0.0, safe_amt), avail_pretax)
+                elif _yr_conv_strategy == "fill_heir_rate":
+                    _target_bracket = _heir_rate_to_federal_bracket(heir_tax_rate, p_state_tax_rate)
+                    if _target_bracket is not None:
+                        pref_amt = max(0.0, yr_cap_gain) + max(0.0, yr_qualified_div)
+                        fill_amt = compute_bracket_fill_amount(
+                            _target_bracket, base_taxable, ss_now, _yr_filing_status,
+                            _yr_filer_65, _yr_spouse_65, p_retirement_deduction,
+                            preferential_amount=pref_amt, inf_factor=bracket_inf, tax_year=yr)
+                        conversion_this_year = min(max(0.0, fill_amt), avail_pretax)
+                    else:
+                        conversion_this_year = 0.0
                 elif isinstance(_yr_conv_strategy, (int, float)):
                     conversion_this_year = min(float(_yr_conv_strategy), avail_pretax)
                 else:
@@ -1630,7 +1698,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     except (ValueError, TypeError):
                         conversion_this_year = 0.0
                 # AGI cap: when enabled, cap any conversion so AGI stays at or below target
-                if agi_cap_bracket_fills and target_agi > 0 and _yr_conv_strategy != "fill_to_target":
+                if agi_cap_bracket_fills and target_agi > 0 and isinstance(_yr_conv_strategy, (int, float)):
                     agi_room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
                     conversion_this_year = min(conversion_this_year, agi_room)
 
@@ -2260,7 +2328,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _, curr_mtg_bal = calc_mortgage_interest_for_year(curr_mtg_bal, mtg_rate, mtg_payment)
 
         # Growth with negative balance protection
-        curr_cash = max(0.0, curr_cash) * (1 + r_cash)
+        _cash_before_growth = max(0.0, curr_cash)
+        curr_cash = _cash_before_growth * (1 + r_cash)
+        if not p_reinvest_int:
+            curr_cash -= _cash_before_growth * r_cash  # interest already counted as income
         curr_ef = max(0.0, curr_ef) * (1 + r_cash)
         curr_brokerage = max(0.0, curr_brokerage) * (1 + r_taxable - _div_drag)
         curr_pre_filer = max(0.0, curr_pre_filer) * (1 + r_pretax)
@@ -2441,6 +2512,318 @@ def _pdf_kv_line(pdf, label, value, bold_value=False):
     pdf.cell(60, 5, _pdf_safe(label), new_x="END")
     pdf.set_font("Helvetica", "B" if bold_value else "", 9)
     pdf.cell(0, 5, _pdf_safe(value), new_x="LMARGIN", new_y="NEXT")
+
+## --------------- Tax Form PDF Helpers --------------- ##
+
+def _form_header(pdf, form_name, title, tax_year, subtitle=""):
+    """Dark blue header band for a tax form page."""
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_fill_color(44, 62, 80)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(40, 10, _pdf_safe(form_name), fill=True, new_x="END")
+    pdf.cell(0, 10, _pdf_safe(f"  {title}  —  {int(tax_year)}"), fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    if subtitle:
+        pdf.set_font("Helvetica", "I", 9)
+        pdf.cell(0, 5, _pdf_safe(subtitle), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+def _form_info_block(pdf, client_name, filing_status, tax_year):
+    """Name / filing status / year block."""
+    pdf.set_font("Helvetica", "", 10)
+    if client_name:
+        pdf.cell(20, 6, "Name:", new_x="END")
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(80, 6, _pdf_safe(client_name), new_x="END")
+        pdf.set_font("Helvetica", "", 10)
+    pdf.cell(30, 6, "Filing status:", new_x="END")
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, _pdf_safe(filing_status), new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+def _form_line(pdf, line_num, description, amount, bold=False, indent=False):
+    """Standard form line: [line#]  description .......... $ amount"""
+    style = "B" if bold else ""
+    pdf.set_font("Helvetica", style, 9)
+    ln_text = str(line_num) if line_num else ""
+    pdf.cell(12, 5.5, _pdf_safe(ln_text), new_x="END")
+    desc_w = pdf.w - pdf.l_margin - pdf.r_margin - 12 - 45
+    if indent:
+        pdf.cell(4, 5.5, "", new_x="END")
+        desc_w -= 4
+    pdf.cell(desc_w, 5.5, _pdf_safe(description), new_x="END")
+    pdf.set_font("Courier", style, 9)
+    if amount is None or amount == 0:
+        amt_str = "—"
+    elif amount < 0:
+        amt_str = f"({abs(amount):,.0f})"
+    else:
+        amt_str = f"{amount:,.0f}"
+    pdf.cell(45, 5.5, _pdf_safe(amt_str), align="R", new_x="LMARGIN", new_y="NEXT")
+
+def _form_section_bar(pdf, title):
+    """Gray bar section divider."""
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_fill_color(220, 230, 241)
+    pdf.cell(0, 6, _pdf_safe(f"  {title}"), fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+def _form_sub_line(pdf, description, amount):
+    """Indented italic sub-line for breakdowns."""
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.cell(16, 4.5, "", new_x="END")
+    desc_w = pdf.w - pdf.l_margin - pdf.r_margin - 16 - 45
+    pdf.cell(desc_w, 4.5, _pdf_safe(description), new_x="END")
+    pdf.set_font("Courier", "I", 8)
+    if amount is None or amount == 0:
+        amt_str = "—"
+    elif amount < 0:
+        amt_str = f"({abs(amount):,.0f})"
+    else:
+        amt_str = f"{amount:,.0f}"
+    pdf.cell(45, 4.5, _pdf_safe(amt_str), align="R", new_x="LMARGIN", new_y="NEXT")
+
+## --------------- Tax Form Renderers --------------- ##
+
+def _render_1040_page1(pdf, r, client_name, filing_status, tax_year):
+    _form_header(pdf, "Form 1040", "U.S. Individual Income Tax Return", tax_year)
+    _form_info_block(pdf, client_name, filing_status, tax_year)
+
+    _form_section_bar(pdf, "INCOME")
+    _ira_gross = r.get("taxable_ira", 0) + r.get("rmd_amount", 0)
+    _ira_taxable = r.get("taxable_ira", 0) + r.get("taxable_rmd", r.get("rmd_amount", 0))
+    _other = r.get("other_income", 0) + r.get("ordinary_tax_only", 0)
+
+    _form_line(pdf, "1", "Wages, salaries, tips", r.get("wages", 0))
+    _form_line(pdf, "2a", "Tax-exempt interest", r.get("tax_exempt_interest", 0))
+    _form_line(pdf, "2b", "Taxable interest", r.get("interest_taxable", 0))
+    _form_line(pdf, "3a", "Qualified dividends", r.get("qualified_dividends", 0))
+    _form_line(pdf, "3b", "Ordinary dividends", r.get("total_ordinary_dividends", 0))
+    _form_line(pdf, "4a", "IRA distributions", _ira_gross)
+    _form_line(pdf, "4b", "IRA distributions (taxable)", _ira_taxable)
+    _form_line(pdf, "5a", "Pensions and annuities", r.get("taxable_pensions", 0))
+    _form_line(pdf, "5b", "Pensions and annuities (taxable)", r.get("taxable_pensions", 0))
+    _form_line(pdf, "6a", "Social Security benefits", r.get("gross_ss", 0))
+    _form_line(pdf, "6b", "Social Security (taxable)", r.get("taxable_ss", 0))
+    _form_line(pdf, "7", "Capital gain or (loss)", r.get("cap_gain_loss", 0))
+    _form_line(pdf, "8", "Other income (Sch 1)", _other)
+    _form_line(pdf, "9", "Total income", r.get("total_income_for_tax", 0), bold=True)
+
+    _form_section_bar(pdf, "ADJUSTMENTS")
+    _adj = r.get("adjustments", 0) + r.get("se_deduction", 0)
+    _form_line(pdf, "10", "Adjustments to income", _adj)
+    if r.get("se_deduction", 0) > 0:
+        _form_sub_line(pdf, "Includes 50% SE tax deduction", r.get("se_deduction", 0))
+    _form_line(pdf, "11", "Adjusted gross income (AGI)", r.get("agi", 0), bold=True)
+
+    _form_section_bar(pdf, "DEDUCTIONS")
+    _ded_type = "Itemized" if r.get("is_itemizing") else "Standard"
+    _form_line(pdf, "12", f"{_ded_type} deduction", r.get("deduction_used", 0))
+    if r.get("is_itemizing"):
+        _form_sub_line(pdf, "Mortgage interest", r.get("mortgage_interest", 0))
+        _form_sub_line(pdf, "SALT (capped at $10k)", r.get("salt", 0))
+        if r.get("medical_deduction", 0) > 0:
+            _form_sub_line(pdf, "Medical (less 7.5% AGI floor)", r.get("medical_deduction", 0))
+        _form_sub_line(pdf, "Charitable contributions", r.get("charitable", 0))
+    _form_line(pdf, "13", "Qualified business income deduction", 0)
+    _form_line(pdf, "14", "Total deductions", r.get("deduction_used", 0))
+    _form_line(pdf, "15", "Taxable income", r.get("fed_taxable", 0), bold=True)
+
+    _form_section_bar(pdf, "TAX")
+    _form_line(pdf, "16", "Tax", r.get("fed_tax", 0))
+    _form_line(pdf, "24", "Total tax", r.get("fed_tax", 0), bold=True)
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 4, _pdf_safe("For planning purposes only - verify all amounts before filing."), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
+
+def _render_schedule_1(pdf, r, tax_year):
+    """Schedule 1 — Additional Income and Adjustments."""
+    _form_header(pdf, "Schedule 1", "Additional Income and Adjustments to Income", tax_year)
+    _other = r.get("other_income", 0) + r.get("ordinary_tax_only", 0)
+    _adj = r.get("adjustments", 0)
+    _se_ded = r.get("se_deduction", 0)
+
+    _form_section_bar(pdf, "Part I — Additional Income")
+    _form_line(pdf, "8z", "Other income", _other)
+    _form_line(pdf, "10", "Total additional income", _other, bold=True)
+
+    _form_section_bar(pdf, "Part II — Adjustments to Income")
+    if _se_ded > 0:
+        _form_line(pdf, "15", "Deductible part of self-employment tax", _se_ded)
+    _form_line(pdf, "24", "Other adjustments", _adj)
+    _form_line(pdf, "26", "Total adjustments to income", _adj + _se_ded, bold=True)
+
+
+def _render_schedule_a(pdf, r, tax_year):
+    """Schedule A — Itemized Deductions."""
+    _form_header(pdf, "Schedule A", "Itemized Deductions", tax_year)
+
+    _form_section_bar(pdf, "Medical and Dental Expenses")
+    _med_exp = r.get("medical_expenses", 0)
+    _med_ded = r.get("medical_deduction", 0)
+    _form_line(pdf, "1", "Medical and dental expenses", _med_exp)
+    _form_line(pdf, "3", "7.5% of AGI", round(r.get("agi", 0) * 0.075, 0))
+    _form_line(pdf, "4", "Medical deduction (line 1 minus line 3, if positive)", _med_ded)
+
+    _form_section_bar(pdf, "Taxes You Paid")
+    _prop_tax = r.get("property_tax", 0)
+    _salt = r.get("salt", 0)
+    _est_sc = _salt - _prop_tax if _salt > _prop_tax else 0
+    _form_line(pdf, "5a", "State income taxes (estimated SC tax)", max(0, _est_sc))
+    _form_line(pdf, "5b", "Real estate taxes", _prop_tax)
+    _form_line(pdf, "5d", "Total (5a + 5b)", _est_sc + _prop_tax)
+    _form_line(pdf, "5e", "SALT deduction (5d, limited to $10,000)", _salt)
+
+    _form_section_bar(pdf, "Interest You Paid")
+    _form_line(pdf, "8a", "Home mortgage interest", r.get("mortgage_interest", 0))
+
+    _form_section_bar(pdf, "Gifts to Charity")
+    _form_line(pdf, "12", "Charitable contributions", r.get("charitable", 0))
+
+    _form_line(pdf, "17", "Total itemized deductions", r.get("deduction_used", 0), bold=True)
+
+
+def _render_schedule_b(pdf, r, tax_year):
+    """Schedule B — Interest and Ordinary Dividends."""
+    _form_header(pdf, "Schedule B", "Interest and Ordinary Dividends", tax_year)
+
+    _form_section_bar(pdf, "Part I — Interest")
+    _form_line(pdf, "1", "Various (aggregate)", r.get("interest_taxable", 0))
+    _form_line(pdf, "4", "Total interest", r.get("interest_taxable", 0), bold=True)
+
+    _form_section_bar(pdf, "Part II — Ordinary Dividends")
+    _form_line(pdf, "5", "Various (aggregate)", r.get("total_ordinary_dividends", 0))
+    _form_line(pdf, "6", "Total ordinary dividends", r.get("total_ordinary_dividends", 0), bold=True)
+
+
+def _render_schedule_d(pdf, r, tax_year):
+    """Schedule D — Capital Gains and Losses."""
+    _form_header(pdf, "Schedule D", "Capital Gains and Losses", tax_year)
+    _cg = r.get("cap_gain_loss", 0)
+
+    _form_section_bar(pdf, "Part I — Short-Term Capital Gains and Losses")
+    _form_line(pdf, "7", "Net short-term capital gain or (loss)", 0)
+
+    _form_section_bar(pdf, "Part II — Long-Term Capital Gains and Losses")
+    _form_line(pdf, "15", "Net long-term capital gain or (loss)", _cg)
+
+    _form_section_bar(pdf, "Part III — Summary")
+    _form_line(pdf, "16", "Combine lines 7 and 15", _cg, bold=True)
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 4, _pdf_safe("Note: App models aggregate capital gains; individual lots not tracked."), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
+
+def _render_sc1040(pdf, r, filer_65, spouse_65, client_name, filing_status, tax_year):
+    """SC1040 — South Carolina Individual Income Tax Return."""
+    _form_header(pdf, "SC1040", "South Carolina Individual Income Tax Return", tax_year)
+    _form_info_block(pdf, client_name, filing_status, tax_year)
+
+    fed_taxable = r.get("fed_taxable", 0)
+    _form_section_bar(pdf, "SC TAXABLE INCOME COMPUTATION")
+    _form_line(pdf, "1", "Federal taxable income", fed_taxable)
+
+    # Enhanced elderly addback (2025-2028)
+    _enh = 0.0
+    if tax_year is not None and int(tax_year) <= 2028:
+        _enh = get_federal_enhanced_extra(
+            r.get("agi", 0), filer_65, spouse_65, filing_status, tax_year=int(tax_year))
+    if _enh > 0:
+        _form_line(pdf, "+", "Enhanced elderly deduction addback", _enh)
+
+    sc_start = fed_taxable + _enh
+
+    # Subtractions
+    _form_section_bar(pdf, "SUBTRACTIONS")
+    _taxable_ss = r.get("taxable_ss", 0)
+    if _taxable_ss > 0:
+        _form_line(pdf, "", "Less: Taxable SS (SC exempt)", -_taxable_ss)
+
+    _ret_income = r.get("taxable_ira", 0) + r.get("rmd_amount", 0) + r.get("taxable_pensions", 0)
+    _ret_limit = 10000.0 if filer_65 else 3000.0
+    _ret_ded = min(_ret_limit, max(0.0, _ret_income))
+    if _ret_ded > 0:
+        _lbl = f"Less: Retirement deduction (limit ${_ret_limit:,.0f})"
+        _form_line(pdf, "", _lbl, -_ret_ded)
+
+    _65_count = int(bool(filer_65)) + int(bool(spouse_65))
+    if _65_count > 0:
+        _form_line(pdf, "", f"Less: 65+ deduction ($15,000 x {_65_count})", -15000 * _65_count)
+
+    _cg = r.get("cap_gain_loss", 0)
+    if _cg > 0:
+        _form_line(pdf, "", "Less: 44% capital gains exclusion", -round(_cg * 0.44, 0))
+
+    _deps = r.get("dependents", 0)
+    if _deps > 0:
+        _form_line(pdf, "", f"Less: Dependent exemption ({_deps} x $4,930)", -_deps * 4930)
+
+    _form_section_bar(pdf, "SC TAX")
+    sc_taxable = r.get("sc_taxable", 0)
+    _form_line(pdf, "", "SC taxable income", sc_taxable, bold=True)
+
+    # Bracket detail
+    brackets = [(0, 3560, 0.00), (3560, 17830, 0.03), (17830, float("inf"), 0.06)]
+    prev = 0.0
+    for _, upper, rate in brackets:
+        seg = min(sc_taxable, upper) - prev
+        if seg > 0:
+            tax_seg = seg * rate
+            _form_sub_line(pdf, f"  {rate*100:.0f}% on ${seg:,.0f}", tax_seg)
+        prev = upper
+        if prev >= sc_taxable:
+            break
+
+    _form_line(pdf, "", "SC income tax", r.get("sc_tax", 0), bold=True)
+    _form_line(pdf, "", f"Effective SC rate", None)
+    pdf.set_font("Helvetica", "B", 9)
+    # overwrite the last amount cell with the rate
+    pdf.set_xy(pdf.w - pdf.r_margin - 45, pdf.get_y() - 5.5)
+    pdf.cell(45, 5.5, _pdf_safe(f"{r.get('effective_sc', 0)}%"), align="R", new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(120, 120, 120)
+    pdf.cell(0, 4, _pdf_safe("For planning purposes only - verify all amounts before filing."), align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+
+
+## --------------- Tax Form Orchestrator --------------- ##
+
+def generate_tax_forms_pdf(r, inputs, filer_65, spouse_65, client_name="", tax_year=2025):
+    """Generate populated Form 1040 + schedules + SC1040 as PDF bytes."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.set_margins(15, 15, 15)
+    filing_status = inputs.get("filing_status", "Single")
+
+    # Always: Form 1040
+    _render_1040_page1(pdf, r, client_name, filing_status, tax_year)
+
+    # Conditional schedules
+    _other = r.get("other_income", 0) + r.get("ordinary_tax_only", 0)
+    _adj = r.get("adjustments", 0) + r.get("se_deduction", 0)
+    if _other > 0 or _adj > 0:
+        _render_schedule_1(pdf, r, tax_year)
+    if r.get("is_itemizing"):
+        _render_schedule_a(pdf, r, tax_year)
+    if r.get("interest_taxable", 0) > 1500 or r.get("total_ordinary_dividends", 0) > 1500:
+        _render_schedule_b(pdf, r, tax_year)
+    if r.get("cap_gain_loss", 0) != 0:
+        _render_schedule_d(pdf, r, tax_year)
+
+    # Always: SC1040
+    _render_sc1040(pdf, r, filer_65, spouse_65, client_name, filing_status, tax_year)
+
+    return bytes(pdf.output())
+
 
 def generate_pdf_report():
     """Generate a PDF report from session state data. Returns bytes."""
@@ -3209,6 +3592,16 @@ with tab1:
     st.subheader("Estimated Tax Analysis")
     r = st.session_state.base_results
     display_tax_return(r, mortgage_pmt=float(mortgage_payment), filer_65=filer_65_plus, spouse_65=spouse_65_plus)
+    st.divider()
+    _tf_bytes = generate_tax_forms_pdf(
+        r, st.session_state.base_inputs,
+        filer_65_plus, spouse_65_plus,
+        client_name=client_name,
+        tax_year=int(tax_year))
+    st.download_button("Download Tax Forms (1040 + SC1040)",
+        data=_tf_bytes,
+        file_name=f"Tax_Forms_1040_{client_name.replace(' ','_')}_{int(tax_year)}.pdf",
+        mime="application/pdf")
 
 with tab2:
     st.subheader("Income Needs Analysis")
