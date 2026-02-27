@@ -1613,7 +1613,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         # Binary search: simulate forward from a trial balance; if the IRA never
         # goes negative, the trial is sufficient.  Find the lowest such balance.
         qcd_reserve = 0.0
-        if _qcd_base > 0 and age_f >= 70:
+        if _qcd_base > 0:
             _curr_pt = curr_pre_filer + curr_pre_spouse
             _rem = years - i
             if _rem <= 1:
@@ -1626,8 +1626,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         _sa = age_f + _fy
                         _sr = compute_rmd_uniform_start73(s, _sa)
                         s -= _sr
-                        _fq = _qcd_base * ((1 + inflation) ** (i + _fy))
-                        s -= max(0.0, _fq - _sr)
+                        if _sa >= 70:  # QCD only starts at age 70½
+                            _fq = _qcd_base * ((1 + inflation) ** (i + _fy))
+                            s -= max(0.0, _fq - _sr)
                         if s < -0.01:
                             return False
                     return True
