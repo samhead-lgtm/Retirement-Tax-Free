@@ -1649,18 +1649,17 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         conversion_this_year = 0.0
         _do_conv = (_yr_conv_strat != "none" and _yr_conv_strat != 0 and _yr_conv_strat != 0.0) if _adaptive_phases else do_conversions
         if _do_conv and (i < conversion_years_limit or _adaptive_phases) and age_f < stop_conversion_age:
-            # Don't apply QCD reserve to conversions — conversions move money to Roth,
-            # they don't deplete wealth.  QCD reserve only protects spending withdrawals.
-            avail_pretax = max(0.0, curr_pre_filer + curr_pre_spouse)
+            # Subtract QCD reserve — conversions don't deplete total wealth but they
+            # DO deplete the pre-tax IRA, which is the only source for future QCDs.
+            avail_pretax = max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve)
             if avail_pretax > 0:
                 _yr_conv_strategy = _yr_conv_strat
                 # Estimate spending-driven pre-tax withdrawal so bracket fill accounts for it
                 _est_fixed = ss_now + pen_now + taxable_rmd + spendable_inv + p_wages + p_other_income
                 _est_spending_wd = max(0.0, total_spend_need - _est_fixed)
-                # Use gross RMD (not taxable_rmd) so conversion room decreases by full RMD.
-                # QCD-covered RMD doesn't add to AGI, but we want total IRA outflow
-                # (RMD + conversion) to be managed conservatively.
-                base_taxable = pen_now + rmd_total + yr_interest + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income + _est_spending_wd
+                # Use taxable RMD (net of QCD) — QCD-covered RMD is excluded from AGI.
+                # IRA depletion risk is separately managed by the QCD floor (below).
+                base_taxable = pen_now + taxable_rmd + yr_interest + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income + _est_spending_wd
                 if _yr_conv_strategy == "fill_to_target":
                     room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
                     conversion_this_year = min(room, avail_pretax)
