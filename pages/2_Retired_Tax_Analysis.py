@@ -1006,12 +1006,16 @@ def display_cashflow_comparison(before_inp, before_res, after_inp, after_res, ne
 
 def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                              base_year_inp, p_base_cap_gain, inf_factor,
-                             conversion_this_year, medicare_inf_factor=None):
+                             conversion_this_year, medicare_inf_factor=None,
+                             heir_tax_rate=0.0):
     """Fill spending shortfall using tax-optimal source blending.
 
     Probes marginal tax cost of each withdrawal source via compute_case_cached,
     pulls from the cheapest source first, and uses binary search to detect
     bracket boundaries so multiple sources are blended within a single year.
+
+    When heir_tax_rate > 0, pretax cost is reduced by the heir tax savings
+    (pulling from IRA now at current rates avoids heirs paying heir_tax_rate).
 
     Args:
         total_spend_need: Total spending needed this year (living + mortgage)
@@ -1023,6 +1027,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
         p_base_cap_gain: Base capital gains from investment income
         inf_factor: Inflation factor for this year
         conversion_this_year: Roth conversion amount this year
+        heir_tax_rate: Heir's marginal tax rate on inherited IRA distributions
 
     Returns:
         (wd_cash, wd_brokerage, wd_pretax, wd_roth, wd_life, wd_annuity,
@@ -1095,6 +1100,9 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                 test_inp = _build_inp(wd_pretax + p, cap_gains_realized, ann_gains_withdrawn)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                 cost = (_tax_total(test_res) - curr_tax) / p
+                # Heir tax adjustment: pulling from IRA now saves heirs from paying
+                # heir_tax_rate on this amount.  Net cost = immediate tax - heir savings.
+                cost -= heir_tax_rate
                 candidates.append(("pretax", cost, avail_pre))
 
             avail_ann = balances["annuity_value"] - wd_annuity
@@ -1844,7 +1852,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             (wd_cash, wd_brokerage, wd_pretax, wd_roth, wd_life, wd_annuity,
              ann_gains_withdrawn, cap_gains_realized, final_res) = _fill_shortfall_dynamic(
                 total_spend_need, cash_received, blend_balances, base_year_inp,
-                yr_cap_gain, bracket_inf, conversion_this_year, medicare_inf_factor=medicare_inf)
+                yr_cap_gain, bracket_inf, conversion_this_year, medicare_inf_factor=medicare_inf,
+                heir_tax_rate=heir_tax_rate)
             yr_tax = final_res["total_tax"]
             yr_medicare = final_res["medicare_premiums"]
             yr_agi = final_res["agi"]
