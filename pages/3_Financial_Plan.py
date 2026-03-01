@@ -1108,7 +1108,7 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             accum_result = _run_accum()
             st.session_state.projection_results = accum_result
             # Run Monte Carlo automatically
-            _ret_years = max(filer_plan_through_age, spouse_plan_through_age) - ret_age + 1
+            _ret_years = max(filer_plan_through_age, spouse_plan_through_age or 0) - ret_age + 1
             n_total = years_to_ret + max(1, _ret_years)
             def _mc_run(return_seq):
                 _ii = dict(income_info)
