@@ -97,6 +97,9 @@ _FP_DEFAULTS = {
     "use_asset_alloc": False,
     "cma_us_equity": 10.0, "cma_intl_equity": 8.0,
     "cma_fixed_income": 4.5, "cma_real_assets": 6.0, "cma_cash": 2.5,
+    # CMA volatility (annualized standard deviation %)
+    "cma_us_equity_vol": 16.0, "cma_intl_equity_vol": 17.5,
+    "cma_fixed_income_vol": 6.0, "cma_real_assets_vol": 20.0, "cma_cash_vol": 1.5,
     # CMA yield decomposition (components of total return)
     "cma_us_equity_div": 1.5, "cma_us_equity_qual": 85, "cma_us_equity_int": 0.0, "cma_us_equity_cg": 1.0,
     "cma_intl_equity_div": 2.5, "cma_intl_equity_qual": 70, "cma_intl_equity_int": 0.0, "cma_intl_equity_cg": 0.5,
@@ -109,6 +112,10 @@ _FP_DEFAULTS = {
     "aa_roth_s_eq": 70, "aa_roth_s_intl": 15, "aa_roth_s_fi": 10, "aa_roth_s_re": 5,
     "aa_taxable_eq": 50, "aa_taxable_intl": 10, "aa_taxable_fi": 30, "aa_taxable_re": 10,
     "aa_annuity_eq": 40, "aa_annuity_intl": 10, "aa_annuity_fi": 40, "aa_annuity_re": 10,
+    # Vehicle type per account: "individual", "etfs", "mutual_funds"
+    "vt_pretax_f": "mutual_funds", "vt_pretax_s": "mutual_funds",
+    "vt_roth_f": "mutual_funds", "vt_roth_s": "mutual_funds",
+    "vt_taxable": "individual", "vt_annuity": "mutual_funds",
 
     # --- Growing: Investment Assumptions for Projections ---
     "use_invest_assumptions": False,
@@ -207,6 +214,24 @@ for _k, _v in _FP_DEFAULTS.items():
         st.session_state.fp_data[_k] = _v
 
 D = st.session_state.fp_data
+
+# Vehicle type → CG yield override (applies to all asset classes)
+_VT_CG_OVERRIDE = {
+    "individual": 0.0,    # You control realization timing — no forced distributions
+    "etfs": 0.2,          # Minimal — in-kind creation/redemption
+    "mutual_funds": None,  # Use CMA value as-is (already represents fund distributions)
+}
+
+# 5x5 correlation matrix: [US Eq, Intl Eq, Fixed Inc, Real Assets, Cash]
+_CMA_CORR = [
+    [1.00, 0.78, 0.05, 0.60, -0.05],
+    [0.78, 1.00, 0.10, 0.55, -0.03],
+    [0.05, 0.10, 1.00, 0.15,  0.20],
+    [0.60, 0.55, 0.15, 1.00, -0.05],
+    [-0.05,-0.03, 0.20,-0.05,  1.00],
+]
+_CMA_CORR_NP = np.array(_CMA_CORR)
+_CMA_CHOLESKY = np.linalg.cholesky(_CMA_CORR_NP)
 
 # Computation state (not persisted in profiles)
 _COMP_DEFAULTS = {
@@ -1797,31 +1822,34 @@ elif nav == "Growing":
         _cma_keys = ["cma_us_equity", "cma_intl_equity", "cma_fixed_income", "cma_real_assets", "cma_cash"]
         _cma_base = ["us_equity", "intl_equity", "fixed_income", "real_assets", "cash"]
         # Header row
-        hdr_cma = st.columns([2, 1, 1, 1, 1, 1, 1])
+        hdr_cma = st.columns([2, 1, 1, 1, 1, 1, 1, 1])
         hdr_cma[0].markdown("**Asset Class**")
         hdr_cma[1].markdown("**Total**")
-        hdr_cma[2].markdown("**Div%**")
-        hdr_cma[3].markdown("**Qual%**")
-        hdr_cma[4].markdown("**Int%**")
-        hdr_cma[5].markdown("**CG%**")
-        hdr_cma[6].markdown("**Deferred**")
+        hdr_cma[2].markdown("**Vol%**")
+        hdr_cma[3].markdown("**Div%**")
+        hdr_cma[4].markdown("**Qual%**")
+        hdr_cma[5].markdown("**Int%**")
+        hdr_cma[6].markdown("**CG%**")
+        hdr_cma[7].markdown("**Deferred**")
         for _ci, (_clbl, _ck, _cb) in enumerate(zip(_cma_labels, _cma_keys, _cma_base)):
-            _cr = st.columns([2, 1, 1, 1, 1, 1, 1])
+            _cr = st.columns([2, 1, 1, 1, 1, 1, 1, 1])
             _cr[0].write(_clbl)
             with _cr[1]:
                 w_num(_clbl[:3] + " Tot", _ck, step=0.5, format="%.1f", label_visibility="collapsed")
             with _cr[2]:
-                w_num(_clbl[:3] + " Div", f"cma_{_cb}_div", step=0.1, format="%.1f", label_visibility="collapsed")
+                w_num(_clbl[:3] + " Vol", f"cma_{_cb}_vol", step=0.5, format="%.1f", label_visibility="collapsed")
             with _cr[3]:
-                w_num(_clbl[:3] + " Q%", f"cma_{_cb}_qual", step=5, min_value=0, max_value=100, label_visibility="collapsed")
+                w_num(_clbl[:3] + " Div", f"cma_{_cb}_div", step=0.1, format="%.1f", label_visibility="collapsed")
             with _cr[4]:
-                w_num(_clbl[:3] + " Int", f"cma_{_cb}_int", step=0.1, format="%.1f", label_visibility="collapsed")
+                w_num(_clbl[:3] + " Q%", f"cma_{_cb}_qual", step=5, min_value=0, max_value=100, label_visibility="collapsed")
             with _cr[5]:
+                w_num(_clbl[:3] + " Int", f"cma_{_cb}_int", step=0.1, format="%.1f", label_visibility="collapsed")
+            with _cr[6]:
                 w_num(_clbl[:3] + " CG", f"cma_{_cb}_cg", step=0.1, format="%.1f", label_visibility="collapsed")
             _deferred = D[_ck] - D[f"cma_{_cb}_div"] - D[f"cma_{_cb}_int"] - D[f"cma_{_cb}_cg"]
-            _cr[6].write(f"{_deferred:.1f}%")
+            _cr[7].write(f"{_deferred:.1f}%")
             if _deferred < -0.01:
-                _cr[6].caption("⚠️ yields > total")
+                _cr[7].caption("⚠️ yields > total")
 
         st.subheader("Account Allocations (%)")
         _AA_ACCOUNTS = [("Pre-Tax Filer", "pretax_f"), ("Pre-Tax Spouse", "pretax_s"),
@@ -1829,47 +1857,66 @@ elif nav == "Growing":
                         ("Taxable", "taxable"), ("Annuity", "annuity")]
         _AA_FIELDS = [("US Eq", "eq"), ("Int'l", "intl"), ("Fixed", "fi"), ("Real", "re")]
 
+        _VT_OPTS = ["individual", "etfs", "mutual_funds"]
+        _VT_DISPLAY = {"individual": "Individual Securities", "etfs": "ETFs", "mutual_funds": "Mutual Funds"}
+
         # Header row
-        hdr = st.columns([2, 1, 1, 1, 1, 1, 1, 0.7, 0.7, 0.7, 0.7])
+        hdr = st.columns([1.6, 1.2, 1, 1, 1, 1, 0.7, 0.8, 0.6, 0.6, 0.6, 0.6, 0.6])
         hdr[0].markdown("**Account**")
+        hdr[1].markdown("**Vehicle**")
         for i, (fl, _) in enumerate(_AA_FIELDS):
-            hdr[i + 1].markdown(f"**{fl}**")
-        hdr[5].markdown("**Cash**")
-        hdr[6].markdown("**Return**")
-        hdr[7].markdown("**Div**")
-        hdr[8].markdown("**Int**")
-        hdr[9].markdown("**CG**")
-        hdr[10].markdown("**Def**")
+            hdr[i + 2].markdown(f"**{fl}**")
+        hdr[6].markdown("**Cash**")
+        hdr[7].markdown("**Return**")
+        hdr[8].markdown("**Div**")
+        hdr[9].markdown("**Int**")
+        hdr[10].markdown("**CG**")
+        hdr[11].markdown("**Def**")
+        hdr[12].markdown("**Vol**")
 
         _cma_returns = [D[k] for k in _cma_keys]
+        _cma_vols = [D["cma_us_equity_vol"], D["cma_intl_equity_vol"],
+                     D["cma_fixed_income_vol"], D["cma_real_assets_vol"], D["cma_cash_vol"]]
         for acct_label, acct_key in _AA_ACCOUNTS:
             if not is_joint and "_s" in acct_key:
                 continue
-            cols = st.columns([2, 1, 1, 1, 1, 1, 1, 0.7, 0.7, 0.7, 0.7])
+            cols = st.columns([1.6, 1.2, 1, 1, 1, 1, 0.7, 0.8, 0.6, 0.6, 0.6, 0.6, 0.6])
             cols[0].write(acct_label)
+            _vt_key = f"vt_{acct_key}"
+            with cols[1]:
+                w_select(acct_label[:3] + " Veh", _VT_OPTS, _vt_key,
+                         format_func=lambda v: _VT_DISPLAY.get(v, v), label_visibility="collapsed")
+            _cur_vt = D[_vt_key]
             total = 0
             for i, (_, fk) in enumerate(_AA_FIELDS):
-                with cols[i + 1]:
+                with cols[i + 2]:
                     k = f"aa_{acct_key}_{fk}"
                     st.number_input(acct_label[:3], value=D[k], min_value=0, max_value=100, step=5,
                                     key=f"_w_{k}", on_change=_sync, args=(k,), label_visibility="collapsed")
                     total += D[k]
             cash_pct = max(0, 100 - total)
-            cols[5].write(f"{cash_pct}%")
+            cols[6].write(f"{cash_pct}%")
             allocs = [D[f"aa_{acct_key}_{fk}"] for _, fk in _AA_FIELDS] + [cash_pct]
             ret = sum(a / 100 * r / 100 for a, r in zip(allocs, _cma_returns))
-            cols[6].write(f"**{ret * 100:.1f}%**")
-            # Yield breakdown from CMA decomposition
+            cols[7].write(f"**{ret * 100:.1f}%**")
+            # Yield breakdown from CMA decomposition (with vehicle type CG override)
             _yd = _yc = _yi = 0.0
             for _ai, _cbk in enumerate(_cma_base):
                 _aw = allocs[_ai] / 100
                 _yd += _aw * D.get(f"cma_{_cbk}_div", 0.0) / 100
                 _yi += _aw * D.get(f"cma_{_cbk}_int", 0.0) / 100
-                _yc += _aw * D.get(f"cma_{_cbk}_cg", 0.0) / 100
-            cols[7].write(f"{_yd * 100:.1f}%")
-            cols[8].write(f"{_yi * 100:.1f}%")
-            cols[9].write(f"{_yc * 100:.1f}%")
-            cols[10].write(f"{(ret - _yd - _yi - _yc) * 100:.1f}%")
+                _cg_raw = D.get(f"cma_{_cbk}_cg", 0.0) / 100
+                _vt_cg = _VT_CG_OVERRIDE.get(_cur_vt)
+                if _vt_cg is not None:
+                    _cg_raw = _vt_cg / 100
+                _yc += _aw * _cg_raw
+            cols[8].write(f"{_yd * 100:.1f}%")
+            cols[9].write(f"{_yi * 100:.1f}%")
+            cols[10].write(f"{_yc * 100:.1f}%")
+            cols[11].write(f"{(ret - _yd - _yi - _yc) * 100:.1f}%")
+            # Per-account volatility (weighted average)
+            _acct_vol = sum(a / 100 * v for a, v in zip(allocs, _cma_vols))
+            cols[12].write(f"{_acct_vol:.1f}%")
 
     # --- Investment Assumptions for Projections ---
     if not D["use_asset_alloc"]:
@@ -2549,7 +2596,7 @@ elif nav == "Achieving":
         allocs.append(cash_pct)
         return sum(a / 100 * r / 100 for a, r in zip(allocs, _cma))
 
-    def _compute_aa_yields(acct_key):
+    def _compute_aa_yields(acct_key, vehicle_type=None):
         """Returns dict with total, div_yield, qual_pct, int_yield, cg_yield, deferred — all as decimals."""
         _cma_k = ["us_equity", "intl_equity", "fixed_income", "real_assets", "cash"]
         _flds = ["eq", "intl", "fi", "re"]
@@ -2564,6 +2611,11 @@ elif nav == "Achieving":
             q = D.get(f"cma_{_ck}_qual", 0) / 100
             n = D.get(f"cma_{_ck}_int", 0.0) / 100
             c = D.get(f"cma_{_ck}_cg", 0.0) / 100
+            # Vehicle type CG override — applies to all asset classes
+            if vehicle_type is not None:
+                _vt_cg = _VT_CG_OVERRIDE.get(vehicle_type)
+                if _vt_cg is not None:
+                    c = _vt_cg / 100
             total += w * t
             div += w * d
             qual_w += w * d * q
@@ -2573,6 +2625,16 @@ elif nav == "Achieving":
         deferred = total - div - int_y - cg
         return {"total": total, "div_yield": div, "qual_pct": qual_pct,
                 "int_yield": int_y, "cg_yield": cg, "deferred": deferred}
+
+    def _compute_aa_vol(acct_key):
+        """Weighted-average volatility for an account based on allocation."""
+        _vols = [D["cma_us_equity_vol"], D["cma_intl_equity_vol"],
+                 D["cma_fixed_income_vol"], D["cma_real_assets_vol"], D["cma_cash_vol"]]
+        _flds = ["eq", "intl", "fi", "re"]
+        allocs = [D[f"aa_{acct_key}_{fk}"] for fk in _flds]
+        cash_pct = max(0, 100 - sum(allocs))
+        allocs.append(cash_pct)
+        return sum(a / 100 * v for a, v in zip(allocs, _vols))
 
     interest_taxable = D["interest_taxable"]
     total_ordinary_dividends = D["total_ordinary_dividends"]
@@ -2608,7 +2670,7 @@ elif nav == "Achieving":
 
     # Investment income for projections
     if D["use_asset_alloc"]:
-        _taxable_yields = _compute_aa_yields("taxable")
+        _taxable_yields = _compute_aa_yields("taxable", vehicle_type=D["vt_taxable"])
         proj_interest = taxable_brokerage_bal * _taxable_yields["int_yield"]
         proj_dividends = taxable_brokerage_bal * _taxable_yields["div_yield"]
         proj_qual_div = proj_dividends * _taxable_yields["qual_pct"]
@@ -2848,10 +2910,10 @@ elif nav == "Achieving":
             "state_estate_exemption": float(D["state_estate_exemption"]),
             # AA yield decomposition for projection
             "aa_yields": {
-                "taxable": _compute_aa_yields("taxable"),
-                "pretax": _compute_aa_yields("pretax_f"),
-                "roth": _compute_aa_yields("roth_f"),
-                "annuity": _compute_aa_yields("annuity"),
+                "taxable": _compute_aa_yields("taxable", vehicle_type=D["vt_taxable"]),
+                "pretax": _compute_aa_yields("pretax_f", vehicle_type=D["vt_pretax_f"]),
+                "roth": _compute_aa_yields("roth_f", vehicle_type=D["vt_roth_f"]),
+                "annuity": _compute_aa_yields("annuity", vehicle_type=D["vt_annuity"]),
             } if D["use_asset_alloc"] else None,
         }
 
@@ -3218,17 +3280,34 @@ elif nav == "Achieving":
                     st.write(f"Cash: {r_cash:.1%} | Brokerage: {r_taxable:.1%} | Pre-tax: {r_pretax:.1%} | Roth: {r_roth:.1%} | Annuity: {r_annuity:.1%} | Life: {r_life:.1%}")
                     st.markdown("#### Monte Carlo Settings")
                     mc_simulations = st.number_input("Simulations", min_value=100, max_value=5000, value=1000, step=100, key="fp_mc_sims")
-                    mc_volatility = st.number_input("Annual volatility (%)", value=12.0, step=1.0, key="fp_mc_vol") / 100
+                    # Blended portfolio return (balance-weighted)
+                    _mc_acct_bals = [
+                        (taxable_brokerage_bal + taxable_cash_bal, r_cash if taxable_cash_bal > taxable_brokerage_bal else r_taxable),
+                        (pretax_bal, r_pretax), (roth_bal, r_roth),
+                        (annuity_value, r_annuity), (life_cash_value, r_life),
+                    ]
+                    _mc_total_bal = sum(b for b, _ in _mc_acct_bals)
+                    _mc_blend_ret = sum(b / _mc_total_bal * r for b, r in _mc_acct_bals) if _mc_total_bal > 0 else 0.0
+                    if D["use_asset_alloc"]:
+                        _mc_port_vol = _compute_aa_vol("taxable")  # representative; per-account used in MC
+                        st.write(f"Blended portfolio return: **{_mc_blend_ret:.1%}** | Vol: **{_mc_port_vol:.1f}%** (from asset allocation)")
+                        mc_volatility = None  # signal to use per-account correlated shocks
+                    else:
+                        mc_volatility = st.number_input("Annual volatility (%)", value=12.0, step=1.0, key="fp_mc_vol") / 100
+                        st.write(f"Blended portfolio return: **{_mc_blend_ret:.1%}** | Vol: **{mc_volatility:.1%}** (uniform)")
+                        st.caption(f"Cash: {r_cash:.1%} | Brokerage: {r_taxable:.1%} | "
+                                   f"Pre-Tax: {r_pretax:.1%} | Roth: {r_roth:.1%} | "
+                                   f"Annuity: {r_annuity:.1%} | Life: {r_life:.1%}")
 
                     if D["use_asset_alloc"]:
                         st.markdown("#### Portfolio Summary (from Asset Allocation)")
                         _ps_accts = [
-                            ("Brokerage", taxable_brokerage_bal, _compute_aa_yields("taxable"), _compute_aa_return("taxable")),
-                            ("Pre-Tax", pretax_bal, _compute_aa_yields("pretax_f"), _compute_aa_return("pretax_f")),
-                            ("Roth", roth_bal, _compute_aa_yields("roth_f"), _compute_aa_return("roth_f")),
+                            ("Brokerage", taxable_brokerage_bal, _compute_aa_yields("taxable", vehicle_type=D["vt_taxable"]), _compute_aa_return("taxable")),
+                            ("Pre-Tax", pretax_bal, _compute_aa_yields("pretax_f", vehicle_type=D["vt_pretax_f"]), _compute_aa_return("pretax_f")),
+                            ("Roth", roth_bal, _compute_aa_yields("roth_f", vehicle_type=D["vt_roth_f"]), _compute_aa_return("roth_f")),
                         ]
                         if annuity_value > 0:
-                            _ps_accts.append(("Annuity", annuity_value, _compute_aa_yields("annuity"), _compute_aa_return("annuity")))
+                            _ps_accts.append(("Annuity", annuity_value, _compute_aa_yields("annuity", vehicle_type=D["vt_annuity"]), _compute_aa_return("annuity")))
                         _ps_total = sum(b for _, b, _, _ in _ps_accts)
                         if _ps_total > 0:
                             _cma_labels_ps = ["US Equity", "Int'l Equity", "Fixed Income", "Real Assets", "Cash"]
@@ -3334,7 +3413,7 @@ elif nav == "Achieving":
                         # --- Monte Carlo Simulation ---
                         st.divider()
                         st.markdown("### Monte Carlo Analysis")
-                        n_sims = int(mc_simulations); vol = mc_volatility; n_years = int(years)
+                        n_sims = int(mc_simulations); n_years = int(years)
                         mc_init_cash = a0["taxable"]["cash"]; mc_init_brok = a0["taxable"]["brokerage"]
                         mc_init_pf = float(pretax_bal_filer_current)
                         mc_init_ps = float(pretax_bal_spouse_current)
@@ -3351,6 +3430,24 @@ elif nav == "Achieving":
                         rng = np.random.default_rng(42)
                         ending_portfolios = np.zeros(n_sims); ran_out_year = np.full(n_sims, n_years)
                         all_paths = np.zeros((n_sims, n_years + 1)); all_paths[:, 0] = init_total
+
+                        # Correlated per-account shocks (when asset allocation is active)
+                        _use_corr_mc = D["use_asset_alloc"] and mc_volatility is None
+                        if _use_corr_mc:
+                            _mc_vols = np.array([D["cma_us_equity_vol"], D["cma_intl_equity_vol"],
+                                                 D["cma_fixed_income_vol"], D["cma_real_assets_vol"],
+                                                 D["cma_cash_vol"]]) / 100  # as decimals
+                            _mc_flds = ["eq", "intl", "fi", "re"]
+                            def _mc_weights(acct_key):
+                                w = [D[f"aa_{acct_key}_{fk}"] / 100 for fk in _mc_flds]
+                                w.append(max(0, 1 - sum(w)))
+                                return np.array(w)
+                            _w_taxable = _mc_weights("taxable")
+                            _w_pretax_f = _mc_weights("pretax_f")
+                            _w_pretax_s = _mc_weights("pretax_s") if is_joint else _w_pretax_f
+                            _w_roth = _mc_weights("roth_f")
+                            _w_annuity = _mc_weights("annuity")
+                            _L = _CMA_CHOLESKY
 
                         for sim in range(n_sims):
                             s_cash = mc_init_cash; s_brok = mc_init_brok; s_pf = mc_init_pf; s_ps = mc_init_ps
@@ -3388,14 +3485,35 @@ elif nav == "Achieving":
                                             pull = min(shortfall, max(0.0, s_ann)); s_ann -= pull; shortfall -= pull
                                 else:
                                     s_cash += abs(shortfall)
-                                yr_shock = rng.normal(0, vol)
-                                s_cash = max(0.0, s_cash) * (1 + r_taxable + yr_shock)
-                                s_brok = max(0.0, s_brok) * (1 + r_taxable + yr_shock)
-                                s_pf = max(0.0, s_pf) * (1 + r_pretax + yr_shock)
-                                s_ps = max(0.0, s_ps) * (1 + r_pretax + yr_shock)
-                                s_roth = max(0.0, s_roth) * (1 + r_roth + yr_shock)
-                                s_ann = max(0.0, s_ann) * (1 + r_annuity + yr_shock)
-                                s_life = max(0.0, s_life) * (1 + r_life + yr_shock)
+                                if _use_corr_mc:
+                                    # Correlated per-account shocks via Cholesky
+                                    z = rng.standard_normal(5)
+                                    corr_z = _L @ z
+                                    asset_shocks = corr_z * _mc_vols
+                                    shock_cash = _w_taxable @ asset_shocks  # cash uses taxable allocation
+                                    shock_brok = _w_taxable @ asset_shocks
+                                    shock_pf = _w_pretax_f @ asset_shocks
+                                    shock_ps = _w_pretax_s @ asset_shocks
+                                    shock_roth = _w_roth @ asset_shocks
+                                    shock_ann = _w_annuity @ asset_shocks
+                                    shock_life = 0.0  # life insurance not market-correlated
+                                    s_cash = max(0.0, s_cash) * (1 + r_taxable + shock_cash)
+                                    s_brok = max(0.0, s_brok) * (1 + r_taxable + shock_brok)
+                                    s_pf = max(0.0, s_pf) * (1 + r_pretax + shock_pf)
+                                    s_ps = max(0.0, s_ps) * (1 + r_pretax + shock_ps)
+                                    s_roth = max(0.0, s_roth) * (1 + r_roth + shock_roth)
+                                    s_ann = max(0.0, s_ann) * (1 + r_annuity + shock_ann)
+                                    s_life = max(0.0, s_life) * (1 + r_life + shock_life)
+                                else:
+                                    # Fallback: single volatility for all accounts
+                                    yr_shock = rng.normal(0, mc_volatility)
+                                    s_cash = max(0.0, s_cash) * (1 + r_taxable + yr_shock)
+                                    s_brok = max(0.0, s_brok) * (1 + r_taxable + yr_shock)
+                                    s_pf = max(0.0, s_pf) * (1 + r_pretax + yr_shock)
+                                    s_ps = max(0.0, s_ps) * (1 + r_pretax + yr_shock)
+                                    s_roth = max(0.0, s_roth) * (1 + r_roth + yr_shock)
+                                    s_ann = max(0.0, s_ann) * (1 + r_annuity + yr_shock)
+                                    s_life = max(0.0, s_life) * (1 + r_life + yr_shock)
                                 total_port = s_cash + s_brok + s_pf + s_ps + s_roth + s_ann + s_life
                                 if total_port <= 0:
                                     ran_out_year[sim] = yr_i
@@ -3410,6 +3528,17 @@ elif nav == "Achieving":
                             failed = ran_out_year[ran_out_year < n_years]
                             if len(failed) > 0: mc_data["median_fail_year"] = int(start_year) + int(np.median(failed))
                         st.session_state.tab3_mc = mc_data
+
+                        # MC mode indicator
+                        if _use_corr_mc:
+                            _acct_vol_info = []
+                            for _vn, _vw in [("Brokerage", _w_taxable), ("Pre-Tax", _w_pretax_f),
+                                              ("Roth", _w_roth), ("Annuity", _w_annuity)]:
+                                _av = float(np.sqrt(_vw @ (np.diag(_mc_vols) @ _CMA_CORR_NP @ np.diag(_mc_vols)) @ _vw)) * 100
+                                _acct_vol_info.append(f"{_vn}: {_av:.1f}%")
+                            st.caption(f"Correlated Monte Carlo — per-account vol (with diversification): {' | '.join(_acct_vol_info)}")
+                        else:
+                            st.caption(f"Simple Monte Carlo — uniform vol: {mc_volatility:.1%}")
 
                         mc_c1, mc_c2, mc_c3 = st.columns(3)
                         with mc_c1:
@@ -3482,6 +3611,9 @@ elif nav == "Achieving":
                 return TEA.run_wealth_projection(a0, params, [], prorata_blend=True, prorata_weights={"pretax": 2.0, "roth": 0.25}, **_extra_kw)
             elif order_key == "prorata_no_roth":
                 return TEA.run_wealth_projection(a0, params, [], prorata_blend=True, prorata_weights={"roth": 0.0, "life": 0.0}, **_extra_kw)
+            elif order_key == "dynamic_heir":
+                return TEA.run_wealth_projection(a0, params, [], blend_mode=True,
+                                                  heir_arbitrage_blend=True, **_extra_kw)
             elif is_blend:
                 return TEA.run_wealth_projection(a0, params, wf_order, blend_mode=True, **_extra_kw)
             else:
@@ -3586,6 +3718,7 @@ elif nav == "Achieving":
                     _spending_strategies.append({"key": "prorata_pt_heavy", "label": "Pro-Rata: Heavy Pre-Tax (2x), Light Roth (0.25x)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     _spending_strategies.append({"key": "prorata_no_roth", "label": "Pro-Rata: All Except Roth", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     _spending_strategies.append({"key": "dynamic", "label": "Dynamic Blend (Marginal Cost)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "dynamic_heir", "label": "Dynamic Blend (Heir Arbitrage)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     _wf_buckets = ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"]
                     _wf_bucket_bals = {
                         "Taxable": a0["taxable"]["cash"] + a0["taxable"]["brokerage"] + a0["taxable"]["emergency_fund"],
