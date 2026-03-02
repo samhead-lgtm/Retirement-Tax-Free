@@ -1046,6 +1046,13 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
     def _tax_total(res):
         return res["total_tax"] + res["medicare_premiums"]
 
+    def _probe_cost(res):
+        """Cost metric for source comparison.  Excludes Medicare when heir
+        arbitrage active so IRMAA cliffs don't cause year-to-year oscillation."""
+        if heir_tax_rate > 0:
+            return res["total_tax"]
+        return res["total_tax"] + res["medicare_premiums"]
+
     ann_total_gains = max(0.0, balances["annuity_value"] - balances["annuity_basis"])
     dyn_gain_pct = balances["dyn_gain_pct"]
 
@@ -1057,6 +1064,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
         taxes = curr_res["total_tax"]
         medicare = curr_res["medicare_premiums"]
         curr_tax = taxes + medicare
+        curr_cost = _probe_cost(curr_res)
 
         # Compute shortfall
         total_wd = wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
@@ -1091,7 +1099,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                 test_cg = (wd_brokerage + p) * dyn_gain_pct
                 test_inp = _build_inp(wd_pretax, test_cg, ann_gains_withdrawn)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
-                cost = (_tax_total(test_res) - curr_tax) / p
+                cost = (_probe_cost(test_res) - curr_cost) / p
                 candidates.append(("brokerage", cost, avail_brok))
 
             avail_pre = balances["pretax"] - wd_pretax
@@ -1099,7 +1107,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                 p = min(PROBE, avail_pre)
                 test_inp = _build_inp(wd_pretax + p, cap_gains_realized, ann_gains_withdrawn)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
-                cost = (_tax_total(test_res) - curr_tax) / p
+                cost = (_probe_cost(test_res) - curr_cost) / p
                 # Heir tax adjustment: pulling from IRA now saves heirs from paying
                 # heir_tax_rate on this amount.  Net cost = immediate tax - heir savings.
                 cost -= heir_tax_rate
@@ -1112,7 +1120,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                 test_ag = ann_gains_withdrawn + min(p, rem_gains)
                 test_inp = _build_inp(wd_pretax, cap_gains_realized, test_ag)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
-                cost = (_tax_total(test_res) - curr_tax) / p
+                cost = (_probe_cost(test_res) - curr_cost) / p
                 candidates.append(("annuity", cost, avail_ann))
 
             if not candidates:
@@ -1135,7 +1143,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                     rem = max(0.0, ann_total_gains - ann_gains_withdrawn)
                     test_inp_full = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn + min(pull_full, rem))
                 test_res_full = compute_case_cached(_serialize_inputs_for_cache(test_inp_full), inf_factor, medicare_inflation_factor=medicare_inf_factor)
-                cost_full = (_tax_total(test_res_full) - curr_tax) / pull_full
+                cost_full = (_probe_cost(test_res_full) - curr_cost) / pull_full
 
                 threshold = next_cost + 0.01
                 if cost_full > threshold:
@@ -1151,7 +1159,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                             rem = max(0.0, ann_total_gains - ann_gains_withdrawn)
                             test_inp_mid = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn + min(mid, rem))
                         test_res_mid = compute_case_cached(_serialize_inputs_for_cache(test_inp_mid), inf_factor, medicare_inflation_factor=medicare_inf_factor)
-                        cost_mid = (_tax_total(test_res_mid) - curr_tax) / mid
+                        cost_mid = (_probe_cost(test_res_mid) - curr_cost) / mid
                         if cost_mid <= threshold:
                             lo = mid
                         else:
@@ -1171,11 +1179,12 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
 
             shortfall -= pull_full
 
-            # Update curr_tax for next fill_round probe
+            # Update baselines for next fill_round probe
             cap_gains_realized = wd_brokerage * dyn_gain_pct
             curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
             curr_res = compute_case_cached(_serialize_inputs_for_cache(curr_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
             curr_tax = _tax_total(curr_res)
+            curr_cost = _probe_cost(curr_res)
 
         # Step 6: Tax-free sources (last resort)
         if shortfall > 1.0:
@@ -1263,7 +1272,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                            prorata_weights=None, adaptive_strategy=None,
                            extra_pretax_bracket=None, annuity_depletion_years=None,
                            annuity_gains_only=False, harvest_gains_bracket=None,
-                           agi_cap_bracket_fills=False):
+                           agi_cap_bracket_fills=False,
+                           heir_arbitrage_blend=False):
     """Unified wealth projection engine used by both Tab 3 and Tab 4.
 
     Combines:
@@ -1853,7 +1863,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
              ann_gains_withdrawn, cap_gains_realized, final_res) = _fill_shortfall_dynamic(
                 total_spend_need, cash_received, blend_balances, base_year_inp,
                 yr_cap_gain, bracket_inf, conversion_this_year, medicare_inf_factor=medicare_inf,
-                heir_tax_rate=heir_tax_rate)
+                heir_tax_rate=heir_tax_rate if heir_arbitrage_blend else 0.0)
             yr_tax = final_res["total_tax"]
             yr_medicare = final_res["medicare_premiums"]
             yr_agi = final_res["agi"]
