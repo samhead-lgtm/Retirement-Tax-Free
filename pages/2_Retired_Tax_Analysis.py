@@ -482,6 +482,215 @@ ADAPTIVE_STRATEGIES = {
 }
 
 
+# ── Auto-detect income cliffs & generate adaptive strategies ──────────────
+
+def detect_income_cliffs(params, min_amount=10000):
+    """Scan params for income sources that start or stop during the projection.
+
+    Returns sorted list of cliff dicts:
+      [{"age": 78, "type": "stop", "source": "other_income", "amount": 160000}, ...]
+    Only future transitions (age > current_age_filer) with amount >= min_amount.
+    """
+    current_age = params.get("current_age_filer", 70)
+    cliffs = []
+
+    # --- wages, other_income, tax_exempt_interest ---
+    _sidebar_sources = [
+        ("wages",              "wages",              "wages_start_age",        "wages_end_age"),
+        ("other_income",       "other_income",       "other_income_start_age", "other_income_end_age"),
+        ("tax_exempt_interest","tax_exempt_interest", "tax_exempt_start_age",  "tax_exempt_end_age"),
+    ]
+    for label, amt_key, start_key, end_key in _sidebar_sources:
+        amt = params.get(amt_key, 0.0)
+        if amt < min_amount:
+            continue
+        start_age = params.get(start_key, 0)
+        end_age   = params.get(end_key, 0)
+        # start cliff (income begins after current age)
+        if start_age > current_age:
+            cliffs.append({"age": start_age, "type": "start", "source": label, "amount": amt})
+        # stop cliff (income ends in the future; 0 means ongoing)
+        if end_age > current_age and end_age > start_age:
+            cliffs.append({"age": end_age, "type": "stop", "source": label, "amount": amt})
+
+    # --- future_income list entries ---
+    for fi in params.get("future_income", []):
+        amt = fi.get("amount", 0.0)
+        if amt < min_amount:
+            continue
+        s_age = fi.get("start_age", 0)
+        e_age = fi.get("end_age", 0)
+        name  = fi.get("name", "future_income")
+        if s_age > current_age:
+            cliffs.append({"age": s_age, "type": "start", "source": name, "amount": amt})
+        if e_age > current_age and e_age > s_age:
+            cliffs.append({"age": e_age, "type": "stop", "source": name, "amount": amt})
+
+    # --- Social Security start (not yet receiving) ---
+    for prefix, dob_key, already_key, fra_key, claim_key in [
+        ("filer_ss",  "filer_dob",  "filer_ss_already",  "filer_ss_fra",  "filer_ss_claim"),
+        ("spouse_ss", "spouse_dob", "spouse_ss_already", "spouse_ss_fra", "spouse_ss_claim"),
+    ]:
+        if params.get(already_key, False):
+            continue
+        fra_amt = params.get(fra_key, 0.0)
+        if fra_amt < min_amount:
+            continue
+        claim_choice = str(params.get(claim_key, "FRA")).strip().lower()
+        claim_age = 67 if claim_choice == "fra" else int(claim_choice)
+        ss_amt = fra_amt * ss_claim_factor(params.get(claim_key, "FRA"))
+        if claim_age > current_age:
+            cliffs.append({"age": claim_age, "type": "start", "source": prefix, "amount": ss_amt})
+
+    # Filter: only future, above threshold
+    cliffs = [c for c in cliffs if c["age"] > current_age and c["amount"] >= min_amount]
+
+    # Merge cliffs at same age (combine amounts)
+    merged = {}
+    for c in cliffs:
+        key = (c["age"], c["type"])
+        if key in merged:
+            merged[key]["amount"] += c["amount"]
+            merged[key]["source"] += f" + {c['source']}"
+        else:
+            merged[key] = dict(c)
+    cliffs = sorted(merged.values(), key=lambda c: (-c["amount"],))
+
+    # Limit to top 2 by magnitude
+    if len(cliffs) > 2:
+        cliffs = cliffs[:2]
+
+    # Sort by age for phase ordering
+    cliffs.sort(key=lambda c: c["age"])
+    return cliffs
+
+
+def _clear_auto_strategies():
+    """Remove previously auto-generated entries from ADAPTIVE_STRATEGIES."""
+    to_remove = [k for k, v in ADAPTIVE_STRATEGIES.items() if v.get("auto_generated")]
+    for k in to_remove:
+        del ADAPTIVE_STRATEGIES[k]
+
+
+def generate_cliff_strategies(params):
+    """Detect income cliffs and register adaptive strategies into ADAPTIVE_STRATEGIES.
+
+    Returns list of newly added strategy keys.
+    """
+    _clear_auto_strategies()
+    cliffs = detect_income_cliffs(params)
+    if not cliffs:
+        return []
+
+    new_keys = []
+
+    def _add(key, label, description, phases):
+        ADAPTIVE_STRATEGIES[key] = {
+            "label": label,
+            "description": description,
+            "phases": phases,
+            "auto_generated": True,
+        }
+        new_keys.append(key)
+
+    stop_cliffs  = [c for c in cliffs if c["type"] == "stop"]
+    start_cliffs = [c for c in cliffs if c["type"] == "start"]
+
+    # --- STOP cliffs: income ending ---
+    for c in stop_cliffs:
+        a = c["age"]
+        tag = f"@{a}"
+        src = c["source"]
+
+        _add(f"brk_then_ira_{tag}",
+             f"Auto {tag}: Brokerage → IRA",
+             f"Brokerage while {src} active, then drain IRA after age {a}",
+             [{"until_age": a, "pt_cap": 0,      "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": 999999,  "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+        _add(f"brk_then_dynamic_{tag}",
+             f"Auto {tag}: Brokerage → Dynamic",
+             f"Brokerage while {src} active, then marginal-cost blend after age {a}",
+             [{"until_age": a, "pt_cap": 0,    "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": None,  "conversion_strategy": "none", "blend_mode": True,  "prorata": False}])
+
+        _add(f"dyn_then_ira_{tag}",
+             f"Auto {tag}: Dynamic → IRA",
+             f"Marginal-cost blend while {src} active, then drain IRA after age {a}",
+             [{"until_age": a, "pt_cap": None,   "conversion_strategy": "none", "blend_mode": True,  "prorata": False},
+              {"from_age":  a, "pt_cap": 999999,  "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+        _add(f"brk_then_mod_{tag}",
+             f"Auto {tag}: Brokerage → Moderate IRA",
+             f"Brokerage while {src} active, then $50k/yr IRA after age {a}",
+             [{"until_age": a, "pt_cap": 0,     "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": 50000,  "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+        _add(f"brk_then_ira_conv22_{tag}",
+             f"Auto {tag}: Brokerage → IRA + Conv 22%",
+             f"Brokerage while {src} active, then IRA drain + fill 22% conversions after age {a}",
+             [{"until_age": a, "pt_cap": 0,      "conversion_strategy": "none",           "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": 999999,  "conversion_strategy": "fill_bracket_22", "blend_mode": False, "prorata": False}])
+
+        _add(f"ira_then_brk_{tag}",
+             f"Auto {tag}: IRA → Brokerage",
+             f"Drain IRA while {src} active, then brokerage after age {a}",
+             [{"until_age": a, "pt_cap": 999999, "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": 0,       "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+    # --- START cliffs: income beginning ---
+    for c in start_cliffs:
+        a = c["age"]
+        tag = f"@{a}"
+        src = c["source"]
+
+        _add(f"ira_pre_{tag}",
+             f"Auto {tag}: IRA → Brokerage",
+             f"Drain IRA before {src} starts at age {a}, then brokerage",
+             [{"until_age": a, "pt_cap": 999999, "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": 0,       "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+        _add(f"ira_conv22_pre_{tag}",
+             f"Auto {tag}: IRA + Conv 22% → Brokerage",
+             f"IRA drain + fill 22% conversions before {src} at age {a}, then brokerage",
+             [{"until_age": a, "pt_cap": 999999, "conversion_strategy": "fill_bracket_22", "blend_mode": False, "prorata": False},
+              {"from_age":  a, "pt_cap": 0,       "conversion_strategy": "none",            "blend_mode": False, "prorata": False}])
+
+        _add(f"dyn_pre_{tag}",
+             f"Auto {tag}: Dynamic → Brokerage",
+             f"Marginal-cost blend before {src} at age {a}, then brokerage",
+             [{"until_age": a, "pt_cap": None,  "conversion_strategy": "none", "blend_mode": True,  "prorata": False},
+              {"from_age":  a, "pt_cap": 0,      "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+    # --- Two cliffs at different ages: 3-phase strategies ---
+    if len(cliffs) == 2 and cliffs[0]["age"] != cliffs[1]["age"]:
+        a1, a2 = cliffs[0]["age"], cliffs[1]["age"]
+        tag = f"@{a1}_{a2}"
+
+        _add(f"brk_ira_dyn_{tag}",
+             f"Auto {tag}: Brk → IRA → Dynamic",
+             f"Brokerage until {a1}, IRA drain until {a2}, then dynamic",
+             [{"until_age": a1, "pt_cap": 0,      "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age": a1, "until_age": a2, "pt_cap": 999999,  "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a2, "pt_cap": None,    "conversion_strategy": "none", "blend_mode": True,  "prorata": False}])
+
+        _add(f"brk_ira_brk_{tag}",
+             f"Auto {tag}: Brk → IRA → Brk",
+             f"Brokerage until {a1}, IRA drain until {a2}, then brokerage",
+             [{"until_age": a1, "pt_cap": 0,      "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age": a1, "until_age": a2, "pt_cap": 999999,  "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a2, "pt_cap": 0,       "conversion_strategy": "none", "blend_mode": False, "prorata": False}])
+
+        _add(f"dyn_ira_dyn_{tag}",
+             f"Auto {tag}: Dynamic → IRA → Dynamic",
+             f"Dynamic until {a1}, IRA drain until {a2}, then dynamic",
+             [{"until_age": a1, "pt_cap": None,   "conversion_strategy": "none", "blend_mode": True,  "prorata": False},
+              {"from_age": a1, "until_age": a2, "pt_cap": 999999,  "conversion_strategy": "none", "blend_mode": False, "prorata": False},
+              {"from_age":  a2, "pt_cap": None,    "conversion_strategy": "none", "blend_mode": True,  "prorata": False}])
+
+    return new_keys
+
+
 def compute_taxes_only(gross_ss, taxable_pensions, rmd_amount, taxable_ira, conversion_amount,
                        ordinary_income, cap_gains, filing_status, filer_65, spouse_65,
                        retirement_deduction, inf_factor=1.0, tax_year=None):
@@ -1455,6 +1664,14 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     curr_home_val = home_val
     curr_inv_re_val = inv_re_val
 
+    # Life insurance death benefit params
+    life_death_benefit = params.get("life_death_benefit", 0.0)
+    life_payout = params.get("life_payout", "Last to Die")
+    life_db_grows = params.get("life_db_grows", False)
+    life_spend_cv = params.get("life_spend_cv", False)
+    life_premium = params.get("life_monthly", 0.0) * 12
+    life_pay_to_age = params.get("life_pay_to_age", 100)
+
     # Spending: mortgage stays fixed, rest inflates
     initial_mtg_pmt = mtg_payment if curr_mtg_bal > 0 else 0.0
     base_non_mtg = max(0.0, spending_goal - initial_mtg_pmt)
@@ -1766,6 +1983,12 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr_extra_income = yr_extra_taxable + yr_extra_taxfree
         cash_received += yr_extra_income
 
+        # Life insurance premium reduces available cash (triggers withdrawal loop to cover)
+        yr_life_premium = 0.0
+        if life_premium > 0 and curr_life > 0 and age_f < life_pay_to_age:
+            yr_life_premium = life_premium * inf_factor
+            cash_received -= yr_life_premium
+
         # Withdrawal loop
         wd_cash = 0.0
         wd_brokerage = 0.0
@@ -1811,7 +2034,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 _pull = min(_aex_amt, max(0.0, curr_roth - wd_roth))
                 wd_roth += _pull
             elif _aex_src == "Life Insurance (loan)":
-                _pull = min(_aex_amt, max(0.0, curr_life - wd_life))
+                _pull = min(_aex_amt, max(0.0, curr_life - wd_life)) if life_spend_cv else 0.0
                 wd_life += _pull
             elif _aex_src == "Annuity":
                 _pull = min(_aex_amt, max(0.0, curr_ann - wd_annuity))
@@ -1856,7 +2079,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             blend_balances = {
                 "cash": curr_cash, "brokerage": curr_brokerage,
                 "pretax": max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve),
-                "roth": curr_roth, "life": curr_life,
+                "roth": curr_roth, "life": curr_life if life_spend_cv else 0.0,
                 "annuity_value": curr_ann, "annuity_basis": curr_ann_basis,
                 "dyn_gain_pct": dyn_gain_pct,
                 "reinvested_base": reinvested_base,
@@ -1921,7 +2144,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 # 2. Pre-tax up to the annual cap (fills low brackets), reserving for QCD
                 if shortfall > 0:
                     avail_pt = max(0.0, curr_pre_filer + curr_pre_spouse - wd_pretax - qcd_reserve)
-                    pt_room = max(0.0, _pt_cap - wd_pretax)  # remaining cap this year
+                    pt_room = max(0.0, _pt_cap - wd_pretax - rmd_total - qcd_beyond_rmd)  # RMD counts toward cap
                     pull = min(shortfall, avail_pt, pt_room)
                     if pull > 0:
                         wd_pretax += pull; shortfall -= pull
@@ -1957,7 +2180,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         pull = min(shortfall, avail)
                         if pull > 0:
                             wd_roth += pull; shortfall -= pull
-                    if shortfall > 0:
+                    if shortfall > 0 and life_spend_cv:
                         avail = max(0.0, curr_life - wd_life)
                         pull = min(shortfall, avail)
                         if pull > 0:
@@ -2023,7 +2246,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 avail_brok = max(0.0, curr_brokerage - wd_brokerage)
                 avail_pt = max(0.0, curr_pre_filer + curr_pre_spouse - wd_pretax - qcd_reserve)
                 avail_roth = max(0.0, curr_roth - wd_roth) if conversion_this_year == 0 else 0.0
-                avail_life = max(0.0, curr_life - wd_life)
+                avail_life = max(0.0, curr_life - wd_life) if life_spend_cv else 0.0
                 avail_ann = max(0.0, curr_ann - wd_annuity)
 
                 w_cash = avail_cash * _pw.get("cash", 1.0)
@@ -2148,7 +2371,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                                 wd_roth += pull
                                 shortfall -= pull
                                 pulled = True
-                        if shortfall > 0:
+                        if shortfall > 0 and life_spend_cv:
                             avail = curr_life - wd_life
                             pull = min(shortfall, max(0.0, avail))
                             if pull > 0:
@@ -2381,13 +2604,30 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         if curr_inv_re_val > 0:
             curr_inv_re_val *= (1 + inv_re_appr)
 
+        # Death benefit payout at first death (if policy pays on this death)
+        if first_death_idx is not None and i == first_death_idx and curr_life > 0 and life_death_benefit > 0:
+            _should_pay = (
+                (life_payout == "Filer Death" and filer_dies_first) or
+                (life_payout == "Spouse Death" and not filer_dies_first) or
+                (life_payout == "Last to Die" and False)  # pays at end (estate only)
+            )
+            if _should_pay:
+                _db = life_death_benefit + (curr_life if life_db_grows else 0)
+                curr_cash += _db
+                curr_life = 0
+                life_premium = 0
+
         # Estate calculation — present-value after-tax (what heirs receive today)
-        total_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + curr_life
+        # Use death benefit instead of cash value when policy is active
+        _life_estate = curr_life
+        if life_death_benefit > 0 and curr_life > 0:
+            _life_estate = life_death_benefit + (curr_life if life_db_grows else 0)
+        total_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + _life_estate
         _pretax_yr = curr_pre_filer + curr_pre_spouse
         _heir_pretax_net = _pretax_yr * (1.0 - heir_tax_rate)
         _heir_roth_net = curr_roth  # tax-free, no haircut
         _heir_ann_net = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
-        at_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_life + _heir_pretax_net + _heir_roth_net + _heir_ann_net
+        at_wealth_yr = curr_cash + curr_ef + curr_brokerage + _life_estate + _heir_pretax_net + _heir_roth_net + _heir_ann_net
         gross_estate_yr = total_wealth_yr + home_equity + curr_inv_re_val
         # Estate tax: unlimited marital deduction → $0 while both spouses alive.
         _estate_tax_yr = 0.0
@@ -2427,7 +2667,6 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "W/D Cash": round(wd_cash, 0), "W/D Taxable": round(wd_brokerage, 0),
             "W/D Pre-Tax": round(wd_pretax, 0),
             "W/D Roth": round(wd_roth, 0), "W/D Life": round(wd_life, 0),
-            "W/D Tax-Free": round(wd_roth + wd_life, 0),
             "W/D Annuity": round(wd_annuity, 0),
             "Accel PT": round(_accel_pt_extra, 0),
             "Harvest Gains": round(_harvest_gains, 0),
@@ -2436,11 +2675,14 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "AGI": round(yr_agi, 0),
             "Taxes": round(yr_tax, 0), "Medicare": round(yr_medicare, 0),
             "Surplus": round(yr_surplus, 0),
+        })
+        if yr_life_premium > 0:
+            row["Life Prem"] = round(yr_life_premium, 0)
+        row.update({
             "Bal Cash": round(curr_cash, 0), "Bal EF": round(curr_ef, 0), "Bal Taxable": round(curr_brokerage, 0),
             "Bal Pre-Tax": round(curr_pre_filer + curr_pre_spouse, 0),
             "Bal Roth": round(curr_roth, 0), "Bal Annuity": round(curr_ann, 0),
-            "Bal Life": round(curr_life, 0),
-            "Bal Tax-Free": round(curr_roth + curr_life, 0),
+            "Bal Life": round(_life_estate, 0),
             "Portfolio": round(total_wealth_yr, 0),
             "Total Wealth": round(total_wealth_yr, 0),
         })
@@ -2456,13 +2698,17 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         row["_net_draw"] = (wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity) - yr_surplus
         year_details.append(row)
 
-    total_wealth = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + curr_life
+    # Final life estate: death benefit if policy still active (Last to Die pays at end)
+    _final_life_estate = curr_life
+    if life_death_benefit > 0 and curr_life > 0:
+        _final_life_estate = life_death_benefit + (curr_life if life_db_grows else 0)
+    total_wealth = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + _final_life_estate
     # Present-value after-tax estate (what heirs receive today)
     _final_pretax = curr_pre_filer + curr_pre_spouse
     _final_heir_pretax = _final_pretax * (1.0 - heir_tax_rate)
     _final_heir_roth = curr_roth  # tax-free
     _final_heir_ann = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
-    after_tax_estate = curr_cash + curr_ef + curr_brokerage + curr_life + _final_heir_pretax + _final_heir_roth + _final_heir_ann
+    after_tax_estate = curr_cash + curr_ef + curr_brokerage + _final_life_estate + _final_heir_pretax + _final_heir_roth + _final_heir_ann
     home_equity_final = max(0.0, curr_home_val - curr_mtg_bal)
     _gross_final = total_wealth + home_equity_final + curr_inv_re_val
     _final_estate_tax = 0.0
@@ -3124,7 +3370,7 @@ def generate_pdf_report():
 
         # Select key columns for the table — include Addl Expense and Extra Income if present
         display_cols = ["Year", "Age", "Spending", "Addl Expense", "Extra Income", "Fixed Inc", "RMD",
-                        "W/D Cash", "W/D Taxable", "W/D Pre-Tax", "W/D Tax-Free", "W/D Annuity",
+                        "W/D Cash", "W/D Taxable", "W/D Pre-Tax", "W/D Roth", "W/D Life", "W/D Annuity",
                         "Taxes", "Medicare", "Portfolio", "Gross Estate", "Estate (Net)"]
         # Filter to columns that exist in the data
         available_cols = [c for c in display_cols if c in tab3_rows[0]]
@@ -3328,7 +3574,7 @@ def generate_pdf_report():
             pdf.set_font("Helvetica", "B", 10)
             pdf.cell(0, 7, "Projection Summary", new_x="LMARGIN", new_y="NEXT")
             opt_proj_cols = ["Year", "Age", "Spending", "Fixed Inc", "RMD",
-                             "W/D Cash", "W/D Taxable", "W/D Pre-Tax", "W/D Tax-Free", "W/D Annuity",
+                             "W/D Cash", "W/D Taxable", "W/D Pre-Tax", "W/D Roth", "W/D Life", "W/D Annuity",
                              "Taxes", "Medicare", "Portfolio", "Gross Estate", "Estate (Net)"]
             avail_opt = [c for c in opt_proj_cols if c in best_details[0]]
             n_oc = len(avail_opt)

@@ -88,6 +88,8 @@ _FP_DEFAULTS = {
     "annuity_value_f": 0.0, "annuity_basis_f": 0.0, "annuity_monthly_f": 0.0,
     "annuity_value_s": 0.0, "annuity_basis_s": 0.0, "annuity_monthly_s": 0.0,
     "life_cash_value": 0.0, "life_basis": 0.0, "life_monthly": 0.0,
+    "life_death_benefit": 0.0, "life_payout": "Last to Die",
+    "life_db_grows": False, "life_spend_cv": False, "life_pay_to_age": 100.0,
 
     # --- Growing: Growth Rates ---
     "r_cash": 2.0, "r_taxable": 6.0, "r_pretax": 6.0,
@@ -2061,6 +2063,15 @@ elif nav == "Growing":
         w_num("Cash Value", "life_cash_value", step=1000.0)
         w_num("Cost Basis", "life_basis", step=1000.0)
         w_num("Monthly Premium", "life_monthly", step=50.0)
+        w_num("Pay Premium to Age", "life_pay_to_age", step=1.0, format="%.0f")
+        w_num("Death Benefit (Face Value)", "life_death_benefit", step=10000.0)
+        _payout_options = ["Filer Death", "Spouse Death", "Last to Die"]
+        _payout_idx = _payout_options.index(D["life_payout"]) if D["life_payout"] in _payout_options else 2
+        _sel_payout = st.selectbox("Pays on", _payout_options, index=_payout_idx, key="life_payout_sel")
+        if _sel_payout != D["life_payout"]:
+            D["life_payout"] = _sel_payout
+        st.checkbox("Death benefit grows with cash value", key="life_db_grows")
+        st.checkbox("Spend cash value in retirement", key="life_spend_cv")
 
     # --- Growth Rate Assumptions ---
     st.divider()
@@ -3165,6 +3176,13 @@ elif nav == "Achieving":
             "additional_expenses": [dict(ae) for ae in st.session_state.additional_expenses if ae.get("net_amount", 0) > 0],
             "future_income": [dict(fi) for fi in st.session_state.future_income if fi.get("amount", 0) > 0],
             "surplus_destination": surplus_destination,
+            # Life insurance
+            "life_monthly": float(D["life_monthly"]),
+            "life_death_benefit": float(D["life_death_benefit"]),
+            "life_payout": D["life_payout"],
+            "life_db_grows": bool(D["life_db_grows"]),
+            "life_spend_cv": bool(D["life_spend_cv"]),
+            "life_pay_to_age": int(D["life_pay_to_age"]),
             # Estate tax
             "estate_tax_enabled": bool(D["estate_tax_enabled"]),
             "federal_estate_exemption": float(D["federal_estate_exemption"]),
@@ -3653,7 +3671,7 @@ elif nav == "Achieving":
                         "additional_expenses": [dict(ae) for ae in st.session_state.additional_expenses if ae.get("net_amount", 0) > 0],
                         "future_income": [dict(fi) for fi in st.session_state.future_income if fi.get("amount", 0) > 0],
                     }
-                    _hide_cols = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "_net_draw"]
+                    _hide_cols = ["Total Wealth", "_net_draw"]
                     if all(r.get("Addl Expense", 0) == 0 for r in rows): _hide_cols.append("Addl Expense")
                     if all(r.get("Extra Income", 0) == 0 for r in rows): _hide_cols.append("Extra Income")
                     if all(r.get("Accel PT", 0) == 0 for r in rows): _hide_cols.append("Accel PT")
@@ -3978,6 +3996,13 @@ elif nav == "Achieving":
 
                 if st.button("Run Optimizer", type="primary", key="fp_run_optimizer"):
                     params = _build_tab3_params()
+                    _auto_cliff_keys = TEA.generate_cliff_strategies(params)
+                    if _auto_cliff_keys:
+                        _detected = TEA.detect_income_cliffs(params)
+                        _cliff_desc = "; ".join(
+                            f"age {c['age']} ({c['source']} {'stops' if c['type']=='stop' else 'starts'} ${c['amount']:,.0f})"
+                            for c in _detected)
+                        st.info(f"Detected income transitions: {_cliff_desc}. Generated {len(_auto_cliff_keys)} adaptive strategies.")
                     from itertools import permutations
 
                     # ---- Build spending strategies ----
@@ -4211,6 +4236,15 @@ elif nav == "Achieving":
                     else:
                         st.success(f"**Best:** {_best_label} — Estate: **${_best['after_tax_estate']:,.0f}**")
 
+                    # ---- Top 5 ----
+                    if len(_all) >= 2:
+                        st.markdown("#### Top 5 Strategies")
+                        for _t5i, _t5r in enumerate(_all[:5], 1):
+                            _t5_label = f"{_t5r['spending_label']} + {_t5r['conversion_label']}"
+                            _t5_delta = _t5r["after_tax_estate"] - _baseline_estate
+                            _t5_delta_str = f" ({'+' if _t5_delta >= 0 else ''}{_t5_delta:,.0f} vs spending-only)" if abs(_t5_delta) > 100 else ""
+                            st.markdown(f"{_t5i}. **{_t5_label}** — ${_t5r['after_tax_estate']:,.0f}{_t5_delta_str}")
+
                     # ---- Summary metrics ----
                     _has_et = _best.get("estate_tax", 0) > 0
                     _m_cols = st.columns(4)
@@ -4226,7 +4260,9 @@ elif nav == "Achieving":
                             _comp_rows = []
                             for r in _quick_display:
                                 _type_tag = r["order"]
-                                if _type_tag == "adaptive": _cat = "Adaptive"
+                                if _type_tag == "adaptive":
+                                    _ak = r.get("_strat_info", {}).get("adaptive_key", "")
+                                    _cat = "Auto" if TEA.ADAPTIVE_STRATEGIES.get(_ak, {}).get("auto_generated") else "Adaptive"
                                 elif _type_tag.startswith("prorata"): _cat = "Pro-Rata"
                                 elif _type_tag == "blend": _cat = "Blend"
                                 elif _type_tag == "dynamic": _cat = "Dynamic"
@@ -4251,7 +4287,7 @@ elif nav == "Achieving":
                             st.dataframe(_comp_df, use_container_width=True, hide_index=True)
 
                     # ---- All Tested Combos ----
-                    with st.expander("All Tested Combinations", expanded=True):
+                    with st.expander("All Tested Combinations", expanded=False):
                         _combo_rows = []
                         for r in _all:
                             _row = {"Spending Strategy": r["spending_label"], "Conversion": r["conversion_label"],
@@ -4276,7 +4312,7 @@ elif nav == "Achieving":
                         with col2b: st.metric("Selected Net Estate", f"${_selected_combo['after_tax_estate']:,.0f}")
                         with col3b: st.metric("vs Best", f"${_selected_combo['after_tax_estate'] - _best['after_tax_estate']:+,.0f}")
 
-                    _opt_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "_net_draw"]
+                    _opt_hide = ["Total Wealth", "_net_draw"]
                     _zero_hide = ["Accel PT", "Harvest Gains"]
                     _sel_details = _selected_combo.get("_year_details", [])
                     if _sel_details:
