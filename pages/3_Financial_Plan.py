@@ -3529,8 +3529,9 @@ elif nav == "Achieving":
                     heir_tax_rate = st.number_input("Heir Tax Rate (%)", value=D["heir_tax_rate"], step=1.0, key="fp_heir_tab3",
                         help="Heir's marginal tax rate on inherited IRA distributions. Used in 10-year SECURE Act model.") / 100
                     start_year = st.number_input("Start year", min_value=2020, max_value=2100, value=max(2026, int(tax_year)), step=1, key="fp_start_year")
-                    filer_plan_through_age = st.number_input("Filer Plan Through Age", min_value=70, max_value=105, value=int(D["filer_plan_age"]), step=1, key="fp_filer_plan_age")
-                    spouse_plan_through_age = st.number_input("Spouse Plan Through Age", min_value=70, max_value=105, value=int(D["spouse_plan_age"]), step=1, key="fp_spouse_plan_age") if is_joint else None
+                    st.text_input("Filer Plan Through Age", value=str(int(D["filer_plan_age"])), disabled=True)
+                    if is_joint:
+                        st.text_input("Spouse Plan Through Age", value=str(int(D["spouse_plan_age"])), disabled=True)
                     if is_joint and spouse_plan_through_age and current_age_spouse:
                         years = max(filer_plan_through_age - current_age_filer, spouse_plan_through_age - current_age_spouse)
                     else:
