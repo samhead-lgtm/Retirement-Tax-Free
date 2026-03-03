@@ -1055,10 +1055,11 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
 
     ann_total_gains = max(0.0, balances["annuity_value"] - balances["annuity_basis"])
     dyn_gain_pct = balances["dyn_gain_pct"]
+    _reinvested_base = balances.get("reinvested_base", 0.0)
 
     for conv_iter in range(10):
         # Compute current tax with current withdrawals
-        cap_gains_realized = wd_brokerage * dyn_gain_pct
+        cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
         curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
         curr_res = compute_case_cached(_serialize_inputs_for_cache(curr_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
         taxes = curr_res["total_tax"]
@@ -1096,7 +1097,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             avail_brok = balances["brokerage"] - wd_brokerage
             if avail_brok > 0:
                 p = min(PROBE, avail_brok)
-                test_cg = (wd_brokerage + p) * dyn_gain_pct
+                test_cg = max(0.0, wd_brokerage + p - _reinvested_base) * dyn_gain_pct
                 test_inp = _build_inp(wd_pretax, test_cg, ann_gains_withdrawn)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                 cost = (_probe_cost(test_res) - curr_cost) / p
@@ -1136,7 +1137,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             if pull_full > PROBE * 2:
                 # Check if average cost at full pull is significantly higher
                 if best_src == "brokerage":
-                    test_inp_full = _build_inp(wd_pretax, (wd_brokerage + pull_full) * dyn_gain_pct, ann_gains_withdrawn)
+                    test_inp_full = _build_inp(wd_pretax, max(0.0, wd_brokerage + pull_full - _reinvested_base) * dyn_gain_pct, ann_gains_withdrawn)
                 elif best_src == "pretax":
                     test_inp_full = _build_inp(wd_pretax + pull_full, cap_gains_realized, ann_gains_withdrawn)
                 else:
@@ -1152,7 +1153,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                     for _ in range(12):
                         mid = (lo + hi) / 2
                         if best_src == "brokerage":
-                            test_inp_mid = _build_inp(wd_pretax, (wd_brokerage + mid) * dyn_gain_pct, ann_gains_withdrawn)
+                            test_inp_mid = _build_inp(wd_pretax, max(0.0, wd_brokerage + mid - _reinvested_base) * dyn_gain_pct, ann_gains_withdrawn)
                         elif best_src == "pretax":
                             test_inp_mid = _build_inp(wd_pretax + mid, cap_gains_realized, ann_gains_withdrawn)
                         else:
@@ -1169,7 +1170,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             # Apply the pull
             if best_src == "brokerage":
                 wd_brokerage += pull_full
-                cap_gains_realized = wd_brokerage * dyn_gain_pct
+                cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
             elif best_src == "pretax":
                 wd_pretax += pull_full
             elif best_src == "annuity":
@@ -1180,7 +1181,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             shortfall -= pull_full
 
             # Update baselines for next fill_round probe
-            cap_gains_realized = wd_brokerage * dyn_gain_pct
+            cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
             curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
             curr_res = compute_case_cached(_serialize_inputs_for_cache(curr_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
             curr_tax = _tax_total(curr_res)
@@ -1202,7 +1203,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                     shortfall -= pull
 
     # Final tax result
-    cap_gains_realized = wd_brokerage * dyn_gain_pct
+    cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
     final_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
     final_res = compute_case_cached(_serialize_inputs_for_cache(final_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
 
@@ -1858,6 +1859,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 "roth": curr_roth, "life": curr_life,
                 "annuity_value": curr_ann, "annuity_basis": curr_ann_basis,
                 "dyn_gain_pct": dyn_gain_pct,
+                "reinvested_base": reinvested_base,
             }
             (wd_cash, wd_brokerage, wd_pretax, wd_roth, wd_life, wd_annuity,
              ann_gains_withdrawn, cap_gains_realized, final_res) = _fill_shortfall_dynamic(
@@ -1873,7 +1875,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _pt_cap = _yr_pt_cap * inf_factor  # inflation-adjust the cap
             for iteration in range(20):
                 dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
-                cap_gains_realized = wd_brokerage * dyn_gain_pct
+                cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
                 trial_inp = {
                     "wages": p_wages, "gross_ss": ss_now, "taxable_pensions": pen_now,
                     "rmd_amount": taxable_rmd,
@@ -1963,7 +1965,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
             # Final tax calc with settled withdrawals
             dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
-            cap_gains_realized = wd_brokerage * dyn_gain_pct
+            cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
             final_inp = dict(trial_inp)
             final_inp["taxable_ira"] = wd_pretax + conversion_this_year
             final_inp["cap_gain_loss"] = yr_cap_gain + cap_gains_realized
@@ -1979,7 +1981,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             _pw = prorata_weights or {}  # optional weight overrides: {"pretax": 2.0, "roth": 0.5, ...}
             for iteration in range(20):
                 dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
-                cap_gains_realized = wd_brokerage * dyn_gain_pct
+                cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
                 trial_inp = {
                     "wages": p_wages, "gross_ss": ss_now, "taxable_pensions": pen_now,
                     "rmd_amount": taxable_rmd,
@@ -2059,7 +2061,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
             # Final tax calc with settled withdrawals
             dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
-            cap_gains_realized = wd_brokerage * dyn_gain_pct
+            cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
             ann_gains_withdrawn = min(wd_annuity, max(0.0, curr_ann - curr_ann_basis)) if wd_annuity > 0 else 0.0
             final_inp = dict(trial_inp)
             final_inp["taxable_ira"] = wd_pretax + conversion_this_year
@@ -2077,7 +2079,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 # Dynamic brokerage gain % based on current basis
                 dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
                 # Recompute cap gains from brokerage withdrawals with dynamic basis
-                cap_gains_realized = wd_brokerage * dyn_gain_pct
+                cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
 
                 # Build tax inputs for full compute_case
                 trial_inp = {
@@ -2179,7 +2181,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
             # Final tax calc with settled withdrawals
             dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
-            cap_gains_realized = wd_brokerage * dyn_gain_pct
+            cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
             final_inp = dict(trial_inp)
             final_inp["taxable_ira"] = wd_pretax + conversion_this_year
             final_inp["cap_gain_loss"] = yr_cap_gain + cap_gains_realized
@@ -2214,7 +2216,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     wd_pretax += _accel_pt_extra
                     # Recompute taxes with the additional pre-tax withdrawal
                     dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
-                    cap_gains_realized = wd_brokerage * dyn_gain_pct
+                    cap_gains_realized = max(0.0, wd_brokerage - reinvested_base) * dyn_gain_pct
                     _accel_inp = {
                         "wages": p_wages, "gross_ss": ss_now, "taxable_pensions": pen_now,
                         "rmd_amount": taxable_rmd,
@@ -2303,12 +2305,14 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     _harvest_gains = 0.0
 
         # Apply withdrawals to balances
-        # Reduce brokerage basis proportionally (from Pre-Ret)
-        if wd_brokerage > 0 and curr_brokerage > 0:
-            basis_reduction = brokerage_basis * (wd_brokerage / curr_brokerage)
+        # Reinvested income spent directly doesn't touch existing portfolio basis
+        _reinv_used = min(wd_brokerage, reinvested_base) if reinvested_base > 0 else 0.0
+        _truly_sold = wd_brokerage - _reinv_used
+        if _truly_sold > 0 and curr_brokerage > 0:
+            basis_reduction = brokerage_basis * (_truly_sold / curr_brokerage)
             brokerage_basis = max(0.0, brokerage_basis - basis_reduction)
         curr_cash -= wd_cash
-        curr_brokerage -= wd_brokerage
+        curr_brokerage -= _truly_sold  # intercepted income never entered portfolio
 
         if wd_pretax > 0:
             avail = curr_pre_filer + curr_pre_spouse
@@ -2339,8 +2343,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 brokerage_basis += yr_surplus
 
         # Reinvested income increases cost basis (already taxed as income)
-        if reinvested_base > 0:
-            brokerage_basis += reinvested_base
+        # Only the portion not intercepted for spending gets reinvested
+        _net_reinvested = reinvested_base - _reinv_used
+        if _net_reinvested > 0:
+            brokerage_basis += _net_reinvested
 
         # Track mortgage paydown
         if curr_mtg_bal > 0 and mtg_payment > 0:
@@ -2352,7 +2358,15 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         if not p_reinvest_int:
             curr_cash -= _cash_before_growth * r_cash  # interest already counted as income
         curr_ef = max(0.0, curr_ef) * (1 + r_cash)
-        curr_brokerage = max(0.0, curr_brokerage) * (1 + r_taxable - _div_drag)
+        # When income was intercepted for spending, switch to OFF-equivalent growth:
+        # distribute all income (full yield drag), add net reinvested as surplus.
+        # This makes ON and OFF produce identical brokerage growth.
+        if _reinv_used > 0:
+            curr_brokerage += _net_reinvested  # explicit surplus (mirrors OFF model)
+            _full_yield = _div_yield + _cg_yield + _int_yield
+            curr_brokerage = max(0.0, curr_brokerage) * (1 + r_taxable - _full_yield)
+        else:
+            curr_brokerage = max(0.0, curr_brokerage) * (1 + r_taxable - _div_drag)
         curr_pre_filer = max(0.0, curr_pre_filer) * (1 + r_pretax)
         curr_pre_spouse = max(0.0, curr_pre_spouse) * (1 + r_pretax)
         curr_roth = max(0.0, curr_roth) * (1 + r_roth)

@@ -1123,6 +1123,131 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                    f"Taxable {TEA.money(contrib_taxable)} | HSA {TEA.money(contrib_hsa)} | "
                    f"Total {TEA.money(contrib_dict['pretax'] + contrib_dict['roth'] + contrib_taxable + contrib_hsa)}")
 
+        # --- Annual Cash Flow Summary ---
+        st.markdown("### Annual Cash Flow Summary")
+        _cf_income = salary_filer + salary_spouse + D["other_income"]
+        _cf_living = D["living_expenses"] + mtg_payment_annual
+        _cf_future_exp = sum(fe["amount"] for fe in future_expenses if fe["start_age"] <= current_age_filer < fe["end_age"])
+        _cf_base = st.session_state.base_results
+        _cf_taxes = (_cf_base["total_tax"] + _cf_base.get("fica_total", 0)) if _cf_base else 0.0
+        _cf_savings = contrib_dict["pretax"] + contrib_dict["roth"] + contrib_taxable + contrib_hsa
+        _cf_surplus = _cf_income - _cf_living - _cf_future_exp - _cf_taxes - _cf_savings
+        _cf_ncols = 6 if _cf_future_exp != 0 else 5
+        _cf_cols = st.columns(_cf_ncols)
+        with _cf_cols[0]: st.metric("Income", TEA.money(_cf_income))
+        with _cf_cols[1]: st.metric("Living + Mortgage", TEA.money(_cf_living))
+        _ci = 2
+        if _cf_future_exp != 0:
+            with _cf_cols[_ci]: st.metric("Other Expenses", TEA.money(_cf_future_exp))
+            _ci += 1
+        with _cf_cols[_ci]: st.metric("Est. Taxes", TEA.money(_cf_taxes))
+        with _cf_cols[_ci + 1]: st.metric("Total Savings", TEA.money(_cf_savings))
+        with _cf_cols[_ci + 2]: st.metric("Surplus / (Deficit)", TEA.money(_cf_surplus))
+
+        # Spending validation
+        if _cf_surplus > 0:
+            _cf_existing = taxable_brokerage_bal + taxable_cash_bal
+            _cf_est_years = max(1, current_age_filer - 22)
+            _cf_expected_min = _cf_surplus * min(_cf_est_years, 10) * 0.5
+            if _cf_surplus > 5000 and _cf_existing < _cf_expected_min:
+                st.error(
+                    f"**Spending Check:** Your income exceeds stated expenses + savings by "
+                    f"**{TEA.money(_cf_surplus)}/yr**, yet you have only **{TEA.money(_cf_existing)}** "
+                    f"in taxable investments + cash. Most people underestimate spending — consider "
+                    f"whether your actual living expenses are closer to "
+                    f"**{TEA.money(D['living_expenses'] + _cf_surplus)}**.")
+
+        # --- Inherited IRA Distribution Recommendations ---
+        _inh_f_bal = D["inh_ira_f"]
+        _inh_s_bal = D["inh_ira_s"] if is_joint else 0.0
+        if _inh_f_bal > 0 or _inh_s_bal > 0:
+            st.markdown("### Inherited IRA Distribution Recommendations")
+            _inh_income = salary_filer + salary_spouse + D["other_income"]
+            # Filer inherited IRA
+            if _inh_f_bal > 0:
+                _inh_f_rule = "10_year" if D["inh_rule_f"] == "10-Year Rule" else "lifetime"
+                _inh_f_yrs = int(D["inh_yrs_f"]) if _inh_f_rule == "10_year" else 0
+                _inh_f_rmd = bool(D["inh_rmd_req_f"])
+                _inh_f_horizon = max(5, filer_plan_through_age - current_age_filer) if _inh_f_rule == "lifetime" else None
+                _inh_f_rec = engine.calc_inherited_ira_recommendation(
+                    _inh_f_bal, _inh_f_yrs, current_age_filer, _inh_f_rmd,
+                    _inh_income, filing_status, state_rate=state_rate,
+                    growth_rate=pre_ret_return, inflation=bracket_growth,
+                    rule=_inh_f_rule, horizon_years=_inh_f_horizon)
+                if _inh_f_rec:
+                    _inh_label = "Filer" if _inh_s_bal > 0 else ""
+                    st.markdown(f"**{_inh_label} Distribution Recommendation:** Fill to top of {_inh_f_rec['target_bracket_rate']:.0%} bracket")
+                    rc1, rc2 = st.columns(2)
+                    if _inh_f_rule == "10_year":
+                        with rc1:
+                            st.metric("Recommended Annual", TEA.money(_inh_f_rec["recommended_annual"]))
+                            st.caption(f"Stays in {_inh_f_rec['target_bracket_rate']:.0%} bracket (current rate: {_inh_f_rec['marginal_without']:.0%})")
+                        with rc2:
+                            st.metric("Est. Tax Savings vs Final-Year Lump", TEA.money(_inh_f_rec["total_tax_lump"] - _inh_f_rec["total_tax_recommended"]))
+                        if _inh_f_rec.get("final_yr_lump") and _inh_f_rec["final_yr_lump"] > _inh_f_rec["recommended_annual"] * 1.5:
+                            st.error(f"Without spreading: final year forces {TEA.money(_inh_f_rec['final_yr_lump'])} lump sum → {_inh_f_rec['final_yr_rate']:.0%} bracket")
+                    else:
+                        with rc1:
+                            if _inh_f_rec.get("recommended_additional", 0) > 0:
+                                st.metric("Recommended Annual Total", TEA.money(_inh_f_rec["recommended_annual"]))
+                                st.caption(f"Min RMD + {TEA.money(_inh_f_rec['recommended_additional'])} additional")
+                            else:
+                                st.metric("Year-1 Minimum RMD", TEA.money(_inh_f_rec["recommended_annual"]))
+                                st.caption("Min RMD already fills or exceeds current bracket")
+                        with rc2:
+                            if _inh_f_rec.get("tax_savings", 0) > 0:
+                                st.metric("Est. Tax Savings vs Min-Only", TEA.money(_inh_f_rec["tax_savings"]))
+                            if _inh_f_rec.get("peak_min_only_dist", 0) > 0:
+                                st.metric("Peak Future RMD (min-only)", TEA.money(_inh_f_rec["peak_min_only_dist"]))
+                                st.caption(f"At age {_inh_f_rec['peak_min_only_age']} → {_inh_f_rec['peak_min_only_rate']:.0%} bracket")
+                    if _inh_f_rec.get("spill_desc"):
+                        st.info(_inh_f_rec["spill_desc"])
+                    if _inh_f_rec.get("warning"):
+                        st.warning(_inh_f_rec["warning"])
+                    with st.expander("Year-by-Year Schedule"):
+                        _inh_sched = pd.DataFrame(_inh_f_rec["schedule"])
+                        _inh_sched["marginal_rate"] = _inh_sched["marginal_rate"].apply(lambda x: f"{x:.0%}")
+                        st.dataframe(_inh_sched, use_container_width=True, hide_index=True)
+            # Spouse inherited IRA
+            if _inh_s_bal > 0 and is_joint:
+                _inh_s_rule = "10_year" if D["inh_rule_s"] == "10-Year Rule" else "lifetime"
+                _inh_s_yrs = int(D["inh_yrs_s"]) if _inh_s_rule == "10_year" else 0
+                _inh_s_rmd = bool(D["inh_rmd_req_s"])
+                _sp_age = current_age_spouse or current_age_filer
+                _inh_s_horizon = max(5, spouse_plan_through_age - _sp_age) if _inh_s_rule == "lifetime" else None
+                _inh_s_rec = engine.calc_inherited_ira_recommendation(
+                    _inh_s_bal, _inh_s_yrs, _sp_age, _inh_s_rmd,
+                    _inh_income, filing_status, state_rate=state_rate,
+                    growth_rate=pre_ret_return, inflation=bracket_growth,
+                    rule=_inh_s_rule, horizon_years=_inh_s_horizon)
+                if _inh_s_rec:
+                    st.markdown(f"**Spouse Distribution Recommendation:** Fill to top of {_inh_s_rec['target_bracket_rate']:.0%} bracket")
+                    sc1, sc2 = st.columns(2)
+                    if _inh_s_rule == "10_year":
+                        with sc1:
+                            st.metric("Recommended Annual", TEA.money(_inh_s_rec["recommended_annual"]))
+                            st.caption(f"Stays in {_inh_s_rec['target_bracket_rate']:.0%} bracket")
+                        with sc2:
+                            st.metric("Est. Tax Savings vs Final-Year Lump", TEA.money(_inh_s_rec["total_tax_lump"] - _inh_s_rec["total_tax_recommended"]))
+                    else:
+                        with sc1:
+                            if _inh_s_rec.get("recommended_additional", 0) > 0:
+                                st.metric("Recommended Annual Total", TEA.money(_inh_s_rec["recommended_annual"]))
+                                st.caption(f"Min RMD + {TEA.money(_inh_s_rec['recommended_additional'])} additional")
+                            else:
+                                st.metric("Year-1 Minimum RMD", TEA.money(_inh_s_rec["recommended_annual"]))
+                        with sc2:
+                            if _inh_s_rec.get("tax_savings", 0) > 0:
+                                st.metric("Est. Tax Savings vs Min-Only", TEA.money(_inh_s_rec["tax_savings"]))
+                            if _inh_s_rec.get("peak_min_only_dist", 0) > 0:
+                                st.metric("Peak Future RMD (min-only)", TEA.money(_inh_s_rec["peak_min_only_dist"]))
+                    if _inh_s_rec.get("warning"):
+                        st.warning(_inh_s_rec["warning"])
+                    with st.expander("Spouse Year-by-Year Schedule"):
+                        _inh_sp_sched = pd.DataFrame(_inh_s_rec["schedule"])
+                        _inh_sp_sched["marginal_rate"] = _inh_sp_sched["marginal_rate"].apply(lambda x: f"{x:.0%}")
+                        st.dataframe(_inh_sp_sched, use_container_width=True, hide_index=True)
+
         with st.expander("Monte Carlo Settings"):
             mc_c1, mc_c2, mc_c3 = st.columns(3)
             with mc_c1: mc_sims = st.number_input("Simulations", min_value=100, max_value=2000, value=500, step=100, key="fp_preret_mc_sims")
@@ -1326,6 +1451,19 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             _rp["heir_bracket_option"] = rr_heir_opt
             ret_result = engine.run_retirement_projection(_bals, _rp, rr_order)
             st.session_state.retire_projection = ret_result
+            # Store for Tab 5 Roth Conversion Optimizer
+            st.session_state._fp_rc_bals = copy.deepcopy(_bals)
+            st.session_state._fp_rc_params = copy.deepcopy(_rp)
+            st.session_state._fp_rc_order = list(rr_order)
+            st.session_state._fp_rc_accum_inputs = {
+                "current_age": current_age_filer,
+                "years_to_ret": years_to_ret,
+                "start_balances": copy.deepcopy(start_balances),
+                "contributions": dict(contrib_dict),
+                "salary_growth": salary_growth,
+                "pre_ret_return": pre_ret_return,
+                "income_info": copy.deepcopy(income_info),
+            }
 
         if st.session_state.retire_projection:
             rr = st.session_state.retire_projection
@@ -1384,6 +1522,132 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                 wf_results.sort(key=lambda x: x["Estate"], reverse=True)
                 st.success(f"Best order: **{wf_results[0]['Order']}** (Estate: {TEA.money(wf_results[0]['Estate'])})")
                 st.dataframe(pd.DataFrame(wf_results), use_container_width=True, hide_index=True)
+
+            # --- SS Claiming Strategy Optimizer ---
+            st.divider()
+            with st.expander("SS Claiming Strategy Optimizer"):
+                _ss_has_spouse_ss = is_joint and ss_spouse_pia > 0
+                if _ss_has_spouse_ss:
+                    st.caption("Evaluates all claiming-age combinations (62-70 for each spouse) "
+                               "using a full retirement projection. Compares ending estate values, "
+                               "capturing portfolio drawdown, tax bracket interactions, RMDs, pensions, "
+                               "and the complete withdrawal waterfall.")
+                else:
+                    st.caption("Evaluates claim ages 62-70 using a full retirement projection. "
+                               "Compares ending estate values including portfolio drawdown, taxes, "
+                               "RMDs, and the complete withdrawal waterfall.")
+
+                _ss_life_exp = st.number_input(
+                    "Life Expectancy for SS Optimization", min_value=75, max_value=100,
+                    value=filer_plan_through_age, step=1, key="fp_ss_opt_life_exp",
+                    help="Shorter life expectancy favors early claiming. Longer favors delay.")
+
+                if st.button("Optimize SS Claiming Strategy", type="primary", key="fp_ss_opt_btn"):
+                    if accum_result is None:
+                        accum_result = _run_accum()
+                        st.session_state.projection_results = accum_result
+                    _final = accum_result["rows"][-1] if accum_result["rows"] else {}
+                    _ss_brok = accum_result.get("final_brokerage", _final.get("Bal Taxable", 0))
+                    _ss_cash = accum_result.get("final_cash", 0)
+                    if _ire_liq_equity > 0:
+                        _ss_brok += _ire_liq_equity
+                    _ss_bals = {
+                        "pretax": _final.get("Bal Pre-Tax", 0),
+                        "roth": _final.get("Bal Roth", 0),
+                        "brokerage": _ss_brok, "cash": _ss_cash,
+                        "taxable": _ss_brok + _ss_cash,
+                        "brokerage_basis": accum_result.get("final_basis", 0) + _ire_liq_equity,
+                        "hsa": _final.get("Bal HSA", 0),
+                    }
+                    _ss_rp = _build_retire_params(accum_result)
+                    _ss_rp["filer_life_expectancy"] = _ss_life_exp
+                    _ss_rp["expenses_at_retirement"] = D["living_expenses"] * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
+                    _ss_rp["survivor_spending_pct"] = rr_survivor
+                    _ss_rp["pension_survivor_pct"] = rr_pension_surv
+                    _ss_rp["heir_bracket_option"] = rr_heir_opt
+                    with st.spinner("Testing all claiming combinations..."):
+                        _ss_result = engine.optimize_ss_claiming(
+                            balances_at_retire=_ss_bals,
+                            base_params=_ss_rp,
+                            spending_order=rr_order,
+                            filer_current_age=current_age_filer,
+                            spouse_current_age=current_age_spouse if _ss_has_spouse_ss else None)
+                    st.session_state._fp_ss_opt = _ss_result
+                if st.session_state.get("_fp_ss_opt"):
+                    _ss_result = st.session_state._fp_ss_opt
+                    _ss_best = _ss_result["best"]
+                    if _ss_has_spouse_ss:
+                        st.success(f"Recommended: You claim at **{_ss_best['filer_claim']}**, "
+                                   f"Spouse claims at **{_ss_best['spouse_claim']}**")
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Your Claim Age", _ss_best["filer_claim"])
+                        mc2.metric("Spouse Claim Age", _ss_best["spouse_claim"])
+                        mc3.metric("Estate (After Heir Tax)", TEA.money(_ss_best["estate"]))
+                        mc4.metric("Total Lifetime Taxes", TEA.money(_ss_best["total_taxes"]))
+                    else:
+                        st.success(f"Recommended: Claim at age **{_ss_best['filer_claim']}**")
+                        mc1, mc2, mc3 = st.columns(3)
+                        mc1.metric("Optimal Claim Age", _ss_best["filer_claim"])
+                        mc2.metric("Estate (After Heir Tax)", TEA.money(_ss_best["estate"]))
+                        mc3.metric("Total Lifetime Taxes", TEA.money(_ss_best["total_taxes"]))
+                    st.info(_ss_result["explanation"])
+                    # Top strategies
+                    _ss_rankings = _ss_result["rankings"]
+                    if _ss_has_spouse_ss:
+                        st.markdown("**Top 5 Strategies:**")
+                        _ss_top = _ss_rankings[:5]
+                        _ss_top_rows = []
+                        for _sr in _ss_top:
+                            _ss_top_rows.append({
+                                "Rank": _sr["rank"], "Your Claim": _sr["filer_claim"],
+                                "Spouse Claim": _sr["spouse_claim"],
+                                "Ending Estate": TEA.money(_sr["estate"]),
+                                "Total Taxes": TEA.money(_sr["total_taxes"]),
+                                "vs. Best": TEA.money(_sr["diff_vs_best"]) if _sr["diff_vs_best"] < 0 else "\u2014",
+                            })
+                        st.dataframe(pd.DataFrame(_ss_top_rows), use_container_width=True, hide_index=True)
+                        # Common strategies
+                        st.markdown("**Common Strategies:**")
+                        _ss_lookup = {(_sr["filer_claim"], _sr["spouse_claim"]): _sr for _sr in _ss_rankings}
+                        _f_min = max(62, current_age_filer)
+                        _s_min = max(62, current_age_spouse) if current_age_spouse else 62
+                        _common = [
+                            ("Both at 62", (max(62, _f_min), max(62, _s_min))),
+                            ("Both at 67 (FRA)", (max(67, _f_min), max(67, _s_min))),
+                            ("Both at 70", (70, 70)),
+                        ]
+                        if ss_filer_pia >= ss_spouse_pia:
+                            _common.append(("Higher earner 70 / Lower 62", (70, max(62, _s_min))))
+                        else:
+                            _common.append(("Higher earner 70 / Lower 62", (max(62, _f_min), 70)))
+                        _common_rows = []
+                        for _label, (_fc, _sc) in _common:
+                            _sr = _ss_lookup.get((_fc, _sc))
+                            if _sr:
+                                _common_rows.append({
+                                    "Strategy": _label, "Your Claim": _fc, "Spouse Claim": _sc,
+                                    "Ending Estate": TEA.money(_sr["estate"]),
+                                    "Total Taxes": TEA.money(_sr["total_taxes"]),
+                                    "Rank": f"{_sr['rank']} of {len(_ss_rankings)}",
+                                    "vs. Best": TEA.money(_sr["diff_vs_best"]) if _sr["diff_vs_best"] < 0 else "Best",
+                                })
+                        if _common_rows:
+                            st.dataframe(pd.DataFrame(_common_rows), use_container_width=True, hide_index=True)
+                    else:
+                        st.markdown("**All Claim Ages:**")
+                        _ss_all_rows = []
+                        for _sr in _ss_rankings:
+                            _ss_all_rows.append({
+                                "Rank": _sr["rank"], "Claim Age": _sr["filer_claim"],
+                                "Factor": f"{engine.ss_claim_factor(_sr['filer_claim']):.0%}",
+                                "Ending Estate": TEA.money(_sr["estate"]),
+                                "Total Taxes": TEA.money(_sr["total_taxes"]),
+                                "vs. Best": TEA.money(_sr["diff_vs_best"]) if _sr["diff_vs_best"] < 0 else "Best",
+                            })
+                        st.dataframe(pd.DataFrame(_ss_all_rows), use_container_width=True, hide_index=True)
+                    with st.expander("Year-by-Year Schedule (Best Strategy)"):
+                        st.caption("Full retirement projection showing SS, pensions, withdrawals, taxes, and balances")
+                        st.dataframe(pd.DataFrame(_ss_result["schedule"]), use_container_width=True, hide_index=True)
 
     # ════════════════════════════════════════════════════════════════
     # TAB 4 (PRE-RET): Savings Optimizer
@@ -2944,6 +3208,16 @@ elif nav == "Achieving":
         r = st.session_state.base_results
         TEA.display_tax_return(r, mortgage_pmt=float(mortgage_payment),
                                filer_65=filer_65_plus, spouse_65=spouse_65_plus)
+        st.divider()
+        _tf_bytes = TEA.generate_tax_forms_pdf(
+            r, st.session_state.base_inputs,
+            filer_65_plus, spouse_65_plus,
+            client_name=D["client_name"],
+            tax_year=int(tax_year))
+        st.download_button("Download Tax Forms (1040 + SC1040)",
+            data=_tf_bytes,
+            file_name=f"Tax_Forms_1040_{D['client_name'].replace(' ', '_')}_{int(tax_year)}.pdf",
+            mime="application/pdf", key="fp_tab1_tax_forms_pdf")
 
     # ================================================================
     # PRE-RETIREMENT TABS (tabs 2-4) — only when working
@@ -4296,6 +4570,121 @@ elif nav == "Achieving":
                     if _net_benefit > 0: st.success(f"Converting {TEA.money(actual_conversion)}/yr for {_conv_years} year(s) improves the net estate by **{TEA.money(_net_benefit)}** (heirs @ {_heir_pct:.0%}).")
                     elif _net_benefit < 0: st.warning(f"Converting {TEA.money(actual_conversion)}/yr for {_conv_years} year(s) reduces the net estate by **{TEA.money(abs(_net_benefit))}** (heirs @ {_heir_pct:.0%}).")
                     else: st.info("The conversion strategy is estate-neutral at this heir tax rate.")
+
+            # --- Full Roth Conversion Optimizer (pre-retirement) ---
+            if _is_working:
+                st.divider()
+                st.markdown("### Roth Conversion Optimizer")
+                st.caption("Tests dozens of conversion strategies (bracket fills, fixed amounts, with/without pre-retirement conversions) "
+                           "and ranks them by after-tax estate. Uses the full retirement projection for each strategy.")
+                _rc_bals = st.session_state.get("_fp_rc_bals")
+                _rc_params = st.session_state.get("_fp_rc_params")
+                _rc_order = st.session_state.get("_fp_rc_order")
+                _rc_ai = st.session_state.get("_fp_rc_accum_inputs")
+                if _rc_bals is None or _rc_params is None:
+                    st.info("Run the **Retirement Projection** tab first (with a retirement projection) to enable the Roth Conversion Optimizer.")
+                else:
+                    if st.button("Run Roth Conversion Optimizer", type="primary", key="fp_rc_opt_btn"):
+                        import copy as _rc_copy
+                        with st.spinner("Testing conversion strategies..."):
+                            _rc_result = engine.optimize_roth_conversions(
+                                _rc_copy.deepcopy(_rc_bals), _rc_copy.deepcopy(_rc_params), _rc_order,
+                                start_age=current_age_filer,
+                                accum_inputs=_rc_copy.deepcopy(_rc_ai) if _rc_ai else None)
+                        st.session_state._fp_rc_result = _rc_result
+                    if st.session_state.get("_fp_rc_result"):
+                        _rc_result = st.session_state._fp_rc_result
+                        _rc_best = _rc_result["best"]
+                        _rc_baseline = _rc_result["baseline"]
+                        _rc_improvement = _rc_best["estate"] - _rc_baseline
+                        _rc_threshold = min(_rc_baseline * 0.05, 500000) if _rc_baseline > 0 else 500000
+                        _rc_pct = (_rc_improvement / _rc_baseline * 100) if _rc_baseline > 0 else 0
+                        _rc_best_name = _rc_best.get("strategy", "")
+                        _rc_no_conv = _rc_best_name == "No Conversion"
+                        if _rc_no_conv or _rc_improvement <= 0:
+                            st.info("No conversion strategy improves the after-tax estate. **Recommendation: No conversions.**")
+                        elif _rc_improvement >= _rc_threshold:
+                            st.success(f"**Recommended:** {_rc_best_name} — improves estate by "
+                                       f"{TEA.money(_rc_improvement)} ({_rc_pct:.1f}%)")
+                        else:
+                            st.warning(f"Best strategy ({_rc_best_name}) improves estate by only "
+                                       f"**{TEA.money(_rc_improvement)} ({_rc_pct:.1f}%)** — "
+                                       f"below recommendation threshold. **Recommendation: No conversions.**")
+                        _sm1, _sm2 = st.columns(2)
+                        with _sm1: st.metric("Baseline Estate (No Conversions)", TEA.money(_rc_baseline))
+                        with _sm2: st.metric("Best Possible Improvement", TEA.money(_rc_improvement),
+                                             delta=f"{_rc_pct:.1f}%" if _rc_baseline > 0 else "N/A")
+                        if _rc_improvement >= _rc_threshold:
+                            # Timing insight
+                            _rc_pre = _rc_result.get("pre_retire", False)
+                            if _rc_pre:
+                                _all_res = _rc_result.get("all_results", [])
+                                _best_early = next((r for r in _all_res if "[retire only]" not in r["strategy"] and r["strategy"] != "No Conversion"), None)
+                                _best_wait = next((r for r in _all_res if "[retire only]" in r["strategy"]), None)
+                                if _best_early and _best_wait:
+                                    if _best_wait["estate"] > _best_early["estate"]:
+                                        st.info(f"Waiting to convert in retirement beats early conversion by "
+                                                f"**{TEA.money(_best_wait['estate'] - _best_early['estate'])}**.")
+                                    else:
+                                        st.warning(f"Starting conversions early beats waiting for retirement by "
+                                                   f"**{TEA.money(_best_early['estate'] - _best_wait['estate'])}**.")
+                            _sm3, _sm4, _sm5 = st.columns(3)
+                            with _sm3: st.metric("Best Estate", TEA.money(_rc_best["estate"]))
+                            with _sm4: st.metric("Total Converted", TEA.money(_rc_best.get("total_converted", 0)))
+                            with _sm5: st.metric("Total Taxes", TEA.money(_rc_best["total_taxes"]))
+                            # Conversion breakdown
+                            _rc_accum_conv = _rc_best.get("accum_converted", 0)
+                            _rc_retire_conv = _rc_best.get("retire_converted", 0)
+                            if _rc_accum_conv > 0:
+                                _cv1, _cv2, _cv3 = st.columns(3)
+                                with _cv1: st.metric("Converted (Pre-Retirement)", TEA.money(_rc_accum_conv))
+                                with _cv2: st.metric("Converted (In Retirement)", TEA.money(_rc_retire_conv))
+                                with _cv3: st.metric("Total Converted", TEA.money(_rc_best.get("total_converted", 0)))
+                            # Starting balances comparison
+                            _bl_bals = _rc_result.get("baseline_start_bals", {})
+                            if _rc_pre and _bl_bals:
+                                st.markdown("#### Balances at Start of Retirement")
+                                st.markdown("**Without conversions:**")
+                                _bl1, _bl2, _bl3, _bl4 = st.columns(4)
+                                with _bl1: st.metric("Pre-Tax", TEA.money(_bl_bals.get("pretax", 0)))
+                                with _bl2: st.metric("Roth", TEA.money(_bl_bals.get("roth", 0)))
+                                with _bl3: st.metric("Taxable", TEA.money(_bl_bals.get("taxable", 0)))
+                                with _bl4: st.metric("Total", TEA.money(sum(_bl_bals.values())))
+                                st.markdown("**With best strategy's conversions:**")
+                                _sb_pt = _rc_best.get("starting_pretax", 0)
+                                _sb_ro = _rc_best.get("starting_roth", 0)
+                                _sb_tx = _rc_best.get("starting_taxable", 0)
+                                _sb1, _sb2, _sb3, _sb4 = st.columns(4)
+                                with _sb1: st.metric("Pre-Tax", TEA.money(_sb_pt))
+                                with _sb2: st.metric("Roth", TEA.money(_sb_ro))
+                                with _sb3: st.metric("Taxable", TEA.money(_sb_tx))
+                                with _sb4: st.metric("Total", TEA.money(_sb_pt + _sb_ro + _sb_tx))
+                            # All strategies ranked
+                            st.markdown("### All Strategies Ranked by After-Tax Estate")
+                            _rc_df = pd.DataFrame(_rc_result["rankings"])
+                            _rc_show = _rc_df.copy()
+                            _money_cols = ["Estate (Net)", "vs Baseline", "Total Taxes", "Total Converted",
+                                           "Start Pre-Tax", "Start Roth", "Start Taxable",
+                                           "Final Pre-Tax", "Final Roth", "Final Taxable"]
+                            if _rc_pre:
+                                _money_cols.insert(4, "Accum Conv")
+                                _money_cols.insert(5, "Retire Conv")
+                            for _mc in _money_cols:
+                                if _mc in _rc_show.columns:
+                                    _rc_show[_mc] = _rc_show[_mc].apply(lambda x: f"${x:,.0f}")
+                            st.dataframe(_rc_show, use_container_width=True, hide_index=True)
+                            # Accumulation schedule for best strategy
+                            _rc_accum_rows = _rc_best.get("accum_rows", [])
+                            if _rc_accum_rows:
+                                with st.expander("Pre-Retirement Accumulation (Best Strategy)"):
+                                    _accum_cols = ["Year", "Age", "Income", "Conv Gross", "Conv Tax", "Conv to Roth",
+                                                   "Bal Pre-Tax", "Bal Roth", "Bal Taxable", "Bal HSA", "Total Balance"]
+                                    _rc_adf = pd.DataFrame(_rc_accum_rows)
+                                    _show = [c for c in _accum_cols if c in _rc_adf.columns]
+                                    st.dataframe(_rc_adf[_show], use_container_width=True, hide_index=True)
+                            # Year-by-year retirement schedule
+                            with st.expander("Retirement Year-by-Year Schedule (Best Strategy)"):
+                                st.dataframe(pd.DataFrame(_rc_result["schedule"]), use_container_width=True, hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════
 # PDF DOWNLOAD
