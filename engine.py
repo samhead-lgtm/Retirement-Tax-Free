@@ -2858,6 +2858,7 @@ def run_retirement_projection(balances, params, spending_order):
     ret_other_income_tax_free = params.get("other_income_tax_free", False)
     ret_other_income_inflation = params.get("other_income_inflation", False)
     ret_other_income_years = params.get("other_income_years", 0)
+    ret_other_income_start_yr = params.get("other_income_start_year", 0)
     ret_re_props = params.get("inv_re_properties", [])
     ret_inherited_iras = params.get("inherited_iras", [])
     ret_iira_bals = [ira["balance"] for ira in ret_inherited_iras]
@@ -3025,11 +3026,12 @@ def run_retirement_projection(balances, params, spending_order):
         inv_cap_gains_income = yr_dividends
         inv_ordinary_income = yr_interest
 
-        # Other income (alimony, disability, etc.) — ends after N years from start
+        # Other income (alimony, disability, etc.) — starts at start_year, ends after N years
         yr_other_income = 0.0
-        if ret_other_income > 0:
-            if ret_other_income_years == 0 or i < ret_other_income_years:
-                yr_other_income = ret_other_income * inf_factor if ret_other_income_inflation else ret_other_income
+        if ret_other_income > 0 and i >= ret_other_income_start_yr:
+            if ret_other_income_years == 0 or i < ret_other_income_start_yr + ret_other_income_years:
+                _oi_yrs = i - ret_other_income_start_yr
+                yr_other_income = ret_other_income * ((1 + inflation) ** _oi_yrs) if ret_other_income_inflation else ret_other_income
 
         # Investment RE rental income (per-property with mortgage payoff boost)
         yr_rental_income = 0.0
@@ -3426,6 +3428,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
     other_income_tax_free = income_info.get("other_income_tax_free", False) if income_info else False
     other_income_inflation = income_info.get("other_income_inflation", False) if income_info else False
     other_income_years = income_info.get("other_income_years", 0) if income_info else 0
+    other_income_start_yr = income_info.get("other_income_start_year", 0) if income_info else 0
     other_income_recipient = income_info.get("other_income_recipient", "Household") if income_info else "Household"
     base_expenses = income_info.get("living_expenses", 0) if income_info else 0
     base_mortgage = income_info.get("mortgage_annual", 0) if income_info else 0
@@ -3632,9 +3635,13 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
         # Calculate income and non-savings expenses
         yr_wages = base_salary_filer * sf * work_frac + base_salary_spouse * sf * spouse_work_frac
         yr_spendable_inv_income = 0.0 if reinvest_inv_income else yr_inv_income
-        # Other income (disability, inheritance, etc.) -- ends after N years if specified
-        if base_other_income > 0 and (other_income_years == 0 or yr < other_income_years):
-            yr_other_income = base_other_income * inf_f if other_income_inflation else base_other_income
+        # Other income (disability, inheritance, etc.) -- starts at start_year, ends after N years if specified
+        _oi_active = (base_other_income > 0 and yr >= other_income_start_yr
+                      and (other_income_years == 0 or yr < other_income_start_yr + other_income_years))
+        if _oi_active:
+            _oi_yrs_since_start = yr - other_income_start_yr
+            _oi_inf = (1 + inf_rate) ** _oi_yrs_since_start if other_income_inflation else 1.0
+            yr_other_income = base_other_income * _oi_inf
         else:
             yr_other_income = 0.0
 
@@ -4006,6 +4013,321 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
 
 
 # ── 17. OPTIMIZER FUNCTIONS ──────────────────────────────────────────────────
+
+WATERFALL_VARIANTS = [
+    ("PreTax→Taxable→TF", ["Pre-Tax", "Taxable", "Tax-Free", "Tax-Deferred"]),
+    ("Taxable→PreTax→TF", ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"]),
+    ("Taxable→TF→PreTax", ["Taxable", "Tax-Free", "Pre-Tax", "Tax-Deferred"]),
+]
+
+
+def _build_ss_variants(filer_age, spouse_age, retire_age, is_married, ssdi_f=False, ssdi_s=False):
+    """Build SS claiming age variants: {62, FRA(67), 70} per person, constrained by retire age."""
+    key_ages = [62, 67, 70]
+    filer_min = max(62, retire_age)
+    filer_ages = sorted(set(a for a in key_ages if a >= filer_min))
+    if not filer_ages:
+        filer_ages = [filer_min]
+    if ssdi_f:
+        filer_ages = [67]
+    if is_married and spouse_age is not None:
+        spouse_min = max(62, retire_age)
+        spouse_ages = sorted(set(a for a in key_ages if a >= spouse_min))
+        if not spouse_ages:
+            spouse_ages = [spouse_min]
+        if ssdi_s:
+            spouse_ages = [67]
+        variants = []
+        for fa in filer_ages:
+            for sa in spouse_ages:
+                label = f"SS {fa}/{sa}"
+                variants.append((label, fa, sa))
+        return variants
+    else:
+        return [(f"SS {fa}", fa, None) for fa in filer_ages]
+
+
+def _build_roth_variants(is_joint):
+    """Build Roth conversion variants for the unified optimizer."""
+    variants = [("No Conversion", "none", 0, 100)]
+    if is_joint:
+        variants.append(("Fill 22%", "fill_to_target", 238000, 85))
+        variants.append(("Fill 24%", "fill_to_target", 426000, 85))
+    else:
+        variants.append(("Fill 22%", "fill_to_target", 119000, 85))
+        variants.append(("Fill 24%", "fill_to_target", 213000, 85))
+    variants.append(("$50k/yr x 10yr", 50000, 0, None))
+    return variants
+
+
+def run_unified_optimizer(
+    current_age, years_to_ret, start_balances,
+    contrib_variants,     # [(label, contrib_dict, income_info), ...]
+    waterfall_variants,   # [(label, spending_order_list), ...]
+    ss_variants,          # [(label, filer_claim, spouse_claim), ...]
+    roth_variants,        # [(label, strategy, target_agi, stop_age_or_None), ...]
+    base_retire_params,   # from _build_retire_params()-like dict
+    salary_growth, pre_ret_return,
+    progress_callback=None,
+):
+    """Cross-product all 4 dimensions, run full accumulation → retirement for each combo.
+
+    Performance: caches accumulation by contrib variant since waterfall/SS/roth
+    only affect retirement phase.
+
+    Returns dict with:
+        best_combo: {contrib, waterfall, ss, roth, estate, taxes}
+        best_detail: {accum_rows, retire_result} for the winner
+        rankings: top combos sorted by estate
+        dimension_analysis: {dim_name: [(option, avg_estate), ...]}
+        total_combos: int
+    """
+    import copy
+
+    retire_age = base_retire_params.get("retire_age", 65)
+
+    # Phase 1: Accumulation cache — only contrib mix affects this
+    accum_cache = {}
+    total_accum = len(contrib_variants)
+    # Count valid combos (skip contradictory: Roth conversion + spend TF before PT)
+    n_compat_wf_conv = sum(1 for _, wo in waterfall_variants
+                           if wo.index("Tax-Free") > wo.index("Pre-Tax"))
+    n_all_wf = len(waterfall_variants)
+    n_roth_active = sum(1 for _, rs, _, _ in roth_variants if rs != "none")
+    n_roth_none = len(roth_variants) - n_roth_active
+    total_retire = len(contrib_variants) * len(ss_variants) * (
+        n_roth_none * n_all_wf + n_roth_active * n_compat_wf_conv)
+    total_steps = total_accum + total_retire
+    step = 0
+
+    _accum_by_contrib = {}
+    for c_label, c_dict, c_ii in contrib_variants:
+        ii = copy.deepcopy(c_ii)
+        accum = run_accumulation(current_age, years_to_ret,
+                                 copy.deepcopy(start_balances),
+                                 c_dict, salary_growth, pre_ret_return, ii)
+        ar = accum["rows"]
+        af = ar[-1] if ar else {}
+        bals = {
+            "pretax": float(af.get("Bal Pre-Tax", 0)),
+            "roth": float(af.get("Bal Roth", 0)),
+            "taxable": float(af.get("Bal Taxable", 0)),
+            "brokerage": float(accum.get("final_brokerage", af.get("Bal Taxable", 0))),
+            "cash": float(accum.get("final_cash", 0)),
+            "brokerage_basis": float(accum.get("final_basis", af.get("Bal Taxable", 0))),
+            "hsa": float(af.get("Bal HSA", 0)),
+        }
+        inh_state = accum.get("inherited_iras_state", [])
+        _accum_by_contrib[c_label] = (bals, inh_state, ar)
+        step += 1
+        if progress_callback:
+            progress_callback(step, total_steps, "Accumulation phase...")
+
+    # Expand accum cache: each (contrib, roth) points to same accum result
+    for c_label, c_dict, c_ii in contrib_variants:
+        for r_label, r_strategy, r_target, r_stop in roth_variants:
+            accum_cache[(c_label, r_label)] = _accum_by_contrib[c_label]
+
+    # Phase 2: Retirement cross-product
+    all_combos = []
+    for c_label, c_dict, c_ii in contrib_variants:
+        for r_label, r_strategy, r_target, r_stop in roth_variants:
+            bals, inh_state, accum_rows = accum_cache[(c_label, r_label)]
+            for w_label, w_order in waterfall_variants:
+                # Skip contradictory combos: don't spend Tax-Free before Pre-Tax
+                # while simultaneously converting Pre-Tax → Roth
+                if r_strategy != "none":
+                    tf_idx = w_order.index("Tax-Free") if "Tax-Free" in w_order else 99
+                    pt_idx = w_order.index("Pre-Tax") if "Pre-Tax" in w_order else 99
+                    if tf_idx < pt_idx:
+                        continue
+                for s_label, s_filer_claim, s_spouse_claim in ss_variants:
+                    params = copy.deepcopy(base_retire_params)
+                    if r_strategy != "none":
+                        params["roth_conversion_strategy"] = r_strategy
+                        params["roth_conversion_target_agi"] = r_target
+                        eff_stop = r_stop if r_stop is not None else (retire_age + 10)
+                        params["roth_conversion_stop_age"] = eff_stop
+                    params["ss_filer_claim_age"] = s_filer_claim
+                    if s_spouse_claim is not None:
+                        params["ss_spouse_claim_age"] = s_spouse_claim
+                    params["inherited_iras"] = inh_state
+
+                    ret = run_retirement_projection(copy.deepcopy(bals), params, w_order)
+
+                    all_combos.append({
+                        "contrib": c_label,
+                        "waterfall": w_label,
+                        "ss": s_label,
+                        "roth": r_label,
+                        "estate": ret["estate"],
+                        "taxes": ret["total_taxes"],
+                        "final_total": ret["final_total"],
+                        "converted": ret.get("total_converted", 0),
+                        "_c_label": c_label, "_r_label": r_label,
+                        "_w_order": w_order, "_s_fc": s_filer_claim, "_s_sc": s_spouse_claim,
+                        "_r_strategy": r_strategy, "_r_target": r_target, "_r_stop": r_stop,
+                    })
+                    step += 1
+                    if progress_callback:
+                        progress_callback(step, total_steps,
+                                          f"Testing {c_label} / {w_label} / {s_label} / {r_label}")
+
+    all_combos.sort(key=lambda x: x["estate"], reverse=True)
+
+    # Dimension analysis: average estate per option within each dimension
+    def _dim_analysis(key):
+        from collections import defaultdict
+        sums = defaultdict(float)
+        counts = defaultdict(int)
+        for c in all_combos:
+            sums[c[key]] += c["estate"]
+            counts[c[key]] += 1
+        return sorted([(k, sums[k] / counts[k]) for k in sums], key=lambda x: x[1], reverse=True)
+
+    dimension_analysis = {
+        "Contribution Mix": _dim_analysis("contrib"),
+        "Withdrawal Order": _dim_analysis("waterfall"),
+        "SS Claiming": _dim_analysis("ss"),
+        "Roth Conversion": _dim_analysis("roth"),
+    }
+
+    # Re-run best combo for full detail
+    best = all_combos[0]
+    bals, inh_state, best_accum_rows = accum_cache[(best["_c_label"], best["_r_label"])]
+    params = copy.deepcopy(base_retire_params)
+    if best["_r_strategy"] != "none":
+        params["roth_conversion_strategy"] = best["_r_strategy"]
+        params["roth_conversion_target_agi"] = best["_r_target"]
+        eff_stop = best["_r_stop"] if best["_r_stop"] is not None else (retire_age + 10)
+        params["roth_conversion_stop_age"] = eff_stop
+    params["ss_filer_claim_age"] = best["_s_fc"]
+    if best["_s_sc"] is not None:
+        params["ss_spouse_claim_age"] = best["_s_sc"]
+    params["inherited_iras"] = inh_state
+    best_retire = run_retirement_projection(copy.deepcopy(bals), params, best["_w_order"])
+
+    return {
+        "best_combo": {
+            "contrib": best["contrib"],
+            "waterfall": best["waterfall"],
+            "ss": best["ss"],
+            "roth": best["roth"],
+            "estate": best["estate"],
+            "taxes": best["taxes"],
+            "final_total": best["final_total"],
+            "converted": best.get("converted", 0),
+        },
+        "best_detail": {
+            "accum_rows": best_accum_rows,
+            "retire_result": best_retire,
+        },
+        "rankings": all_combos[:50],
+        "dimension_analysis": dimension_analysis,
+        "total_combos": len(all_combos),
+    }
+
+
+def sweep_retirement_ages(
+    current_age, start_age, end_age,
+    start_balances, contrib_dict, income_info,
+    salary_growth, pre_ret_return,
+    build_retire_params_fn,   # callable(accum_result, years_to_ret, ret_age) -> (balances_dict, params_dict)
+    spending_order,
+    mc_sims=200, mc_vol=0.12, mc_post_ret=None,
+    ire_liq_equity=0.0,
+    progress_callback=None,
+):
+    """Sweep retirement ages and run Monte Carlo at each to find when client can retire.
+
+    Args:
+        current_age: client's current age
+        start_age: first retirement age to test
+        end_age: last retirement age to test (inclusive)
+        start_balances: current account balances dict
+        contrib_dict: annual contributions dict
+        income_info: income/tax info dict for accumulation
+        salary_growth: annual salary growth rate
+        pre_ret_return: pre-retirement return rate
+        build_retire_params_fn: callable(accum_result, ytr, ra) -> (balances_dict, retire_params_dict)
+        spending_order: withdrawal order list
+        mc_sims: Monte Carlo simulations per age (default 200 for speed)
+        mc_vol: return standard deviation
+        mc_post_ret: post-retirement mean return (None = use pre_ret_return)
+        ire_liq_equity: investment RE liquidation equity to add to brokerage
+        progress_callback: optional callable(current_step, total_steps)
+
+    Returns:
+        list of dicts sorted by age: [{age, years_to_ret, success_rate,
+            median_portfolio, p10, p90}]
+    """
+    import copy as _copy
+    ages = list(range(start_age, end_age + 1))
+    total_steps = len(ages)
+    results = []
+
+    for step_i, ra in enumerate(ages):
+        ytr = max(0, ra - current_age)
+
+        # Run deterministic accumulation for this retirement age
+        _ii = dict(income_info)
+        _ii["retire_age"] = ra
+        acc = run_accumulation(
+            current_age, ytr, _copy.deepcopy(start_balances),
+            dict(contrib_dict), salary_growth, pre_ret_return, _ii)
+
+        # Get balances and retirement params from caller's builder
+        _bals, _rp = build_retire_params_fn(acc, ytr, ra)
+
+        # Determine plan horizon (must match engine's total_retire_years + 1)
+        _filer_le = _rp.get("filer_life_expectancy", 95)
+        _spouse_le = _rp.get("spouse_life_expectancy", 0) or 0
+        _spouse_ra = _rp.get("spouse_age_at_retire") or ra
+        _ret_yrs_f = _filer_le - ra
+        _ret_yrs_s = (_spouse_le - _spouse_ra) if _spouse_le else 0
+        _ret_years = max(1, max(_ret_yrs_f, _ret_yrs_s) + 1)
+        n_total = ytr + 1 + max(1, _ret_years)
+
+        # Build MC run function for this age
+        def _make_mc_fn(_ytr, _bals_snap, _rp_snap, _ret_years_snap, _order):
+            def _mc_run(return_seq):
+                _ii_mc = dict(income_info)
+                _ii_mc["retire_age"] = current_age + _ytr
+                _ii_mc["return_sequence"] = return_seq[:_ytr + 1]
+                _acc = run_accumulation(
+                    current_age, _ytr, _copy.deepcopy(start_balances),
+                    dict(contrib_dict), salary_growth, pre_ret_return, _ii_mc)
+                _mc_bals, _mc_rp = build_retire_params_fn(_acc, _ytr, current_age + _ytr)
+                _ret_seq = return_seq[_ytr + 1:] if len(return_seq) > _ytr + 1 else None
+                if _ret_seq and len(_ret_seq) >= _ret_years_snap:
+                    _mc_rp["return_sequence"] = _ret_seq
+                _ret = run_retirement_projection(_mc_bals, _mc_rp, list(_order))
+                _final_row = _acc["rows"][-1] if _acc["rows"] else {}
+                return {"estate": _ret["estate"], "final_total": _ret["final_total"],
+                        "retire_portfolio": _final_row.get("Portfolio", 0)}
+            return _mc_run
+
+        mc_fn = _make_mc_fn(ytr, _bals, _rp, _ret_years, spending_order)
+        mc = run_monte_carlo(
+            mc_fn, n_sims=mc_sims, mean_return=pre_ret_return,
+            return_std=mc_vol, n_years=n_total, seed=42,
+            mean_return_post=mc_post_ret or _rp.get("post_retire_return", pre_ret_return),
+            n_years_pre=ytr)
+
+        results.append({
+            "age": ra,
+            "years_to_ret": ytr,
+            "success_rate": mc["success_rate"],
+            "median_portfolio": mc.get("median_portfolio", 0),
+            "p10": mc.get("portfolio_p10", 0),
+            "p90": mc.get("portfolio_p90", 0),
+        })
+
+        if progress_callback:
+            progress_callback(step_i + 1, total_steps)
+
+    return results
+
 
 def optimize_ss_claiming(balances_at_retire, base_params, spending_order,
                          filer_current_age, spouse_current_age=None):

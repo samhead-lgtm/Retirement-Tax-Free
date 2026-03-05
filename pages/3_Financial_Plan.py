@@ -1,4 +1,6 @@
 import streamlit as st
+st.set_page_config(page_title="OptiPlan Wealth Optimization Planner", layout="wide")
+
 import pandas as pd
 import datetime as dt
 import json, os, sys, copy
@@ -6,8 +8,6 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import tax_estimator_advanced as TEA
 import engine
-
-st.set_page_config(page_title="OptiPlan Wealth Optimization Planner", layout="wide")
 
 # ---------- Auth ----------
 try:
@@ -165,9 +165,9 @@ _FP_DEFAULTS = {
     "cap_gain_loss": 0.0,
 
     # --- Receiving: Other Income ---
-    "wages": 0.0, "tax_exempt_interest": 0.0, "other_income": 0.0,
+    "wages": 0.0, "tax_exempt_interest": 0.0, "other_income": 0.0, "other_income_tax_free": False,
     "wages_start_age": 0, "wages_end_age": 0,
-    "other_income_start_age": 0, "other_income_end_age": 0,
+    "other_income_start_age": 0, "other_income_end_age": 0, "other_income_inflate": True,
     "tax_exempt_start_age": 0, "tax_exempt_end_age": 0,
 
     # --- Receiving: RMD ---
@@ -240,7 +240,7 @@ _COMP_DEFAULTS = {
     "base_results": None, "base_inputs": None, "assets": None,
     "last_solved_results": None, "last_solved_inputs": None, "last_solved_assets": None,
     "last_net_needed": None, "last_source": None, "last_withdrawal_proceeds": 0,
-    "gross_from_needs": 0, "additional_expenses": [], "future_income": [],
+    "gross_from_needs": 0,
     "tab3_rows": None, "tab3_params": None, "tab3_mc": None,
     # Unified optimizer
     "opt_quick_results": None, "opt_deep_results": None, "opt_all_results": None,
@@ -254,9 +254,13 @@ _COMP_DEFAULTS = {
     "tab5_conv_res": None, "tab5_conv_inputs": None, "tab5_actual_conversion": None,
     "tab5_conversion_room": None, "tab5_total_additional_cost": None,
     "projection_results": None, "retire_projection": None,
-    "_preret_mc": None, "_preret_opt": None,
+    "_preret_mc": None, "_preret_opt": None, "_preret_sweep": None, "_preret_opt_mc": None,
 }
 for _k, _v in _COMP_DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+# User-entered lists — NOT in _COMP_DEFAULTS so profile load doesn't wipe them
+for _k, _v in {"additional_expenses": [], "future_income": []}.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
@@ -300,7 +304,75 @@ _PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "p
 os.makedirs(_PROFILE_DIR, exist_ok=True)
 _TAX_PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tax_profiles")
 
+def _sync_lists_from_widgets():
+    """Sync additional_expenses and future_income from widget keys.
+
+    The UI code that assigns widget values back into the list dicts only runs
+    when the corresponding nav tab is active.  This function reads the widget
+    keys directly so Save always captures the latest values.
+
+    Tab 2 ("Receiving"/"Spending") stores start/end as calendar years in widgets;
+    Tab 3 ("Achieving") stores them as ages.  We convert years→ages for Tab 2.
+    """
+    _dob = D.get("filer_dob")
+    _age_now = TEA.age_at_date(_dob, dt.date.today()) if _dob else 70
+    _birth_year = dt.date.today().year - _age_now
+
+    for idx, ae in enumerate(st.session_state.get("additional_expenses", [])):
+        # Tab 2 keys: prefix "_ae_" (start/end are years)
+        if f"_ae_name_{idx}" in st.session_state:
+            ae["name"] = st.session_state[f"_ae_name_{idx}"]
+            ae["net_amount"] = st.session_state[f"_ae_amt_{idx}"]
+            ae["inflates"] = st.session_state[f"_ae_inf_{idx}"]
+            ae["source"] = st.session_state[f"_ae_src_{idx}"]
+            if f"_ae_start_{idx}" in st.session_state:
+                ae["start_age"] = st.session_state[f"_ae_start_{idx}"] - _birth_year
+            if f"_ae_end_{idx}" in st.session_state:
+                _end_yr = st.session_state[f"_ae_end_{idx}"]
+                ae["end_age"] = (_end_yr - _birth_year) if _end_yr > 0 else 0
+        # Tab 3 keys: prefix "fp_ae_" (start/end are ages)
+        if f"fp_ae_name_{idx}" in st.session_state:
+            ae["name"] = st.session_state[f"fp_ae_name_{idx}"]
+            ae["net_amount"] = st.session_state[f"fp_ae_amt_{idx}"]
+            ae["inflates"] = st.session_state[f"fp_ae_inf_{idx}"]
+            ae["source"] = st.session_state[f"fp_ae_src_{idx}"]
+            if f"fp_ae_start_{idx}" in st.session_state:
+                ae["start_age"] = st.session_state[f"fp_ae_start_{idx}"]
+            if f"fp_ae_end_{idx}" in st.session_state:
+                ae["end_age"] = st.session_state[f"fp_ae_end_{idx}"]
+
+    for idx, fi in enumerate(st.session_state.get("future_income", [])):
+        # Tab 2 keys: prefix "_fi_" (start/end are years)
+        if f"_fi_name_{idx}" in st.session_state:
+            fi["name"] = st.session_state[f"_fi_name_{idx}"]
+            fi["amount"] = st.session_state[f"_fi_amt_{idx}"]
+            fi["tax_type"] = st.session_state[f"_fi_tax_{idx}"]
+            if f"_fi_inf_{idx}" in st.session_state:
+                fi["inflates"] = st.session_state[f"_fi_inf_{idx}"]
+            if f"_fi_start_{idx}" in st.session_state:
+                fi["start_age"] = st.session_state[f"_fi_start_{idx}"] - _birth_year
+            if f"_fi_end_{idx}" in st.session_state:
+                _end_yr = st.session_state[f"_fi_end_{idx}"]
+                fi["end_age"] = (_end_yr - _birth_year) if _end_yr > 0 else 0
+            if f"_fi_basis_{idx}" in st.session_state:
+                fi["basis"] = st.session_state[f"_fi_basis_{idx}"]
+        # Tab 3 keys: prefix "fp_fi_" (start/end are ages)
+        if f"fp_fi_name_{idx}" in st.session_state:
+            fi["name"] = st.session_state[f"fp_fi_name_{idx}"]
+            fi["amount"] = st.session_state[f"fp_fi_amt_{idx}"]
+            fi["tax_type"] = st.session_state[f"fp_fi_tax_{idx}"]
+            if f"fp_fi_inf_{idx}" in st.session_state:
+                fi["inflates"] = st.session_state[f"fp_fi_inf_{idx}"]
+            if f"fp_fi_start_{idx}" in st.session_state:
+                fi["start_age"] = st.session_state[f"fp_fi_start_{idx}"]
+            if f"fp_fi_end_{idx}" in st.session_state:
+                fi["end_age"] = st.session_state[f"fp_fi_end_{idx}"]
+            if f"fp_fi_basis_{idx}" in st.session_state:
+                fi["basis"] = st.session_state[f"fp_fi_basis_{idx}"]
+
 def _save_profile(name):
+    name = name.strip()
+    _sync_lists_from_widgets()
     data = {}
     for k, v in D.items():
         if isinstance(v, dt.date):
@@ -318,6 +390,9 @@ def _load_profile(name):
         return False
     with open(path) as f:
         data = json.load(f)
+    # Reset all D keys to defaults before loading to prevent cross-client leakage
+    for k, v in _FP_DEFAULTS.items():
+        D[k] = v
     # Migrate old taxable_basis_pct → taxable_basis (dollar amount)
     if "taxable_basis_pct" in data and "taxable_basis" not in data:
         data["taxable_basis"] = data.get("curr_taxable", 0.0) * (1.0 - data["taxable_basis_pct"])
@@ -332,6 +407,11 @@ def _load_profile(name):
     if "_additional_expenses" in data:
         st.session_state.additional_expenses = data["_additional_expenses"]
     if "_future_income" in data:
+        for _fi_item in data["_future_income"]:
+            if "taxable" in _fi_item and "tax_type" not in _fi_item:
+                _fi_item["tax_type"] = "Ordinary Income" if _fi_item["taxable"] else "Non-Taxable"
+            _fi_item.setdefault("tax_type", "Ordinary Income")
+            _fi_item.setdefault("basis", 0.0)
         st.session_state.future_income = data["_future_income"]
     # Update cached widget keys to match loaded D values
     _keep = {"_btn_load", "_sb_load_sel", "_btn_save"}
@@ -386,7 +466,7 @@ def _load_tax_profile(name):
         "wages_start_age", "wages_end_age",
         "other_income_start_age", "other_income_end_age",
         "tax_exempt_start_age", "tax_exempt_end_age",
-        "cap_gain_loss", "other_income",
+        "cap_gain_loss", "other_income", "other_income_tax_free",
         "filer_65_plus", "spouse_65_plus",
         "adjustments", "dependents", "retirement_deduction", "out_of_state_gain",
         "property_tax", "medical_expenses", "charitable", "qcd_annual",
@@ -537,13 +617,32 @@ if "_fp_v3_migrated" not in st.session_state:
 # ══════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.subheader("Profile")
-    _pname = st.text_input("Profile name", value=D.get("client_name", ""), key="_sb_pname")
-    c1, c2 = st.columns(2)
+    _pname = D.get("client_name", "").strip()
+    if _pname:
+        st.caption(f"**{_pname}**")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Save", key="_btn_save") and _pname:
-            _save_profile(_pname)
-            st.toast(f"Saved: {_pname}")
+        if st.button("New", key="_btn_new"):
+            # Reset data dict to defaults
+            for k, v in _FP_DEFAULTS.items():
+                D[k] = v
+            # Clear user-entered lists
+            st.session_state.additional_expenses = []
+            st.session_state.future_income = []
+            # Clear computation state
+            for ck in list(_COMP_DEFAULTS.keys()):
+                st.session_state[ck] = _COMP_DEFAULTS[ck]
+            # Clear cached widget keys
+            for wk in list(st.session_state.keys()):
+                if wk.startswith(("_w_", "_sb_", "_ae_", "fp_ae_", "fp_rr_", "fp_preret_")):
+                    if wk not in {"_btn_save", "_btn_load", "_btn_new", "_sb_load_sel"}:
+                        del st.session_state[wk]
+            st.toast("New profile started")
+            st.rerun()
     with c2:
+        if st.button("Save", key="_btn_save") and _pname:
+            st.session_state["_pending_save"] = _pname
+    with c3:
         if st.button("Load", key="_btn_load"):
             pass  # handled below
     _all_profiles = list(_profiles)
@@ -566,6 +665,7 @@ with st.sidebar:
     nav = st.radio("Navigation",
                    ["Planning", "Growing", "Receiving", "Spending", "Giving", "Protecting", "Achieving"],
                    label_visibility="collapsed", key="fp_nav")
+
 
 # ══════════════════════════════════════════════════════════════════════
 # COMMON DERIVED
@@ -595,7 +695,7 @@ st.divider()
 # ══════════════════════════════════════════════════════════════════════
 # PRE-RETIREMENT TABS HELPER
 # ══════════════════════════════════════════════════════════════════════
-def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
+def _fp_pre_ret_tabs(tab2, tab3, tab4, tab6, D, is_joint, filing_status,
                      filer_dob, spouse_dob, current_year, inflation, bracket_growth,
                      medicare_growth, pension_cola, spending_order, surplus_destination,
                      current_age_filer, current_age_spouse,
@@ -784,6 +884,11 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
         "pretax_filer": _annual_pretax_filer, "pretax_spouse": _annual_pretax_spouse,
         "roth_filer": _annual_roth_filer, "roth_spouse": _annual_roth_spouse,
     }
+    # Employee-only savings (excludes employer match — match is "free money", not from paycheck)
+    _employer_match_total = employer_match + employer_match_spouse
+    _employee_savings = (contrib_dict["pretax"] + contrib_dict["roth"]
+                         + contrib_taxable + contrib_hsa - _employer_match_total)
+    st.session_state._fp_employee_savings = _employee_savings
 
     total_pretax = pretax_bal_filer_current + pretax_bal_spouse_current
     total_roth = D["curr_roth_ira_f"] + (D["curr_roth_ira_s"] if is_joint else 0) + D["curr_roth_401k"]
@@ -840,8 +945,10 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
     income_info = {
         "total_income": salary_filer + salary_spouse + D["other_income"],
         "salary_filer": salary_filer, "salary_spouse": salary_spouse,
-        "other_income": D["other_income"], "other_income_tax_free": False,
-        "other_income_inflation": True, "other_income_years": 0,
+        "other_income": D["other_income"], "other_income_tax_free": bool(D["other_income_tax_free"]),
+        "other_income_inflation": bool(D["other_income_inflate"]),
+        "other_income_start_year": max(0, int(D["other_income_start_age"]) - current_age_filer) if int(D["other_income_start_age"]) > 0 else 0,
+        "other_income_years": (int(D["other_income_end_age"]) - max(int(D["other_income_start_age"]) or current_age_filer, current_age_filer)) if int(D["other_income_end_age"]) > 0 else 0,
         "living_expenses": D["living_expenses"],
         "mortgage_annual": mtg_payment_annual, "mortgage_years": mtg_years,
         "filing_status": filing_status, "state_rate": state_rate,
@@ -975,11 +1082,54 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
     income_info["inv_re_value"] = _ire_total_today
     income_info["inv_re_appr"] = _ire_total_appr
 
+    # --- Active future income (for cash flow / spending inference) ---
+    _active_future_inc = sum(
+        fi["amount"] for fi in st.session_state.get("future_income", [])
+        if fi.get("amount", 0) > 0
+        and fi.get("start_age", 999) <= current_age_filer
+        and (fi.get("end_age", 0) == 0 or fi.get("end_age", 0) > current_age_filer))
+
+    # --- Inherited IRA current-year distribution (for spending inference) ---
+    # Excluded from "income" for spending calc — it's asset liquidation, not lifestyle income.
+    # The TAX on it is still captured (reduces available spending).
+    _inh_dist_for_cf = 0.0
+    if D["inh_ira_f"] > 0:
+        _cf_rule_f = "10_year" if D["inh_rule_f"] == "10-Year Rule" else "lifetime"
+        if bool(D["inh_rmd_req_f"]) or _cf_rule_f == "lifetime":
+            _cf_div_f = engine.SINGLE_LIFE_TABLE.get(current_age_filer, 1.0)
+            _inh_dist_for_cf += D["inh_ira_f"] / _cf_div_f if _cf_div_f > 0 else D["inh_ira_f"]
+        _inh_dist_for_cf += float(D["inh_add_f"])
+    if is_joint and D["inh_ira_s"] > 0:
+        _cf_rule_s = "10_year" if D["inh_rule_s"] == "10-Year Rule" else "lifetime"
+        if bool(D["inh_rmd_req_s"]) or _cf_rule_s == "lifetime":
+            _cf_age_s = current_age_spouse or current_age_filer
+            _cf_div_s = engine.SINGLE_LIFE_TABLE.get(_cf_age_s, 1.0)
+            _inh_dist_for_cf += D["inh_ira_s"] / _cf_div_s if _cf_div_s > 0 else D["inh_ira_s"]
+        _inh_dist_for_cf += float(D["inh_add_s"])
+
+    # --- Inferred spending (computed early so _build_retire_params can use it) ---
+    _si_base_early = st.session_state.base_results
+    _si_gross_early = _si_base_early.get("spendable_gross", 0) if _si_base_early else 0.0
+    _si_taxes_early = ((_si_base_early["total_tax"] + _si_base_early.get("fica", 0)
+                        + _si_base_early.get("medicare_premiums", 0)) if _si_base_early else 0.0)
+    _si_savings_early = _employee_savings
+    _inferred_spending = max(0, _si_gross_early - _inh_dist_for_cf - _si_taxes_early - _si_savings_early - mtg_payment_annual)
+    _use_override = st.session_state.get("fp_spending_override", False)
+    _proj_spending = D["living_expenses"] if _use_override else _inferred_spending
+    st.session_state._fp_proj_spending = _proj_spending
+    # Auto-rerun projections when spending override changes
+    _last_proj_spending = st.session_state.get("_fp_last_proj_spending")
+    _spending_changed = (_last_proj_spending is not None
+                         and abs(_proj_spending - _last_proj_spending) > 1.0
+                         and st.session_state.get("_preret_mc") is not None)
+    # Sync accumulation engine with chosen spending source
+    income_info["living_expenses"] = _proj_spending
+
     def _build_retire_params(accum_result):
         """Build params dict for run_retirement_projection from accumulation results."""
         _final_row = accum_result["rows"][-1] if accum_result["rows"] else {}
         inf_factor = (1 + inflation) ** years_to_ret
-        ret_expenses = D["living_expenses"] * (D["ret_pct"] / 100) * inf_factor
+        ret_expenses = _proj_spending * (D["ret_pct"] / 100) * inf_factor
         # Pensions inflated to retirement
         pen_f_cola = D["pension_cola_filer"] / 100
         pen_s_cola = D["pension_cola_spouse"] / 100
@@ -1055,10 +1205,13 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             "inherited_iras": iira_state,
             "surplus_destination": surp_dest,
             "heir_bracket_option": "same",
-            "other_income": D["other_income"] * inf_factor + (_ire_keep_income if not inv_re_properties else 0.0),
-            "other_income_tax_free": False,
-            "other_income_inflation": True,
-            "other_income_years": 999,
+            "other_income": (D["other_income"] * (inf_factor if D["other_income_inflate"] else 1.0)
+                             if not (_oi_end > 0 and _oi_end <= ret_age) else 0.0)
+                            + (_ire_keep_income if not inv_re_properties else 0.0),
+            "other_income_tax_free": bool(D["other_income_tax_free"]),
+            "other_income_inflation": bool(D["other_income_inflate"]),
+            "other_income_start_year": max(0, _oi_start - ret_age) if _oi_start > ret_age else 0,
+            "other_income_years": (_oi_end - max(_oi_start or ret_age, ret_age)) if (_oi_end > 0 and _oi_end > ret_age) else 0,
             "inv_re_properties": [{
                 "name": p["name"],
                 "net_income": p["net_income"] * ((1 + p["income_growth"]) ** years_to_ret),
@@ -1096,12 +1249,23 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
         # Show current savings summary
         st.markdown("### Current Balances")
         _cur_portfolio = total_pretax + total_roth + taxable_brokerage_bal + taxable_cash_bal + D["curr_hsa"]
-        cols = st.columns(6)
+        _roth_401k_bal = D["curr_roth_401k"]
+        _roth_ira_bal = total_roth - _roth_401k_bal
+        _ncur = 5
+        if _roth_401k_bal > 0: _ncur += 1
+        cols = st.columns(_ncur)
         with cols[0]: st.metric("Pre-Tax", TEA.money(total_pretax))
-        with cols[1]: st.metric("Roth", TEA.money(total_roth))
-        with cols[2]: st.metric("Taxable", TEA.money(taxable_brokerage_bal + taxable_cash_bal))
-        with cols[3]: st.metric("HSA", TEA.money(D["curr_hsa"]))
-        with cols[4]: st.metric("Portfolio", TEA.money(_cur_portfolio))
+        _ci_b = 1
+        if _roth_401k_bal > 0:
+            with cols[_ci_b]: st.metric("Roth IRA", TEA.money(_roth_ira_bal))
+            _ci_b += 1
+            with cols[_ci_b]: st.metric("Roth 401(k)", TEA.money(_roth_401k_bal))
+        else:
+            with cols[_ci_b]: st.metric("Roth", TEA.money(total_roth))
+        _ci_b += 1
+        with cols[_ci_b]: st.metric("Taxable", TEA.money(taxable_brokerage_bal + taxable_cash_bal))
+        with cols[_ci_b + 1]: st.metric("HSA", TEA.money(D["curr_hsa"]))
+        with cols[_ci_b + 2]: st.metric("Portfolio", TEA.money(_cur_portfolio))
 
         # Non-portfolio assets
         _cur_home = home_value
@@ -1121,30 +1285,54 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             for _ci, (_lbl, _val) in enumerate(_cur_items):
                 with cols2[_ci]: st.metric(_lbl, TEA.money(_val))
 
-        st.caption(f"Annual savings: Pre-Tax {TEA.money(contrib_dict['pretax'])} | Roth {TEA.money(contrib_dict['roth'])} | "
-                   f"Taxable {TEA.money(contrib_taxable)} | HSA {TEA.money(contrib_hsa)} | "
-                   f"Total {TEA.money(contrib_dict['pretax'] + contrib_dict['roth'] + contrib_taxable + contrib_hsa)}")
+        _sav_parts = []
+        if contrib_dict["pretax"] > 0: _sav_parts.append(f"Pre-Tax {TEA.money(contrib_dict['pretax'])}")
+        _roth_401k_total = contrib_401k_roth_filer + contrib_401k_roth_spouse
+        _roth_ira_total = contrib_roth_ira + contrib_roth_ira_spouse
+        if _roth_401k_total > 0: _sav_parts.append(f"Roth 401(k) {TEA.money(_roth_401k_total)}")
+        if _roth_ira_total > 0: _sav_parts.append(f"Roth IRA {TEA.money(_roth_ira_total)}")
+        if contrib_taxable > 0: _sav_parts.append(f"Taxable {TEA.money(contrib_taxable)}")
+        if contrib_hsa > 0: _sav_parts.append(f"HSA {TEA.money(contrib_hsa)}")
+        _sav_total = _employee_savings
+        _sav_match_str = f" + {TEA.money(_employer_match_total)} employer match" if _employer_match_total > 0 else ""
+        st.caption(f"Annual savings: {' | '.join(_sav_parts)} | Employee total {TEA.money(_sav_total)}{_sav_match_str}")
 
         # --- Annual Cash Flow Summary ---
         st.markdown("### Annual Cash Flow Summary")
-        _cf_income = salary_filer + salary_spouse + D["other_income"]
+        _cf_base = st.session_state.base_results
+        _cf_income = _cf_base.get("spendable_gross", 0) if _cf_base else 0.0
         _cf_living = D["living_expenses"] + mtg_payment_annual
         _cf_future_exp = sum(fe["amount"] for fe in future_expenses if fe["start_age"] <= current_age_filer < fe["end_age"])
-        _cf_base = st.session_state.base_results
-        _cf_taxes = (_cf_base["total_tax"] + _cf_base.get("fica_total", 0)) if _cf_base else 0.0
-        _cf_savings = contrib_dict["pretax"] + contrib_dict["roth"] + contrib_taxable + contrib_hsa
-        _cf_surplus = _cf_income - _cf_living - _cf_future_exp - _cf_taxes - _cf_savings
+        _cf_taxes = (_cf_base["total_tax"] + _cf_base.get("fica", 0) + _cf_base.get("medicare_premiums", 0)) if _cf_base else 0.0
+        _cf_savings = _employee_savings
+        _cf_surplus = _cf_income - _cf_taxes - _cf_savings - _cf_living - _cf_future_exp
         _cf_ncols = 6 if _cf_future_exp != 0 else 5
         _cf_cols = st.columns(_cf_ncols)
-        with _cf_cols[0]: st.metric("Income", TEA.money(_cf_income))
-        with _cf_cols[1]: st.metric("Living + Mortgage", TEA.money(_cf_living))
-        _ci = 2
+        with _cf_cols[0]: st.metric("Spendable Income", TEA.money(_cf_income))
+        with _cf_cols[1]: st.metric("Taxes", TEA.money(_cf_taxes))
+        with _cf_cols[2]: st.metric("Total Savings", TEA.money(_cf_savings))
+        _ci = 3
+        with _cf_cols[_ci]: st.metric("Living + Mortgage", TEA.money(_cf_living))
+        _ci += 1
         if _cf_future_exp != 0:
             with _cf_cols[_ci]: st.metric("Other Expenses", TEA.money(_cf_future_exp))
             _ci += 1
-        with _cf_cols[_ci]: st.metric("Est. Taxes", TEA.money(_cf_taxes))
-        with _cf_cols[_ci + 1]: st.metric("Total Savings", TEA.money(_cf_savings))
-        with _cf_cols[_ci + 2]: st.metric("Surplus / (Deficit)", TEA.money(_cf_surplus))
+        with _cf_cols[_ci]: st.metric("Surplus / (Deficit)", TEA.money(_cf_surplus))
+        # Income breakdown (from tax return cashflow)
+        _cf_parts = []
+        if _cf_base:
+            if _cf_base.get("wages", 0) > 0: _cf_parts.append(f"Wages {TEA.money(_cf_base['wages'])}")
+            if _cf_base.get("gross_ss", 0) > 0: _cf_parts.append(f"SS {TEA.money(_cf_base['gross_ss'])}")
+            if _cf_base.get("taxable_pensions", 0) > 0: _cf_parts.append(f"Pension {TEA.money(_cf_base['taxable_pensions'])}")
+            _cf_own_ira = max(0, _cf_base.get("taxable_ira", 0) - _inh_dist_for_cf)
+            if _cf_own_ira > 0: _cf_parts.append(f"IRA dist {TEA.money(_cf_own_ira)}")
+            if _cf_base.get("other_income", 0) > 0: _cf_parts.append(f"Other {TEA.money(_cf_base['other_income'])}")
+            if _cf_base.get("cashflow_taxfree", 0) > 0: _cf_parts.append(f"Tax-free {TEA.money(_cf_base['cashflow_taxfree'])}")
+            _inv_inc = (_cf_base.get("total_ordinary_dividends", 0) + _cf_base.get("interest_taxable", 0)
+                        + _cf_base.get("tax_exempt_interest", 0) - _cf_base.get("reinvested_amount", 0))
+            if _inv_inc > 0: _cf_parts.append(f"Invest. income {TEA.money(_inv_inc)}")
+        if _cf_parts:
+            st.caption("Income: " + " | ".join(_cf_parts))
 
         # Spending validation
         if _cf_surplus > 0:
@@ -1159,109 +1347,23 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                     f"whether your actual living expenses are closer to "
                     f"**{TEA.money(D['living_expenses'] + _cf_surplus)}**.")
 
-        # --- Inherited IRA Distribution Recommendations ---
-        _inh_f_bal = D["inh_ira_f"]
-        _inh_s_bal = D["inh_ira_s"] if is_joint else 0.0
-        if _inh_f_bal > 0 or _inh_s_bal > 0:
-            st.markdown("### Inherited IRA Distribution Recommendations")
-            _inh_income = salary_filer + salary_spouse + D["other_income"]
-            # Filer inherited IRA
-            if _inh_f_bal > 0:
-                _inh_f_rule = "10_year" if D["inh_rule_f"] == "10-Year Rule" else "lifetime"
-                _inh_f_yrs = int(D["inh_yrs_f"]) if _inh_f_rule == "10_year" else 0
-                _inh_f_rmd = bool(D["inh_rmd_req_f"])
-                _inh_f_horizon = max(5, filer_plan_through_age - current_age_filer) if _inh_f_rule == "lifetime" else None
-                _inh_f_rec = engine.calc_inherited_ira_recommendation(
-                    _inh_f_bal, _inh_f_yrs, current_age_filer, _inh_f_rmd,
-                    _inh_income, filing_status, state_rate=state_rate,
-                    growth_rate=pre_ret_return, inflation=bracket_growth,
-                    rule=_inh_f_rule, horizon_years=_inh_f_horizon)
-                if _inh_f_rec:
-                    _inh_label = "Filer" if _inh_s_bal > 0 else ""
-                    st.markdown(f"**{_inh_label} Distribution Recommendation:** Fill to top of {_inh_f_rec['target_bracket_rate']:.0%} bracket")
-                    rc1, rc2 = st.columns(2)
-                    if _inh_f_rule == "10_year":
-                        with rc1:
-                            st.metric("Recommended Annual", TEA.money(_inh_f_rec["recommended_annual"]))
-                            st.caption(f"Stays in {_inh_f_rec['target_bracket_rate']:.0%} bracket (current rate: {_inh_f_rec['marginal_without']:.0%})")
-                        with rc2:
-                            st.metric("Est. Tax Savings vs Final-Year Lump", TEA.money(_inh_f_rec["total_tax_lump"] - _inh_f_rec["total_tax_recommended"]))
-                        if _inh_f_rec.get("final_yr_lump") and _inh_f_rec["final_yr_lump"] > _inh_f_rec["recommended_annual"] * 1.5:
-                            st.error(f"Without spreading: final year forces {TEA.money(_inh_f_rec['final_yr_lump'])} lump sum → {_inh_f_rec['final_yr_rate']:.0%} bracket")
-                    else:
-                        with rc1:
-                            if _inh_f_rec.get("recommended_additional", 0) > 0:
-                                st.metric("Recommended Annual Total", TEA.money(_inh_f_rec["recommended_annual"]))
-                                st.caption(f"Min RMD + {TEA.money(_inh_f_rec['recommended_additional'])} additional")
-                            else:
-                                st.metric("Year-1 Minimum RMD", TEA.money(_inh_f_rec["recommended_annual"]))
-                                st.caption("Min RMD already fills or exceeds current bracket")
-                        with rc2:
-                            if _inh_f_rec.get("tax_savings", 0) > 0:
-                                st.metric("Est. Tax Savings vs Min-Only", TEA.money(_inh_f_rec["tax_savings"]))
-                            if _inh_f_rec.get("peak_min_only_dist", 0) > 0:
-                                st.metric("Peak Future RMD (min-only)", TEA.money(_inh_f_rec["peak_min_only_dist"]))
-                                st.caption(f"At age {_inh_f_rec['peak_min_only_age']} → {_inh_f_rec['peak_min_only_rate']:.0%} bracket")
-                    if _inh_f_rec.get("spill_desc"):
-                        st.info(_inh_f_rec["spill_desc"])
-                    if _inh_f_rec.get("warning"):
-                        st.warning(_inh_f_rec["warning"])
-                    with st.expander("Year-by-Year Schedule"):
-                        _inh_sched = pd.DataFrame(_inh_f_rec["schedule"])
-                        _inh_sched["marginal_rate"] = _inh_sched["marginal_rate"].apply(lambda x: f"{x:.0%}")
-                        st.dataframe(_inh_sched, use_container_width=True, hide_index=True)
-            # Spouse inherited IRA
-            if _inh_s_bal > 0 and is_joint:
-                _inh_s_rule = "10_year" if D["inh_rule_s"] == "10-Year Rule" else "lifetime"
-                _inh_s_yrs = int(D["inh_yrs_s"]) if _inh_s_rule == "10_year" else 0
-                _inh_s_rmd = bool(D["inh_rmd_req_s"])
-                _sp_age = current_age_spouse or current_age_filer
-                _inh_s_horizon = max(5, spouse_plan_through_age - _sp_age) if _inh_s_rule == "lifetime" else None
-                _inh_s_rec = engine.calc_inherited_ira_recommendation(
-                    _inh_s_bal, _inh_s_yrs, _sp_age, _inh_s_rmd,
-                    _inh_income, filing_status, state_rate=state_rate,
-                    growth_rate=pre_ret_return, inflation=bracket_growth,
-                    rule=_inh_s_rule, horizon_years=_inh_s_horizon)
-                if _inh_s_rec:
-                    st.markdown(f"**Spouse Distribution Recommendation:** Fill to top of {_inh_s_rec['target_bracket_rate']:.0%} bracket")
-                    sc1, sc2 = st.columns(2)
-                    if _inh_s_rule == "10_year":
-                        with sc1:
-                            st.metric("Recommended Annual", TEA.money(_inh_s_rec["recommended_annual"]))
-                            st.caption(f"Stays in {_inh_s_rec['target_bracket_rate']:.0%} bracket")
-                        with sc2:
-                            st.metric("Est. Tax Savings vs Final-Year Lump", TEA.money(_inh_s_rec["total_tax_lump"] - _inh_s_rec["total_tax_recommended"]))
-                    else:
-                        with sc1:
-                            if _inh_s_rec.get("recommended_additional", 0) > 0:
-                                st.metric("Recommended Annual Total", TEA.money(_inh_s_rec["recommended_annual"]))
-                                st.caption(f"Min RMD + {TEA.money(_inh_s_rec['recommended_additional'])} additional")
-                            else:
-                                st.metric("Year-1 Minimum RMD", TEA.money(_inh_s_rec["recommended_annual"]))
-                        with sc2:
-                            if _inh_s_rec.get("tax_savings", 0) > 0:
-                                st.metric("Est. Tax Savings vs Min-Only", TEA.money(_inh_s_rec["tax_savings"]))
-                            if _inh_s_rec.get("peak_min_only_dist", 0) > 0:
-                                st.metric("Peak Future RMD (min-only)", TEA.money(_inh_s_rec["peak_min_only_dist"]))
-                    if _inh_s_rec.get("warning"):
-                        st.warning(_inh_s_rec["warning"])
-                    with st.expander("Spouse Year-by-Year Schedule"):
-                        _inh_sp_sched = pd.DataFrame(_inh_s_rec["schedule"])
-                        _inh_sp_sched["marginal_rate"] = _inh_sp_sched["marginal_rate"].apply(lambda x: f"{x:.0%}")
-                        st.dataframe(_inh_sp_sched, use_container_width=True, hide_index=True)
-
         with st.expander("Monte Carlo Settings"):
             mc_c1, mc_c2, mc_c3 = st.columns(3)
             with mc_c1: mc_sims = st.number_input("Simulations", min_value=100, max_value=2000, value=500, step=100, key="fp_preret_mc_sims")
             with mc_c2: mc_vol = st.number_input("Return Std Dev (%)", value=12.0, step=1.0, key="fp_preret_mc_vol") / 100
             with mc_c3: mc_post_ret = st.number_input("Post-Retire Return (%)", value=post_ret_return * 100, step=0.5, key="fp_preret_mc_post") / 100
 
-        if st.button("Run Projection", type="primary", key="fp_preret_run_proj"):
+        _run_proj_btn = st.button("Run Projection", type="primary", key="fp_preret_run_proj")
+        if _run_proj_btn or _spending_changed:
             accum_result = _run_accum()
             st.session_state.projection_results = accum_result
+            st.session_state._fp_last_proj_spending = _proj_spending
             # Run Monte Carlo automatically
-            _ret_years = max(filer_plan_through_age, spouse_plan_through_age or 0) - ret_age + 1
-            n_total = years_to_ret + max(1, _ret_years)
+            _spouse_age_at_ret = (current_age_spouse + years_to_ret) if current_age_spouse else None
+            _ret_yrs_f = filer_plan_through_age - ret_age
+            _ret_yrs_s = (spouse_plan_through_age - _spouse_age_at_ret) if (_spouse_age_at_ret and spouse_plan_through_age) else 0
+            _ret_years = max(1, max(_ret_yrs_f, _ret_yrs_s) + 1)
+            n_total = years_to_ret + 1 + max(1, _ret_years)
             def _mc_run(return_seq):
                 _ii = dict(income_info)
                 _ii["return_sequence"] = return_seq[:years_to_ret + 1]
@@ -1297,6 +1399,145 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                     return_std=mc_vol, n_years=n_total, seed=42,
                     mean_return_post=mc_post_ret, n_years_pre=years_to_ret)
             st.session_state._preret_mc = mc_result
+
+            # --- Age Sweep ---
+            _sweep_start = max(current_age_filer + 1, 55)
+            _sweep_end = min(current_age_filer + 25, 75)
+            if _sweep_start <= _sweep_end:
+                def _build_sweep_params(acc_res, sweep_ytr, sweep_ra):
+                    """Build balances + retire params for a given retirement age."""
+                    _sf = acc_res["rows"][-1] if acc_res["rows"] else {}
+                    _sb = acc_res.get("final_brokerage", _sf.get("Bal Taxable", 0))
+                    _sc = acc_res.get("final_cash", 0)
+                    if _ire_liq_equity > 0:
+                        _sb += _ire_liq_equity
+                    _sbals = {
+                        "pretax": _sf.get("Bal Pre-Tax", 0),
+                        "roth": _sf.get("Bal Roth", 0),
+                        "brokerage": _sb, "cash": _sc,
+                        "taxable": _sb + _sc,
+                        "brokerage_basis": acc_res.get("final_basis", 0) + _ire_liq_equity,
+                        "hsa": _sf.get("Bal HSA", 0),
+                    }
+                    # Build retire params with adjusted years_to_ret / ret_age
+                    _inf_f = (1 + inflation) ** sweep_ytr
+                    _pen_f_cola = D["pension_cola_filer"] / 100
+                    _pen_s_cola = D["pension_cola_spouse"] / 100
+                    _pf = pension_filer * ((1 + _pen_f_cola) ** sweep_ytr) if pension_filer > 0 else 0.0
+                    _ps = pension_spouse * ((1 + _pen_s_cola) ** sweep_ytr) if pension_spouse > 0 else 0.0
+                    if filer_ss_already and filer_ss_current > 0:
+                        _ssf = filer_ss_current * _inf_f
+                    else:
+                        _ssf = ss_filer_pia * _inf_f
+                    if is_joint and spouse_ss_already and spouse_ss_current > 0:
+                        _sss = spouse_ss_current * _inf_f
+                    else:
+                        _sss = ss_spouse_pia * _inf_f
+                    _hv = home_value * ((1 + home_appreciation) ** sweep_ytr)
+                    _my = max(0, mtg_years - sweep_ytr)
+                    _rfe = [dict(fe) for fe in future_expenses if fe["end_age"] > sweep_ra]
+                    _iira = acc_res.get("inherited_iras_state", [])
+                    _sd = "none" if D["surplus_dest"] == "Don't Reinvest" else ("cash" if D["surplus_dest"] == "Cash/Savings" else "brokerage")
+                    _srp = {
+                        "retire_age": sweep_ra,
+                        "filer_life_expectancy": filer_plan_through_age,
+                        "spouse_life_expectancy": spouse_plan_through_age,
+                        "survivor_spending_pct": survivor_spending_pct,
+                        "pension_survivor_pct": pension_survivor_pct,
+                        "retire_year": current_year + sweep_ytr,
+                        "inflation": inflation, "bracket_growth": bracket_growth,
+                        "medicare_growth": medicare_growth,
+                        "post_retire_return": post_ret_return,
+                        "filing_status": filing_status,
+                        "state_tax_rate": state_rate,
+                        "dependents": int(D["dependents"]),
+                        "out_of_state_gain": float(D["out_of_state_gain"]),
+                        "base_tax_year": int(D["tax_year"]),
+                        "expenses_at_retirement": _proj_spending * (D["ret_pct"] / 100) * _inf_f,
+                        "ss_filer_fra": _ssf, "ss_spouse_fra": _sss,
+                        "ss_filer_claim_age": ss_filer_claim_age,
+                        "ss_spouse_claim_age": ss_spouse_claim_age,
+                        "filer_dob": filer_dob,
+                        "spouse_dob": spouse_dob if is_joint else None,
+                        "ssdi_filer": D["ssdi_filer"],
+                        "ssdi_spouse": D["ssdi_spouse"] if is_joint else False,
+                        "ss_filer_already": filer_ss_already,
+                        "ss_filer_current_benefit": filer_ss_current if filer_ss_already else 0,
+                        "ss_spouse_already": spouse_ss_already if is_joint else False,
+                        "ss_spouse_current_benefit": spouse_ss_current if (is_joint and spouse_ss_already) else 0,
+                        "pension_filer_at_retire": _pf,
+                        "pension_filer_start_age": int(D["pension_filer_age"]),
+                        "pension_filer_cola": _pen_f_cola,
+                        "pension_spouse_at_retire": _ps,
+                        "pension_spouse_start_age": int(D["pension_spouse_age"]) if is_joint else 65,
+                        "pension_spouse_cola": _pen_s_cola,
+                        "spouse_age_at_retire": (current_age_spouse + sweep_ytr) if current_age_spouse else None,
+                        "mortgage_payment": mtg_payment_annual,
+                        "mortgage_years_at_retire": _my,
+                        "home_value_at_retire": _hv,
+                        "home_appreciation": home_appreciation,
+                        "inv_re_value_at_retire": _ire_keep_value,
+                        "inv_re_appr": _ire_keep_appr,
+                        "future_expenses": _rfe,
+                        "dividend_yield": acc_res.get("derived_div_yield", div_yield),
+                        "brok_interest_yield": acc_res.get("derived_brok_int_yield", 0.0),
+                        "cash_interest_rate": cash_int_rate,
+                        "charitable": charitable, "qcd_annual": qcd_annual,
+                        "inherited_iras": _iira,
+                        "surplus_destination": _sd,
+                        "heir_bracket_option": "same",
+                        "other_income": (D["other_income"] * (_inf_f if D["other_income_inflate"] else 1.0)
+                                         if not (_oi_end > 0 and _oi_end <= sweep_ra) else 0.0)
+                                        + (_ire_keep_income if not inv_re_properties else 0.0),
+                        "other_income_tax_free": bool(D["other_income_tax_free"]),
+                        "other_income_inflation": bool(D["other_income_inflate"]),
+                        "other_income_start_year": max(0, _oi_start - sweep_ra) if _oi_start > sweep_ra else 0,
+                        "other_income_years": (_oi_end - max(_oi_start or sweep_ra, sweep_ra)) if (_oi_end > 0 and _oi_end > sweep_ra) else 0,
+                        "inv_re_properties": [{
+                            "name": p["name"],
+                            "net_income": p["net_income"] * ((1 + p["income_growth"]) ** sweep_ytr),
+                            "income_growth": p["income_growth"],
+                            "mortgage_pmt": p["mortgage_pmt"],
+                            "mortgage_years": max(0, p["mortgage_years"] - sweep_ytr),
+                        } for p in inv_re_properties],
+                        "life_cash_value": life_cash_value * ((1 + r_life) ** sweep_ytr),
+                        "r_life": r_life,
+                        "annuity_value": annuity_value * ((1 + r_annuity) ** sweep_ytr),
+                        "annuity_basis": annuity_basis,
+                        "r_annuity": r_annuity,
+                        "estate_tax_enabled": bool(D["estate_tax_enabled"]),
+                        "federal_estate_exemption": float(D["federal_estate_exemption"]),
+                        "exemption_inflation": float(D["exemption_inflation"]),
+                        "use_portability": bool(D["use_portability"]),
+                        "state_estate_tax_rate": float(D["state_estate_tax_rate"]),
+                        "state_estate_exemption": float(D["state_estate_exemption"]),
+                    }
+                    _srp["post_retire_return"] = mc_post_ret
+                    return (_sbals, _srp)
+
+                _sweep_progress = st.progress(0, text="Sweeping retirement ages...")
+                def _sweep_cb(step, total):
+                    _sweep_progress.progress(step / total, text=f"Testing age {_sweep_start + step - 1} of {_sweep_start}-{_sweep_end}...")
+                _sweep_results = engine.sweep_retirement_ages(
+                    current_age=current_age_filer,
+                    start_age=_sweep_start,
+                    end_age=_sweep_end,
+                    start_balances=start_balances,
+                    contrib_dict=contrib_dict,
+                    income_info=income_info,
+                    salary_growth=salary_growth,
+                    pre_ret_return=pre_ret_return,
+                    build_retire_params_fn=_build_sweep_params,
+                    spending_order=spending_order,
+                    mc_sims=int(mc_sims) // 2 if mc_sims > 200 else 200,
+                    mc_vol=mc_vol,
+                    mc_post_ret=mc_post_ret,
+                    ire_liq_equity=_ire_liq_equity,
+                    progress_callback=_sweep_cb,
+                )
+                _sweep_progress.empty()
+                st.session_state._preret_sweep = _sweep_results
+
         if st.session_state.projection_results:
             accum_result = st.session_state.projection_results
             rows = accum_result["rows"]
@@ -1380,6 +1621,97 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                 with c4: st.metric("90th Pctile", _mfmt(mc.get("portfolio_p90", 0)))
                 st.caption("Monte Carlo portfolio at end of plan (excludes home equity)")
 
+                # --- Spending Inference ---
+                st.markdown("### Spending Analysis")
+                _si_base = st.session_state.base_results
+                _si_gross = _si_base.get("spendable_gross", 0) if _si_base else 0.0
+                _si_inc_tax = (_si_base["total_tax"]) if _si_base else 0.0
+                _si_fica = (_si_base.get("fica", 0)) if _si_base else 0.0
+                _si_medicare = (_si_base.get("medicare_premiums", 0)) if _si_base else 0.0
+                _si_taxes = _si_inc_tax + _si_fica + _si_medicare
+                _si_savings = _employee_savings
+                _si_spending = max(0, _si_gross - _inh_dist_for_cf - _si_taxes - _si_savings - mtg_payment_annual)
+                _si_ret_spending = _si_spending * (D["ret_pct"] / 100)
+                _si_inh_str = f" − inherited IRA dist {TEA.money(_inh_dist_for_cf)}" if _inh_dist_for_cf > 0 else ""
+                st.markdown(
+                    f"Gross income {TEA.money(_si_gross)} − taxes {TEA.money(_si_taxes)} "
+                    f"(inc {TEA.money(_si_inc_tax)} + FICA {TEA.money(_si_fica)}"
+                    + (f" + Medicare {TEA.money(_si_medicare)}" if _si_medicare > 0 else "")
+                    + f"){_si_inh_str} − savings {TEA.money(_si_savings)}"
+                    + (f" − mortgage {TEA.money(mtg_payment_annual)}" if mtg_payment_annual > 0 else "")
+                    + f" = **{TEA.money(_si_spending)}/yr** lifestyle spending.")
+                st.markdown(
+                    f"Retirement spending target: **{TEA.money(_si_ret_spending)}/yr** "
+                    f"({D['ret_pct']:.0f}% of current)"
+                    + (f" + {TEA.money(mtg_payment_annual)}/yr mortgage" if mtg_payment_annual > 0 else "")
+                    + ".")
+                st.checkbox("Override: use stated spending from Spending tab",
+                            key="fp_spending_override",
+                            help=f"Stated: {TEA.money(D['living_expenses'])}/yr. "
+                                 f"Inferred: {TEA.money(_inferred_spending)}/yr.")
+                if _use_override:
+                    st.caption(f"Projections use stated spending: **{TEA.money(D['living_expenses'])}/yr**")
+                else:
+                    st.caption(f"Projections use inferred spending: **{TEA.money(_inferred_spending)}/yr**")
+
+                # --- Triage ---
+                _mc_pct = mc["success_rate"] * 100
+                if _mc_pct >= 75:
+                    st.success(
+                        f"You're on track to retire at {ret_age}! "
+                        f"Go to **Strategy Optimizer** to maximize your after-tax estate.")
+                elif _mc_pct >= 50:
+                    st.warning(
+                        f"You're close but not yet secure at {ret_age}. "
+                        f"Go to **Savings Optimizer** to explore strategies that can close the gap.")
+                else:
+                    st.error(
+                        f"You're not on track to retire at {ret_age}. "
+                        f"Go to **Savings Optimizer** to find a path — consider saving more, "
+                        f"spending less, or working longer.")
+
+            # --- Age Sweep Display ---
+            if st.session_state.get("_preret_sweep"):
+                _sw = st.session_state._preret_sweep
+                if _sw:
+                    st.markdown("### When Can You Retire?")
+                    # Find earliest age with ≥ 75% success
+                    _earliest_ok = None
+                    for _sr in _sw:
+                        if _sr["success_rate"] >= 0.75:
+                            _earliest_ok = _sr["age"]
+                            break
+
+                    if _earliest_ok is not None:
+                        if _earliest_ok <= ret_age:
+                            st.success(f"You could potentially retire as early as **age {_earliest_ok}** "
+                                       f"(≥ 75% Monte Carlo success).")
+                        else:
+                            st.info(f"Earliest retirement age with ≥ 75% Monte Carlo success: **{_earliest_ok}**")
+                    else:
+                        st.warning("No tested retirement age achieved ≥ 75% Monte Carlo success. "
+                                   "Consider increasing savings or extending your working years.")
+
+                    # Build display table
+                    _sw_rows = []
+                    for _sr in _sw:
+                        _sw_rows.append({
+                            "Retire Age": _sr["age"],
+                            "Years Away": _sr["years_to_ret"],
+                            "MC Success": f"{_sr['success_rate'] * 100:.0f}%",
+                            "Median Portfolio": f"${_sr['median_portfolio']:,.0f}",
+                            "10th Pctile": f"${_sr['p10']:,.0f}",
+                            "90th Pctile": f"${_sr['p90']:,.0f}",
+                        })
+                    _sw_df = pd.DataFrame(_sw_rows)
+                    # Style: highlight earliest qualifying row
+                    def _highlight_sweep(row):
+                        if _earliest_ok is not None and row["Retire Age"] == _earliest_ok:
+                            return ["background-color: #d4edda"] * len(row)
+                        return [""] * len(row)
+                    st.dataframe(_sw_df.style.apply(_highlight_sweep, axis=1),
+                                 use_container_width=True, hide_index=True)
+
     # ════════════════════════════════════════════════════════════════
     # TAB 3 (PRE-RET): Retirement Projection
     # ════════════════════════════════════════════════════════════════
@@ -1425,7 +1757,8 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             rr_heir = st.selectbox("Heir bracket", ["Same as mine", "One bracket lower", "One bracket higher"], key="fp_rr_heir")
             rr_heir_opt = {"Same as mine": "same", "One bracket lower": "lower", "One bracket higher": "higher"}[rr_heir]
 
-        if st.button("Run Retirement Readiness", type="primary", key="fp_rr_run"):
+        _rr_spending_changed = (_spending_changed and st.session_state.get("retire_projection") is not None)
+        if st.button("Run Retirement Readiness", type="primary", key="fp_rr_run") or _rr_spending_changed:
             # Run accumulation if not already done
             if accum_result is None:
                 accum_result = _run_accum()
@@ -1447,7 +1780,7 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             }
             _rp = _build_retire_params(accum_result)
             # Override with tab-specific inputs
-            _rp["expenses_at_retirement"] = D["living_expenses"] * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
+            _rp["expenses_at_retirement"] = _proj_spending * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
             _rp["survivor_spending_pct"] = rr_survivor
             _rp["pension_survivor_pct"] = rr_pension_surv
             _rp["heir_bracket_option"] = rr_heir_opt
@@ -1509,7 +1842,7 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                     "hsa": _final.get("Bal HSA", 0),
                 }
                 _rp = _build_retire_params(accum_result)
-                _rp["expenses_at_retirement"] = D["living_expenses"] * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
+                _rp["expenses_at_retirement"] = _proj_spending * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
                 _rp["survivor_spending_pct"] = rr_survivor
                 _rp["pension_survivor_pct"] = rr_pension_surv
                 _rp["heir_bracket_option"] = rr_heir_opt
@@ -1563,7 +1896,7 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                     }
                     _ss_rp = _build_retire_params(accum_result)
                     _ss_rp["filer_life_expectancy"] = _ss_life_exp
-                    _ss_rp["expenses_at_retirement"] = D["living_expenses"] * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
+                    _ss_rp["expenses_at_retirement"] = _proj_spending * (rr_ret_pct / 100) * ((1 + inflation) ** years_to_ret)
                     _ss_rp["survivor_spending_pct"] = rr_survivor
                     _ss_rp["pension_survivor_pct"] = rr_pension_surv
                     _ss_rp["heir_bracket_option"] = rr_heir_opt
@@ -1659,17 +1992,27 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
         st.caption("Tests different savings allocation strategies through your full retirement "
                    "and compares after-tax estate at end of life — the true measure of wealth.")
 
-        # Show current allocation
+        # Show current allocation — plan-type-aware labels
+        _plan_label_f = _plan_f if _plan_f != "None" else ""
+        _plan_label_s = (D["plan_type_s"] if is_joint and salary_spouse > 0 and D["plan_type_s"] != "None" else "")
+        # Use the more descriptive plan name for display
+        _wp_label = _plan_label_f or _plan_label_s or "401(k)"
         st.markdown("### Current Allocation")
-        _curr_alloc = pd.DataFrame([{
-            "Pre-Tax 401k": TEA.money(contrib_401k_pretax_filer + contrib_401k_pretax_spouse),
-            "Roth 401k": TEA.money(contrib_401k_roth_filer + contrib_401k_roth_spouse),
-            "Trad IRA": TEA.money(contrib_trad_ira + contrib_trad_ira_spouse),
-            "Roth IRA": TEA.money(contrib_roth_ira + contrib_roth_ira_spouse),
-            "HSA": TEA.money(contrib_hsa), "Taxable": TEA.money(contrib_taxable),
-            "Employer Match": TEA.money(employer_match + employer_match_spouse),
-        }])
-        st.dataframe(_curr_alloc, use_container_width=True, hide_index=True)
+        _alloc_items = {}
+        _pt_wp = contrib_401k_pretax_filer + contrib_401k_pretax_spouse
+        _ro_wp = contrib_401k_roth_filer + contrib_401k_roth_spouse
+        if _pt_wp > 0: _alloc_items[f"Pre-Tax {_wp_label}"] = TEA.money(_pt_wp)
+        if _ro_wp > 0: _alloc_items[f"Roth {_wp_label}"] = TEA.money(_ro_wp)
+        _trad_ira_total = contrib_trad_ira + contrib_trad_ira_spouse
+        _roth_ira_total = contrib_roth_ira + contrib_roth_ira_spouse
+        if _trad_ira_total > 0: _alloc_items["Trad IRA"] = TEA.money(_trad_ira_total)
+        if _roth_ira_total > 0: _alloc_items["Roth IRA"] = TEA.money(_roth_ira_total)
+        if contrib_hsa > 0: _alloc_items["HSA"] = TEA.money(contrib_hsa)
+        if contrib_taxable > 0: _alloc_items["Taxable"] = TEA.money(contrib_taxable)
+        _emp_match_total = employer_match + employer_match_spouse
+        if _emp_match_total > 0: _alloc_items["Employer Match"] = TEA.money(_emp_match_total)
+        if _alloc_items:
+            st.dataframe(pd.DataFrame([_alloc_items]), use_container_width=True, hide_index=True)
 
         if st.button("Run Savings Optimizer", type="primary", key="fp_preret_run_opt"):
             # Total tax-advantaged savings pool (employee only, excludes employer match)
@@ -1681,6 +2024,11 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
 
             # Define strategies
             strategies = []
+
+            # Plan-type-aware labels
+            _has_ira = (employee_ira_f + employee_ira_s) > 0
+            _ira_suffix = " + Trad IRA" if _has_ira else ""
+            _roth_ira_suffix = " + Roth IRA" if _has_ira else ""
 
             # Strategy helper: build contrib_dict variant
             def _make_contrib(pretax_401k_f, roth_401k_f, pretax_401k_s, roth_401k_s,
@@ -1700,19 +2048,19 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
             # Current plan
             strategies.append(("Current Plan", contrib_dict, pretax_deductions))
 
-            # All Pre-Tax 401k
+            # All Pre-Tax workplace plan
             _c, _d = _make_contrib(
                 employee_401k_f, 0, employee_401k_s, 0,
                 employee_ira_f, 0, employee_ira_s, 0,
                 contrib_hsa, contrib_taxable)
-            strategies.append(("All Pre-Tax 401k + Trad IRA", _c, _d))
+            strategies.append((f"All Pre-Tax {_wp_label}{_ira_suffix}", _c, _d))
 
-            # All Roth 401k
+            # All Roth workplace plan
             _c, _d = _make_contrib(
                 0, employee_401k_f, 0, employee_401k_s,
                 0, employee_ira_f, 0, employee_ira_s,
                 contrib_hsa, contrib_taxable)
-            strategies.append(("All Roth 401k + Roth IRA", _c, _d))
+            strategies.append((f"All Roth {_wp_label}{_roth_ira_suffix}", _c, _d))
 
             # 50/50 split
             _c, _d = _make_contrib(
@@ -1815,6 +2163,9 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
                     "Funded": "No" if depleted else "Yes",
                     "_estate": net_estate, "_name": name, "_depleted": depleted,
                     "_portfolio": portfolio_at_ret,
+                    "_accum": _acc, "_ret": _opt_ret,
+                    "_contrib": c_dict, "_pt_ded": pt_ded,
+                    "_bals": _opt_bals, "_rp": _opt_rp,
                 })
                 progress.progress((idx + 1) / len(strategies))
             progress.empty()
@@ -1845,7 +2196,365 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, D, is_joint, filing_status,
 
             _disp = [{k: v for k, v in r.items() if not k.startswith("_")} for r in opt_results]
             st.dataframe(pd.DataFrame(_disp), use_container_width=True, hide_index=True)
+
+            # --- Best Strategy: full projection + Monte Carlo ---
+            _best_data = opt_results[0]
+            st.markdown(f"### Best Strategy: {_best_data['Strategy']}")
+
+            # Accumulation projection table
+            _best_acc = _best_data["_accum"]
+            if _best_acc and _best_acc.get("rows"):
+                with st.expander("Accumulation Projection (Best Strategy)", expanded=False):
+                    _ba_df = pd.DataFrame(_best_acc["rows"])
+                    _ba_hide = ["Basis", "Unreal Gain"]
+                    for c in list(_ba_df.columns):
+                        if c in _ba_hide:
+                            _ba_df = _ba_df.drop(columns=[c], errors="ignore")
+                        elif _ba_df[c].dtype in ['float64', 'int64'] and (_ba_df[c] == 0).all():
+                            _ba_df = _ba_df.drop(columns=[c], errors="ignore")
+                    st.dataframe(_ba_df, use_container_width=True, hide_index=True)
+
+            # Retirement projection table
+            _best_ret = _best_data["_ret"]
+            if _best_ret and _best_ret.get("rows"):
+                with st.expander("Retirement Projection (Best Strategy)", expanded=False):
+                    _br_df = pd.DataFrame(_best_ret["rows"])
+                    for c in list(_br_df.columns):
+                        if _br_df[c].dtype in ['float64', 'int64'] and (_br_df[c] == 0).all():
+                            _br_df = _br_df.drop(columns=[c], errors="ignore")
+                    st.dataframe(_br_df, use_container_width=True, hide_index=True)
+                    # End-of-plan summary
+                    _br_c1, _br_c2, _br_c3, _br_c4 = st.columns(4)
+                    with _br_c1: st.metric("Final Portfolio", TEA.money(_best_ret.get("final_total", 0)))
+                    with _br_c2: st.metric("Net Estate", TEA.money(_best_ret.get("estate", 0)))
+                    with _br_c3: st.metric("Gross Estate", TEA.money(_best_ret.get("gross_estate", 0)))
+                    with _br_c4: st.metric("Total Taxes", TEA.money(_best_ret.get("total_taxes", 0)))
+
+            # Monte Carlo on best strategy
+            _best_cd = _best_data["_contrib"]
+            _best_pt = _best_data["_pt_ded"]
+            _spouse_age_at_ret_opt = (current_age_spouse + years_to_ret) if current_age_spouse else None
+            _ret_yrs_f_opt = filer_plan_through_age - ret_age
+            _ret_yrs_s_opt = (spouse_plan_through_age - _spouse_age_at_ret_opt) if (_spouse_age_at_ret_opt and spouse_plan_through_age) else 0
+            _ret_years_opt = max(1, max(_ret_yrs_f_opt, _ret_yrs_s_opt) + 1)
+            _n_total_opt = years_to_ret + 1 + max(1, _ret_years_opt)
+
+            def _opt_mc_run(return_seq):
+                _oi = dict(income_info)
+                _oi["pretax_deductions"] = _best_pt
+                _oi["return_sequence"] = return_seq[:years_to_ret + 1]
+                _oa = engine.run_accumulation(
+                    current_age_filer, years_to_ret, copy.deepcopy(start_balances),
+                    dict(_best_cd), salary_growth, pre_ret_return, _oi)
+                _of = _oa["rows"][-1] if _oa["rows"] else {}
+                _ob = _oa.get("final_brokerage", _of.get("Bal Taxable", 0))
+                _oc = _oa.get("final_cash", 0)
+                if _ire_liq_equity > 0:
+                    _ob += _ire_liq_equity
+                _obals = {
+                    "pretax": _of.get("Bal Pre-Tax", 0),
+                    "roth": _of.get("Bal Roth", 0),
+                    "brokerage": _ob, "cash": _oc,
+                    "taxable": _ob + _oc,
+                    "brokerage_basis": _oa.get("final_basis", 0) + _ire_liq_equity,
+                    "hsa": _of.get("Bal HSA", 0),
+                }
+                _orp = _build_retire_params(_oa)
+                _orp["post_retire_return"] = mc_post_ret
+                _orp["heir_bracket_option"] = "same"
+                _ors = return_seq[years_to_ret + 1:] if len(return_seq) > years_to_ret + 1 else None
+                if _ors and len(_ors) >= _ret_years_opt:
+                    _orp["return_sequence"] = _ors
+                _oret = engine.run_retirement_projection(_obals, _orp, _opt_spend_order)
+                return {"estate": _oret["estate"], "final_total": _oret["final_total"],
+                        "retire_portfolio": _of.get("Portfolio", 0)}
+
+            with st.spinner(f"Running Monte Carlo on best strategy ({_best_data['Strategy']})..."):
+                _opt_mc = engine.run_monte_carlo(
+                    _opt_mc_run, n_sims=int(mc_sims), mean_return=pre_ret_return,
+                    return_std=mc_vol, n_years=_n_total_opt, seed=42,
+                    mean_return_post=mc_post_ret, n_years_pre=years_to_ret)
+
+            st.markdown("### Monte Carlo — Best Strategy")
+            _mfmt_opt = lambda v: f"${float(v):,.0f}"
+            _omc1, _omc2, _omc3, _omc4 = st.columns(4)
+            with _omc1: st.metric("MC Success Rate", f"{_opt_mc['success_rate'] * 100:.1f}%")
+            with _omc2: st.metric("Median Portfolio", _mfmt_opt(_opt_mc.get("median_portfolio", 0)))
+            with _omc3: st.metric("10th Pctile", _mfmt_opt(_opt_mc.get("portfolio_p10", 0)))
+            with _omc4: st.metric("90th Pctile", _mfmt_opt(_opt_mc.get("portfolio_p90", 0)))
+            st.caption("Monte Carlo portfolio at end of plan (excludes home equity)")
+
+            # Store for persistence
             st.session_state._preret_opt = opt_results
+            st.session_state._preret_opt_mc = _opt_mc
+
+    # ════════════════════════════════════════════════════════════════
+    # TAB 6 (PRE-RET): Strategy Optimizer
+    # ════════════════════════════════════════════════════════════════
+    with tab6:
+        st.subheader("Unified Strategy Optimizer")
+        st.caption("Cross-products contribution mix, withdrawal order, SS claiming age, and Roth conversion strategies. "
+                   "Runs full accumulation → retirement for each combo and ranks by after-tax estate.")
+
+        # ── Build contribution variants ──
+        employee_401k_f = contrib_401k_filer
+        employee_401k_s = contrib_401k_pretax_spouse + contrib_401k_roth_spouse
+        employee_ira_f = contrib_trad_ira + contrib_roth_ira
+        employee_ira_s = contrib_trad_ira_spouse + contrib_roth_ira_spouse
+
+        def _u6_make_contrib(pretax_401k_f, roth_401k_f, pretax_401k_s, roth_401k_s,
+                             trad_ira_f, roth_ira_f, trad_ira_s, roth_ira_s,
+                             hsa, taxable):
+            pf = pretax_401k_f + employer_match + trad_ira_f
+            ps = pretax_401k_s + employer_match_spouse + trad_ira_s
+            rf = roth_401k_f + roth_ira_f
+            rs = roth_401k_s + roth_ira_s
+            cd = {
+                "pretax": pf + ps, "roth": rf + rs,
+                "taxable": taxable, "cash": 0.0, "hsa": hsa,
+                "pretax_filer": pf, "pretax_spouse": ps,
+                "roth_filer": rf, "roth_spouse": rs,
+            }
+            pt_ded = pretax_401k_f + pretax_401k_s + trad_ira_f + trad_ira_s + hsa
+            ii = dict(income_info)
+            ii["pretax_deductions"] = pt_ded
+            return cd, ii
+
+        # Trad-Heavy: all employee workplace plan + IRA to pre-tax
+        _u6_cd_trad, _u6_ii_trad = _u6_make_contrib(
+            employee_401k_f, 0, employee_401k_s, 0,
+            employee_ira_f, 0, employee_ira_s, 0,
+            contrib_hsa, contrib_taxable)
+
+        # Roth-Heavy: all employee workplace plan + IRA to Roth
+        _u6_cd_roth, _u6_ii_roth = _u6_make_contrib(
+            0, employee_401k_f, 0, employee_401k_s,
+            0, employee_ira_f, 0, employee_ira_s,
+            contrib_hsa, contrib_taxable)
+
+        _u6_contrib_variants = [
+            ("Current", dict(contrib_dict), dict(income_info)),
+            ("Trad-Heavy", _u6_cd_trad, _u6_ii_trad),
+            ("Roth-Heavy", _u6_cd_roth, _u6_ii_roth),
+        ]
+
+        # ── Build SS variants ──
+        _u6_ssdi_f = D["ssdi_filer"]
+        _u6_ssdi_s = D["ssdi_spouse"] if is_joint else False
+        _u6_ss_variants = engine._build_ss_variants(
+            current_age_filer, current_age_spouse, ret_age, is_joint,
+            _u6_ssdi_f, _u6_ssdi_s)
+
+        # ── Build Roth variants ──
+        _u6_roth_variants = engine._build_roth_variants(filing_status == "Married Filing Jointly")
+        _u6_roth_variants = [(lbl, strat, tgt, (ret_age + 10) if stop is None else stop)
+                              for lbl, strat, tgt, stop in _u6_roth_variants]
+
+        # ── Waterfall variants ──
+        _u6_wf_variants = engine.WATERFALL_VARIANTS
+
+        # ── Dimension summary ──
+        _u6_n_combos = len(_u6_contrib_variants) * len(_u6_wf_variants) * len(_u6_ss_variants) * len(_u6_roth_variants)
+        _u6_n_accum = len(_u6_contrib_variants)
+        st.markdown(f"**Dimensions:** {len(_u6_contrib_variants)} contrib × {len(_u6_wf_variants)} waterfall × "
+                    f"{len(_u6_ss_variants)} SS × {len(_u6_roth_variants)} Roth = **{_u6_n_combos} combos** "
+                    f"({_u6_n_accum} accumulation runs)")
+
+        if st.button("Run Unified Optimizer", type="primary", key="fp_run_unified_opt"):
+            _u6_progress = st.progress(0, text="Starting optimizer...")
+
+            def _u6_progress_cb(step, total, msg):
+                pct = min(100, int(step / total * 100))
+                _u6_progress.progress(pct, text=msg)
+
+            _u6_base_params = _build_retire_params(_run_accum())
+
+            _u6_result = engine.run_unified_optimizer(
+                current_age=current_age_filer,
+                years_to_ret=years_to_ret,
+                start_balances=copy.deepcopy(start_balances),
+                contrib_variants=_u6_contrib_variants,
+                waterfall_variants=_u6_wf_variants,
+                ss_variants=_u6_ss_variants,
+                roth_variants=_u6_roth_variants,
+                base_retire_params=_u6_base_params,
+                salary_growth=salary_growth,
+                pre_ret_return=pre_ret_return,
+                progress_callback=_u6_progress_cb,
+            )
+            _u6_progress.progress(100, text="Complete!")
+            _u6_progress.empty()
+
+            _u6_best = _u6_result["best_combo"]
+            _u6_detail = _u6_result["best_detail"]
+
+            # ── Winner Summary ──
+            st.markdown("### Winning Strategy")
+            _u6w1, _u6w2, _u6w3, _u6w4 = st.columns(4)
+            with _u6w1: st.metric("Contribution Mix", _u6_best["contrib"])
+            with _u6w2: st.metric("Withdrawal Order", _u6_best["waterfall"])
+            with _u6w3: st.metric("SS Claiming", _u6_best["ss"])
+            with _u6w4: st.metric("Roth Conversion", _u6_best["roth"])
+
+            _u6e1, _u6e2, _u6e3, _u6e4 = st.columns(4)
+            with _u6e1: st.metric("After-Tax Estate", TEA.money(_u6_best["estate"]))
+            with _u6e2: st.metric("Total Taxes", TEA.money(_u6_best["taxes"]))
+            with _u6e3: st.metric("Roth Converted", TEA.money(_u6_best["converted"]))
+            with _u6e4: st.metric("Combos Tested", f"{_u6_result['total_combos']:,}")
+
+            # Compare to current plan
+            _u6_current_combo = next(
+                (c for c in _u6_result["rankings"]
+                 if c["contrib"] == "Current"
+                 and c["waterfall"] == engine.WATERFALL_VARIANTS[0][0]
+                 and c["roth"] == "No Conversion"
+                 and c["ss"] == _u6_ss_variants[0][0]),
+                None)
+            if _u6_current_combo:
+                _u6_delta = _u6_best["estate"] - _u6_current_combo["estate"]
+                if _u6_delta > 0:
+                    st.success(f"**Improvement over current plan: {TEA.money(_u6_delta)}** in after-tax estate")
+                elif _u6_delta == 0:
+                    st.success("**Your current strategy is already optimal** across all tested combinations")
+                else:
+                    st.info(f"Current plan is within {TEA.money(abs(_u6_delta))} of the best combination found")
+
+            # ── Dimension Impact Analysis ──
+            st.divider()
+            st.markdown("### Dimension Impact Analysis")
+            st.caption("Average estate per option within each dimension — shows which decisions matter most.")
+
+            _u6_dim = _u6_result["dimension_analysis"]
+            _u6_spreads = {}
+            for dim_name, options in _u6_dim.items():
+                if len(options) > 1:
+                    spread = options[0][1] - options[-1][1]
+                    _u6_spreads[dim_name] = spread
+
+            if _u6_spreads:
+                _u6_most_impactful = max(_u6_spreads, key=_u6_spreads.get)
+                st.info(f"**Most impactful dimension: {_u6_most_impactful}** (spread: {TEA.money(_u6_spreads[_u6_most_impactful])})")
+
+            for dim_name, options in _u6_dim.items():
+                spread = _u6_spreads.get(dim_name, 0)
+                with st.expander(f"{dim_name} — spread: {TEA.money(spread)}", expanded=True):
+                    _dim_df = pd.DataFrame([
+                        {"Option": opt, "Avg Estate": TEA.money(avg), "vs Best": TEA.money(avg - options[0][1])}
+                        for opt, avg in options
+                    ])
+                    st.dataframe(_dim_df, use_container_width=True, hide_index=True)
+
+            # ── Top Combos Table ──
+            st.divider()
+            st.markdown("### Top Combinations")
+            _u6_top = _u6_result["rankings"][:20]
+            _u6_top_df = pd.DataFrame([
+                {
+                    "Rank": i + 1,
+                    "Contribution": c["contrib"],
+                    "Waterfall": c["waterfall"],
+                    "SS Claiming": c["ss"],
+                    "Roth Conv": c["roth"],
+                    "Estate": TEA.money(c["estate"]),
+                    "Taxes": TEA.money(c["taxes"]),
+                    "Portfolio": TEA.money(c["final_total"]),
+                }
+                for i, c in enumerate(_u6_top)
+            ])
+            st.dataframe(_u6_top_df, use_container_width=True, hide_index=True)
+
+            # ── Year-by-Year Detail ──
+            st.divider()
+            st.markdown("### Best Combo — Year-by-Year Detail")
+            with st.expander("Accumulation Phase"):
+                if _u6_detail["accum_rows"]:
+                    st.dataframe(pd.DataFrame(_u6_detail["accum_rows"]), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No accumulation rows (already at retirement)")
+
+            with st.expander("Retirement Phase"):
+                _u6_ret = _u6_detail["retire_result"]
+                if _u6_ret.get("rows"):
+                    st.dataframe(pd.DataFrame(_u6_ret["rows"]), use_container_width=True, hide_index=True)
+                    _u6r1, _u6r2, _u6r3, _u6r4 = st.columns(4)
+                    with _u6r1: st.metric("Final Portfolio", TEA.money(_u6_ret["final_total"]))
+                    with _u6r2: st.metric("Final Estate", TEA.money(_u6_ret["estate"]))
+                    with _u6r3: st.metric("Total Taxes", TEA.money(_u6_ret["total_taxes"]))
+                    with _u6r4: st.metric("Roth Converted", TEA.money(_u6_ret.get("total_converted", 0)))
+
+            # ── Monte Carlo on Winning Strategy ──
+            st.divider()
+            _u6_best_rank = _u6_result["rankings"][0]
+            # Find matching contribution variant
+            _u6_mc_cd = dict(contrib_dict)
+            _u6_mc_ii = dict(income_info)
+            for _cv_label, _cv_dict, _cv_ii in _u6_contrib_variants:
+                if _cv_label == _u6_best_rank["contrib"]:
+                    _u6_mc_cd = _cv_dict
+                    _u6_mc_ii = _cv_ii
+                    break
+
+            _u6_mc_wf = _u6_best_rank["_w_order"]
+            _u6_mc_sfc = _u6_best_rank["_s_fc"]
+            _u6_mc_ssc = _u6_best_rank.get("_s_sc")
+            _u6_mc_rs = _u6_best_rank["_r_strategy"]
+            _u6_mc_rt = _u6_best_rank["_r_target"]
+            _u6_mc_rstop = _u6_best_rank.get("_r_stop")
+            _u6_spouse_age_at_ret = (current_age_spouse + years_to_ret) if current_age_spouse else None
+            _u6_ret_yrs_f = filer_plan_through_age - ret_age
+            _u6_ret_yrs_s = (spouse_plan_through_age - _u6_spouse_age_at_ret) if (_u6_spouse_age_at_ret and spouse_plan_through_age) else 0
+            _u6_ret_years = max(1, max(_u6_ret_yrs_f, _u6_ret_yrs_s) + 1)
+            _u6_n_total = years_to_ret + 1 + max(1, _u6_ret_years)
+
+            def _u6_mc_run(return_seq):
+                _oi = dict(_u6_mc_ii)
+                _oi["return_sequence"] = return_seq[:years_to_ret + 1]
+                _oa = engine.run_accumulation(
+                    current_age_filer, years_to_ret, copy.deepcopy(start_balances),
+                    dict(_u6_mc_cd), salary_growth, pre_ret_return, _oi)
+                _of = _oa["rows"][-1] if _oa["rows"] else {}
+                _ob = _oa.get("final_brokerage", _of.get("Bal Taxable", 0))
+                _oc = _oa.get("final_cash", 0)
+                if _ire_liq_equity > 0:
+                    _ob += _ire_liq_equity
+                _obals = {
+                    "pretax": _of.get("Bal Pre-Tax", 0),
+                    "roth": _of.get("Bal Roth", 0),
+                    "brokerage": _ob, "cash": _oc,
+                    "taxable": _ob + _oc,
+                    "brokerage_basis": _oa.get("final_basis", 0) + _ire_liq_equity,
+                    "hsa": _of.get("Bal HSA", 0),
+                }
+                _orp = _build_retire_params(_oa)
+                _orp["post_retire_return"] = mc_post_ret
+                _orp["ss_filer_claim_age"] = _u6_mc_sfc
+                if _u6_mc_ssc is not None:
+                    _orp["ss_spouse_claim_age"] = _u6_mc_ssc
+                if _u6_mc_rs != "none":
+                    _orp["roth_conversion_strategy"] = _u6_mc_rs
+                    _orp["roth_conversion_target_agi"] = _u6_mc_rt
+                    _orp["roth_conversion_stop_age"] = _u6_mc_rstop if _u6_mc_rstop is not None else (ret_age + 10)
+                _ors = return_seq[years_to_ret + 1:] if len(return_seq) > years_to_ret + 1 else None
+                if _ors and len(_ors) >= _u6_ret_years:
+                    _orp["return_sequence"] = _ors
+                _oret = engine.run_retirement_projection(_obals, _orp, list(_u6_mc_wf))
+                return {"estate": _oret["estate"], "final_total": _oret["final_total"],
+                        "retire_portfolio": _of.get("Portfolio", 0)}
+
+            with st.spinner("Running Monte Carlo on winning strategy..."):
+                _u6_mc = engine.run_monte_carlo(
+                    _u6_mc_run, n_sims=int(mc_sims), mean_return=pre_ret_return,
+                    return_std=mc_vol, n_years=_u6_n_total, seed=42,
+                    mean_return_post=mc_post_ret, n_years_pre=years_to_ret)
+
+            st.markdown("### Monte Carlo — Winning Strategy")
+            _u6_mfmt = lambda v: f"${float(v):,.0f}"
+            _u6m1, _u6m2, _u6m3, _u6m4 = st.columns(4)
+            with _u6m1: st.metric("MC Success Rate", f"{_u6_mc['success_rate'] * 100:.1f}%")
+            with _u6m2: st.metric("Median Portfolio", _u6_mfmt(_u6_mc.get("median_portfolio", 0)))
+            with _u6m3: st.metric("10th Pctile", _u6_mfmt(_u6_mc.get("portfolio_p10", 0)))
+            with _u6m4: st.metric("90th Pctile", _u6_mfmt(_u6_mc.get("portfolio_p90", 0)))
+            st.caption("Monte Carlo portfolio at end of plan (excludes home equity)")
 
 # ══════════════════════════════════════════════════════════════════════
 # PLANNING
@@ -2035,6 +2744,59 @@ elif nav == "Growing":
                 w_check("Original owner was taking RMDs? — Filer", "inh_rmd_req_f")
             w_num("Additional Annual Distribution — Filer", "inh_add_f", step=1000.0,
                   help="Extra amount to distribute each year beyond the minimum.")
+            # --- RMD + Recommendation ---
+            _g_age_f = TEA.age_at_date(D["filer_dob"], dt.date.today())
+            _g_rule_f = "10_year" if D["inh_rule_f"] == "10-Year Rule" else "lifetime"
+            _g_rmd_f = bool(D["inh_rmd_req_f"])
+            if _g_rmd_f or _g_rule_f == "lifetime":
+                _g_div_f = engine.SINGLE_LIFE_TABLE.get(_g_age_f, 1.0)
+                _g_min_rmd_f = D["inh_ira_f"] / _g_div_f if _g_div_f > 0 else D["inh_ira_f"]
+                st.info(f"Minimum annual RMD (year 1): {TEA.money(_g_min_rmd_f)}")
+            _g_yrs_f = int(D["inh_yrs_f"]) if _g_rule_f == "10_year" else 0
+            _g_income = D["salary_filer"] + D["salary_spouse"] + D["other_income"]
+            _g_state = D["state_tax_rate"] / 100
+            _g_growth = D["pre_ret_return"] / 100
+            _g_brgr = D["bracket_growth"] / 100
+            _g_horizon_f = max(5, int(D["filer_plan_age"]) - _g_age_f) if _g_rule_f == "lifetime" else None
+            _g_rec_f = engine.calc_inherited_ira_recommendation(
+                D["inh_ira_f"], _g_yrs_f, _g_age_f, _g_rmd_f,
+                _g_income, filing_status, state_rate=_g_state,
+                growth_rate=_g_growth, inflation=_g_brgr,
+                rule=_g_rule_f, horizon_years=_g_horizon_f)
+            if _g_rec_f:
+                st.markdown("---")
+                st.markdown(f"**Distribution Recommendation:** Fill to top of {_g_rec_f['target_bracket_rate']:.0%} bracket")
+                rc1, rc2 = st.columns(2)
+                if _g_rule_f == "10_year":
+                    with rc1:
+                        st.metric("Recommended Annual", TEA.money(_g_rec_f["recommended_annual"]))
+                        st.caption(f"Stays in {_g_rec_f['target_bracket_rate']:.0%} bracket (current rate: {_g_rec_f['marginal_without']:.0%})")
+                    with rc2:
+                        st.metric("Est. Tax Savings vs Final-Year Lump", TEA.money(_g_rec_f["total_tax_lump"] - _g_rec_f["total_tax_recommended"]))
+                    if _g_rec_f.get("final_yr_lump") and _g_rec_f["final_yr_lump"] > _g_rec_f["recommended_annual"] * 1.5:
+                        st.error(f"Without spreading: final year forces {TEA.money(_g_rec_f['final_yr_lump'])} lump sum → {_g_rec_f['final_yr_rate']:.0%} bracket")
+                else:
+                    with rc1:
+                        if _g_rec_f.get("recommended_additional", 0) > 0:
+                            st.metric("Recommended Annual Total", TEA.money(_g_rec_f["recommended_annual"]))
+                            st.caption(f"Min RMD + {TEA.money(_g_rec_f['recommended_additional'])} additional")
+                        else:
+                            st.metric("Year-1 Minimum RMD", TEA.money(_g_rec_f["recommended_annual"]))
+                            st.caption("Min RMD already fills or exceeds current bracket")
+                    with rc2:
+                        if _g_rec_f.get("tax_savings", 0) > 0:
+                            st.metric("Est. Tax Savings vs Min-Only", TEA.money(_g_rec_f["tax_savings"]))
+                        if _g_rec_f.get("peak_min_only_dist", 0) > 0:
+                            st.metric("Peak Future RMD (min-only)", TEA.money(_g_rec_f["peak_min_only_dist"]))
+                            st.caption(f"At age {_g_rec_f['peak_min_only_age']} → {_g_rec_f['peak_min_only_rate']:.0%} bracket")
+                if _g_rec_f.get("spill_desc"):
+                    st.info(_g_rec_f["spill_desc"])
+                if _g_rec_f.get("warning"):
+                    st.warning(_g_rec_f["warning"])
+                with st.expander("Year-by-Year Schedule"):
+                    _g_sched_f = pd.DataFrame(_g_rec_f["schedule"])
+                    _g_sched_f["marginal_rate"] = _g_sched_f["marginal_rate"].apply(lambda x: f"{x:.0%}")
+                    st.dataframe(_g_sched_f, use_container_width=True, hide_index=True)
         if is_joint:
             w_num("Inherited IRA — Spouse", "inh_ira_s", step=5000.0)
             if D["inh_ira_s"] > 0:
@@ -2044,6 +2806,54 @@ elif nav == "Growing":
                     w_check("Original owner was taking RMDs? — Spouse", "inh_rmd_req_s")
                 w_num("Additional Annual Distribution — Spouse", "inh_add_s", step=1000.0,
                       help="Extra amount to distribute each year beyond the minimum.")
+                # --- Spouse RMD + Recommendation ---
+                _g_sp_dob = D.get("spouse_dob") or D["filer_dob"]
+                _g_sp_age = TEA.age_at_date(_g_sp_dob, dt.date.today())
+                _g_rule_s = "10_year" if D["inh_rule_s"] == "10-Year Rule" else "lifetime"
+                _g_rmd_s = bool(D["inh_rmd_req_s"])
+                if _g_rmd_s or _g_rule_s == "lifetime":
+                    _g_div_s = engine.SINGLE_LIFE_TABLE.get(_g_sp_age, 1.0)
+                    _g_min_rmd_s = D["inh_ira_s"] / _g_div_s if _g_div_s > 0 else D["inh_ira_s"]
+                    st.info(f"Spouse minimum annual RMD (year 1): {TEA.money(_g_min_rmd_s)}")
+                _g_yrs_s = int(D["inh_yrs_s"]) if _g_rule_s == "10_year" else 0
+                _gs_income = D["salary_filer"] + D["salary_spouse"] + D["other_income"]
+                _gs_state = D["state_tax_rate"] / 100
+                _gs_growth = D["pre_ret_return"] / 100
+                _gs_brgr = D["bracket_growth"] / 100
+                _gs_horizon = max(5, int(D["spouse_plan_age"]) - _g_sp_age) if _g_rule_s == "lifetime" else None
+                _g_rec_s = engine.calc_inherited_ira_recommendation(
+                    D["inh_ira_s"], _g_yrs_s, _g_sp_age, _g_rmd_s,
+                    _gs_income, filing_status, state_rate=_gs_state,
+                    growth_rate=_gs_growth, inflation=_gs_brgr,
+                    rule=_g_rule_s, horizon_years=_gs_horizon)
+                if _g_rec_s:
+                    st.markdown("---")
+                    st.markdown(f"**Spouse Distribution Recommendation:** Fill to top of {_g_rec_s['target_bracket_rate']:.0%} bracket")
+                    sc1, sc2 = st.columns(2)
+                    if _g_rule_s == "10_year":
+                        with sc1:
+                            st.metric("Recommended Annual", TEA.money(_g_rec_s["recommended_annual"]))
+                            st.caption(f"Stays in {_g_rec_s['target_bracket_rate']:.0%} bracket")
+                        with sc2:
+                            st.metric("Est. Tax Savings vs Final-Year Lump", TEA.money(_g_rec_s["total_tax_lump"] - _g_rec_s["total_tax_recommended"]))
+                    else:
+                        with sc1:
+                            if _g_rec_s.get("recommended_additional", 0) > 0:
+                                st.metric("Recommended Annual Total", TEA.money(_g_rec_s["recommended_annual"]))
+                                st.caption(f"Min RMD + {TEA.money(_g_rec_s['recommended_additional'])} additional")
+                            else:
+                                st.metric("Year-1 Minimum RMD", TEA.money(_g_rec_s["recommended_annual"]))
+                        with sc2:
+                            if _g_rec_s.get("tax_savings", 0) > 0:
+                                st.metric("Est. Tax Savings vs Min-Only", TEA.money(_g_rec_s["tax_savings"]))
+                            if _g_rec_s.get("peak_min_only_dist", 0) > 0:
+                                st.metric("Peak Future RMD (min-only)", TEA.money(_g_rec_s["peak_min_only_dist"]))
+                    if _g_rec_s.get("warning"):
+                        st.warning(_g_rec_s["warning"])
+                    with st.expander("Spouse Year-by-Year Schedule"):
+                        _gs_sched = pd.DataFrame(_g_rec_s["schedule"])
+                        _gs_sched["marginal_rate"] = _gs_sched["marginal_rate"].apply(lambda x: f"{x:.0%}")
+                        st.dataframe(_gs_sched, use_container_width=True, hide_index=True)
 
     # --- Insurance Products ---
     st.divider()
@@ -2403,13 +3213,15 @@ elif nav == "Receiving":
             with _tc2:
                 w_num("End age (0=ongoing)", "tax_exempt_end_age", min_value=0, max_value=110, step=1, format="%d")
     with col2:
-        w_num("Other taxable income", "other_income", step=500.0)
+        w_num("Other Income", "other_income", step=500.0)
         if D["other_income"] > 0:
+            w_check("Tax-free (e.g., disability, Roth, gifts)", "other_income_tax_free")
+            w_check("Inflate with inflation", "other_income_inflate")
             _oc1, _oc2 = st.columns(2)
             with _oc1:
                 if D["other_income_start_age"] == 0:
                     D["other_income_start_age"] = _oi_default_age
-                w_num("Start age", "other_income_start_age", min_value=50, max_value=110, step=1, format="%d")
+                w_num("Start age", "other_income_start_age", min_value=18, max_value=110, step=1, format="%d")
             with _oc2:
                 w_num("End age (0=ongoing)", "other_income_end_age", min_value=0, max_value=110, step=1, format="%d")
 
@@ -2419,11 +3231,12 @@ elif nav == "Receiving":
     st.caption("Add expected future income (e.g., inheritance, rental income, part-time work).")
     _filer_dob_recv = D["filer_dob"]
     _filer_age_recv = TEA.age_at_date(_filer_dob_recv, dt.date.today()) if _filer_dob_recv else 70
+    _fi_birth_year = (current_year - _filer_age_recv) if _filer_age_recv else (current_year - 70)
     if st.button("Add Income", key="_btn_add_income"):
         st.session_state.future_income.append({
             "name": "", "amount": 0.0,
             "start_age": _filer_age_recv, "end_age": 0,
-            "inflates": False, "taxable": True,
+            "inflates": False, "tax_type": "Ordinary Income", "basis": 0.0,
         })
         st.rerun()
     _fi_to_remove = None
@@ -2432,14 +3245,29 @@ elif nav == "Receiving":
         c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
         with c1: fi["name"] = st.text_input("Description", value=fi["name"], key=f"_fi_name_{idx}")
         with c2: fi["amount"] = st.number_input("Annual $", value=float(fi["amount"]), min_value=0.0, step=1000.0, key=f"_fi_amt_{idx}")
-        with c3: fi["start_age"] = st.number_input("Start Age", value=int(fi["start_age"]), min_value=50, max_value=110, step=1, key=f"_fi_start_{idx}")
-        with c4: fi["end_age"] = st.number_input("End Age (0=ongoing)", value=int(fi["end_age"]), min_value=0, max_value=110, step=1, key=f"_fi_end_{idx}")
+        _fi_start_yr = _fi_birth_year + fi["start_age"]
+        _fi_end_yr = _fi_birth_year + fi["end_age"] if fi["end_age"] > 0 else 0
+        with c3:
+            _new_start_yr = st.number_input("Start Year", value=int(_fi_start_yr), min_value=2020, max_value=current_year + 50, step=1, key=f"_fi_start_{idx}")
+            fi["start_age"] = _new_start_yr - _fi_birth_year
+        with c4:
+            _new_end_yr = st.number_input("End Year (0=ongoing)", value=int(_fi_end_yr), min_value=0, max_value=current_year + 50, step=1, key=f"_fi_end_{idx}")
+            fi["end_age"] = (_new_end_yr - _fi_birth_year) if _new_end_yr > 0 else 0
+        # Backward compat: migrate old taxable boolean to tax_type
+        if "taxable" in fi and "tax_type" not in fi:
+            fi["tax_type"] = "Ordinary Income" if fi["taxable"] else "Non-Taxable"
+            fi.setdefault("basis", 0.0)
+        fi.setdefault("tax_type", "Ordinary Income")
+        fi.setdefault("basis", 0.0)
+        _fi_tax_types = ["Non-Taxable", "Ordinary Income", "Capital Gains"]
         c5, c6, c7 = st.columns([2, 2, 1])
         with c5: fi["inflates"] = st.checkbox("Inflates?", value=fi["inflates"], key=f"_fi_inf_{idx}")
-        with c6: fi["taxable"] = st.checkbox("Taxable?", value=fi["taxable"], key=f"_fi_tax_{idx}")
+        with c6: fi["tax_type"] = st.selectbox("Tax Type", _fi_tax_types, index=_fi_tax_types.index(fi["tax_type"]), key=f"_fi_tax_{idx}")
         with c7:
             if st.button("Remove", key=f"_fi_rm_{idx}"):
                 _fi_to_remove = idx
+        if fi["tax_type"] == "Capital Gains":
+            fi["basis"] = st.number_input("Cost Basis $", value=float(fi["basis"]), min_value=0.0, step=1000.0, key=f"_fi_basis_{idx}")
         st.markdown("---")
     if _fi_to_remove is not None:
         st.session_state.future_income.pop(_fi_to_remove)
@@ -2560,18 +3388,19 @@ elif nav == "Spending":
     st.divider()
     st.subheader("Additional Expenses")
     st.caption("Add one-time or recurring expenses beyond base spending (e.g., new car, home repair, long-term care).")
-    _ae_sources = ["Taxable – Cash", "Taxable – Brokerage", "Pre-Tax – IRA/401k", "Annuity", "Roth", "Life Insurance (loan)"]
+    _ae_sources = ["Available Cash", "Taxable – Cash", "Taxable – Brokerage", "Pre-Tax – IRA/401k", "Annuity", "Roth", "Life Insurance (loan)"]
     if is_joint:
         _ae_sources.insert(_ae_sources.index("Roth") + 1, "Roth — Spouse")
         _ae_sources.insert(_ae_sources.index("Annuity") + 1, "Annuity — Spouse")
     filer_dob = D["filer_dob"]
     _filer_age_now = TEA.age_at_date(filer_dob, dt.date.today()) if filer_dob else 70
+    _ae_birth_year = (current_year - _filer_age_now) if _filer_age_now else (current_year - 70)
 
     if st.button("Add Expense", key="_btn_add_expense"):
         st.session_state.additional_expenses.append({
             "name": "", "net_amount": 0.0,
             "start_age": _filer_age_now, "end_age": 0,
-            "inflates": False, "source": "Taxable – Cash",
+            "inflates": False, "source": "Available Cash",
             "gross_needed": 0.0, "calculated": False, "tax_impact": None,
         })
         st.rerun()
@@ -2582,8 +3411,14 @@ elif nav == "Spending":
         c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
         with c1: ae["name"] = st.text_input("Description", value=ae["name"], key=f"_ae_name_{idx}")
         with c2: ae["net_amount"] = st.number_input("Net Amount $", value=float(ae["net_amount"]), min_value=0.0, step=1000.0, key=f"_ae_amt_{idx}")
-        with c3: ae["start_age"] = st.number_input("Start Age", value=int(ae["start_age"]), min_value=50, max_value=110, step=1, key=f"_ae_start_{idx}")
-        with c4: ae["end_age"] = st.number_input("End Age (0=one-time)", value=int(ae["end_age"]), min_value=0, max_value=110, step=1, key=f"_ae_end_{idx}")
+        _ae_start_yr = _ae_birth_year + ae["start_age"]
+        _ae_end_yr = _ae_birth_year + ae["end_age"] if ae["end_age"] > 0 else 0
+        with c3:
+            _new_ae_start_yr = st.number_input("Start Year", value=int(_ae_start_yr), min_value=2020, max_value=current_year + 50, step=1, key=f"_ae_start_{idx}")
+            ae["start_age"] = _new_ae_start_yr - _ae_birth_year
+        with c4:
+            _new_ae_end_yr = st.number_input("End Year (0=one-time)", value=int(_ae_end_yr), min_value=0, max_value=current_year + 50, step=1, key=f"_ae_end_{idx}")
+            ae["end_age"] = (_new_ae_end_yr - _ae_birth_year) if _new_ae_end_yr > 0 else 0
         c5, c6, c7 = st.columns([2, 3, 1])
         with c5: ae["inflates"] = st.checkbox("Inflates?", value=ae["inflates"], key=f"_ae_inf_{idx}")
         with c6: ae["source"] = st.selectbox("Source", _ae_sources, index=_ae_sources.index(ae["source"]) if ae["source"] in _ae_sources else 0, key=f"_ae_src_{idx}")
@@ -2853,7 +3688,15 @@ elif nav == "Achieving":
         wages = D["wages"]
         _above_line = 0.0
     tax_exempt_interest = D["tax_exempt_interest"]
-    other_income = D["other_income"]
+    _oi_tax_free = bool(D["other_income_tax_free"])
+    # Gate other income by start/end age
+    _oi_start = int(D["other_income_start_age"]) or 0
+    _oi_end = int(D["other_income_end_age"]) or 0
+    _oi_in_range = ((_oi_start == 0 or current_age_filer >= _oi_start)
+                    and (_oi_end == 0 or current_age_filer < _oi_end))
+    _oi_amount = D["other_income"] if _oi_in_range else 0.0
+    other_income = 0.0 if _oi_tax_free else _oi_amount
+    _oi_cashflow_taxfree = _oi_amount if _oi_tax_free else 0.0
     # Add net rental income from base investment RE + additional properties
     _inv_re_rental = D["inv_re_net_income"]
     for _ri in range(1, 4):
@@ -2991,7 +3834,7 @@ elif nav == "Achieving":
     rmd_manual = D["rmd_manual"] if has_rmd else 0.0
 
     # Spending
-    spending_goal = D["living_expenses"]
+    spending_goal = st.session_state.get("_fp_proj_spending", D["living_expenses"])
     heir_tax_rate = D["heir_tax_rate"] / 100
     spending_order = [D["so1"], D["so2"], D["so3"], D["so4"]]
     surplus_dest_raw = D["surplus_dest"]
@@ -3055,13 +3898,48 @@ elif nav == "Achieving":
     st.session_state["_fp_tax_year"] = tax_year
     st.session_state["_fp_emergency_fund"] = emergency_fund
 
+    # --- Active future income → base tax inputs ---
+    _fi_taxfree = 0.0
+    for fi in st.session_state.get("future_income", []):
+        if fi.get("amount", 0) <= 0:
+            continue
+        _fi_sa = fi.get("start_age", 999)
+        _fi_ea = fi.get("end_age", 0)
+        if _fi_sa > current_age_filer or (_fi_ea > 0 and _fi_ea <= current_age_filer):
+            continue
+        _fi_tt = fi.get("tax_type", "Ordinary Income")
+        if _fi_tt == "Non-Taxable":
+            _fi_taxfree += fi["amount"]
+        elif _fi_tt == "Ordinary Income":
+            other_income += fi["amount"]
+        elif _fi_tt == "Capital Gains":
+            cap_gain_loss += fi["amount"]
+
+    # --- Inherited IRA current-year distributions → base tax ---
+    _inh_dist_total = 0.0
+    if D["inh_ira_f"] > 0:
+        _idf_rule = "10_year" if D["inh_rule_f"] == "10-Year Rule" else "lifetime"
+        _idf_rmd = bool(D["inh_rmd_req_f"])
+        if _idf_rmd or _idf_rule == "lifetime":
+            _idf_div = engine.SINGLE_LIFE_TABLE.get(current_age_filer, 1.0)
+            _inh_dist_total += D["inh_ira_f"] / _idf_div if _idf_div > 0 else D["inh_ira_f"]
+        _inh_dist_total += float(D["inh_add_f"])
+    if is_joint and D["inh_ira_s"] > 0:
+        _ids_rule = "10_year" if D["inh_rule_s"] == "10-Year Rule" else "lifetime"
+        _ids_rmd = bool(D["inh_rmd_req_s"])
+        if _ids_rmd or _ids_rule == "lifetime":
+            _ids_age = current_age_spouse or current_age_filer
+            _ids_div = engine.SINGLE_LIFE_TABLE.get(_ids_age, 1.0)
+            _inh_dist_total += D["inh_ira_s"] / _ids_div if _ids_div > 0 else D["inh_ira_s"]
+        _inh_dist_total += float(D["inh_add_s"])
+
     def current_inputs():
         return {
             "wages": float(wages), "tax_exempt_interest": float(tax_exempt_interest),
             "interest_taxable": float(interest_taxable),
             "total_ordinary_dividends": float(total_ordinary_dividends),
             "qualified_dividends": float(qualified_dividends),
-            "taxable_ira": float(baseline_pretax_distributions), "rmd_amount": float(rmd_total),
+            "taxable_ira": float(baseline_pretax_distributions + _inh_dist_total), "rmd_amount": float(rmd_total),
             "taxable_pensions": float(taxable_pensions_total), "gross_ss": float(gross_ss_total),
             "reinvest_dividends": bool(reinvest_dividends), "reinvest_cap_gains": bool(reinvest_cap_gains),
             "reinvest_interest": bool(reinvest_interest),
@@ -3074,7 +3952,7 @@ elif nav == "Achieving":
             "mortgage_payment": float(mortgage_payment), "property_tax": float(property_tax),
             "medical_expenses": float(medical_expenses), "charitable": float(charitable),
             "qcd_annual": float(qcd_annual),
-            "ordinary_tax_only": 0.0, "cashflow_taxfree": 0.0,
+            "ordinary_tax_only": 0.0, "cashflow_taxfree": float(_fi_taxfree + _oi_cashflow_taxfree),
             "brokerage_proceeds": 0.0, "annuity_proceeds": 0.0,
             "tax_year": int(tax_year),
             "force_deduction_method": _ded_method_key,
@@ -3167,7 +4045,8 @@ elif nav == "Achieving":
             "mortgage_balance": float(mortgage_balance), "mortgage_rate": float(mortgage_rate),
             "mortgage_payment": float(mortgage_payment),
             "wages": float(wages), "tax_exempt_interest": float(tax_exempt_interest),
-            "other_income": float(other_income), "adjustments": float(adjustments),
+            "other_income": float(other_income), "other_income_tax_free": bool(D["other_income_tax_free"]),
+            "adjustments": float(adjustments),
             "wages_start_age": int(D["wages_start_age"]), "wages_end_age": int(D["wages_end_age"]),
             "other_income_start_age": int(D["other_income_start_age"]), "other_income_end_age": int(D["other_income_end_age"]),
             "tax_exempt_start_age": int(D["tax_exempt_start_age"]), "tax_exempt_end_age": int(D["tax_exempt_end_age"]),
@@ -3212,36 +4091,18 @@ elif nav == "Achieving":
     if _is_working:
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "Base Tax Estimator", "Retirement Readiness", "Savings Optimizer",
-            "Retirement Projection", "Roth Conversion Opportunity"])
+            "Retirement Projection", "Strategy Optimizer"])
     else:
         tab1, tab2, tab3, tab4, tab5 = st.tabs([
             "Base Tax Estimator", "Income Needs", "Wealth Projection",
             "Multigenerational Optimizer", "Roth Conversion Opportunity"])
 
-    # ════════════════════════════════════════════════════════════════
-    # TAB 1: Base Tax Estimator
-    # ════════════════════════════════════════════════════════════════
-    with tab1:
-        st.subheader("Estimated Tax Analysis")
-        r = st.session_state.base_results
-        TEA.display_tax_return(r, mortgage_pmt=float(mortgage_payment),
-                               filer_65=filer_65_plus, spouse_65=spouse_65_plus)
-        st.divider()
-        _tf_bytes = TEA.generate_tax_forms_pdf(
-            r, st.session_state.base_inputs,
-            filer_65_plus, spouse_65_plus,
-            client_name=D["client_name"],
-            tax_year=int(tax_year))
-        st.download_button("Download Tax Forms (1040 + SC1040)",
-            data=_tf_bytes,
-            file_name=f"Tax_Forms_1040_{D['client_name'].replace(' ', '_')}_{int(tax_year)}.pdf",
-            mime="application/pdf", key="fp_tab1_tax_forms_pdf")
-
     # ================================================================
-    # PRE-RETIREMENT TABS (tabs 2-4) — only when working
+    # PRE-RETIREMENT TABS (tabs 2-5) — only when working
+    # Must run before Tab 1 so _fp_employee_savings is in session state
     # ================================================================
     if _is_working:
-        _fp_pre_ret_tabs(tab2, tab4, tab3, D, is_joint, filing_status,
+        _fp_pre_ret_tabs(tab2, tab4, tab3, tab5, D, is_joint, filing_status,
                          filer_dob, spouse_dob, current_year, inflation, bracket_growth,
                          medicare_growth, pension_cola, spending_order, surplus_destination,
                          current_age_filer, current_age_spouse,
@@ -3268,6 +4129,27 @@ elif nav == "Achieving":
                          proj_interest, proj_dividends, proj_qual_div, proj_cap_gains,
                          reinvest_dividends, reinvest_cap_gains, reinvest_interest,
                          spending_goal)
+
+    # ════════════════════════════════════════════════════════════════
+    # TAB 1: Base Tax Estimator
+    # ════════════════════════════════════════════════════════════════
+    with tab1:
+        st.subheader("Estimated Tax Analysis")
+        r = st.session_state.base_results
+        _tab1_savings = st.session_state.get("_fp_employee_savings", 0.0) if _is_working else 0.0
+        TEA.display_tax_return(r, mortgage_pmt=float(mortgage_payment),
+                               filer_65=filer_65_plus, spouse_65=spouse_65_plus,
+                               savings=_tab1_savings)
+        st.divider()
+        _tf_bytes = TEA.generate_tax_forms_pdf(
+            r, st.session_state.base_inputs,
+            filer_65_plus, spouse_65_plus,
+            client_name=D["client_name"],
+            tax_year=int(tax_year))
+        st.download_button("Download Tax Forms (1040 + SC1040)",
+            data=_tf_bytes,
+            file_name=f"Tax_Forms_1040_{D['client_name'].replace(' ', '_')}_{int(tax_year)}.pdf",
+            mime="application/pdf", key="fp_tab1_tax_forms_pdf")
 
     # ════════════════════════════════════════════════════════════════
     # RETIRED TABS 2-4 — only when NOT working
@@ -3343,7 +4225,7 @@ elif nav == "Achieving":
                 st.divider()
                 with st.expander("Additional Expenses", expanded=len(st.session_state.additional_expenses) > 0):
                     st.caption("Add one-time or recurring expenses beyond base spending (e.g., new car, home repair, long-term care). Each expense has its own withdrawal source.")
-                    _ae_sources = ["Taxable \u2013 Cash", "Taxable \u2013 Brokerage", "Pre-Tax \u2013 IRA/401k", "Annuity", "Roth", "Life Insurance (loan)"]
+                    _ae_sources = ["Available Cash", "Taxable \u2013 Cash", "Taxable \u2013 Brokerage", "Pre-Tax \u2013 IRA/401k", "Annuity", "Roth", "Life Insurance (loan)"]
                     if is_joint:
                         _ae_sources.insert(_ae_sources.index("Roth") + 1, "Roth \u2014 Spouse")
                         _ae_sources.insert(_ae_sources.index("Annuity") + 1, "Annuity \u2014 Spouse")
@@ -3353,7 +4235,7 @@ elif nav == "Achieving":
                         st.session_state.additional_expenses.append({
                             "name": "", "net_amount": 0.0,
                             "start_age": _filer_age_now, "end_age": 0,
-                            "inflates": False, "source": "Taxable \u2013 Cash",
+                            "inflates": False, "source": "Available Cash",
                             "gross_needed": 0.0, "calculated": False, "tax_impact": None,
                         })
                         st.rerun()
@@ -3469,7 +4351,7 @@ elif nav == "Achieving":
                         st.session_state.future_income.append({
                             "name": "", "amount": 0.0,
                             "start_age": _filer_age_now2, "end_age": 0,
-                            "inflates": False, "taxable": True,
+                            "inflates": False, "tax_type": "Ordinary Income", "basis": 0.0,
                         })
                         st.rerun()
 
@@ -3481,15 +4363,24 @@ elif nav == "Achieving":
                         with c2: fi["amount"] = st.number_input("Annual Amount $", value=float(fi["amount"]), min_value=0.0, step=1000.0, key=f"fp_fi_amt_{idx}")
                         with c3: fi["start_age"] = st.number_input("Start Age", value=int(fi["start_age"]), min_value=50, max_value=110, step=1, key=f"fp_fi_start_{idx}")
                         with c4: fi["end_age"] = st.number_input("End Age (0=ongoing)", value=int(fi["end_age"]), min_value=0, max_value=110, step=1, key=f"fp_fi_end_{idx}")
+                        # Backward compat: migrate old taxable boolean to tax_type
+                        if "taxable" in fi and "tax_type" not in fi:
+                            fi["tax_type"] = "Ordinary Income" if fi["taxable"] else "Non-Taxable"
+                            fi.setdefault("basis", 0.0)
+                        fi.setdefault("tax_type", "Ordinary Income")
+                        fi.setdefault("basis", 0.0)
+                        _fi_tax_types = ["Non-Taxable", "Ordinary Income", "Capital Gains"]
                         c5, c6, c7 = st.columns([2, 2, 1])
                         with c5: fi["inflates"] = st.checkbox("Inflates?", value=fi["inflates"], key=f"fp_fi_inf_{idx}")
-                        with c6: fi["taxable"] = st.checkbox("Taxable?", value=fi["taxable"], key=f"fp_fi_tax_{idx}")
+                        with c6: fi["tax_type"] = st.selectbox("Tax Type", _fi_tax_types, index=_fi_tax_types.index(fi["tax_type"]), key=f"fp_fi_tax_{idx}")
                         with c7:
                             if st.button("Remove", key=f"fp_fi_rm_{idx}"):
                                 _fi_to_remove = idx
+                        if fi["tax_type"] == "Capital Gains":
+                            fi["basis"] = st.number_input("Cost Basis $", value=float(fi["basis"]), min_value=0.0, step=1000.0, key=f"fp_fi_basis_{idx}")
                         _fi_eff_end = fi["end_age"] if fi["end_age"] > fi["start_age"] else 999
                         _fi_duration = "ongoing" if fi["end_age"] == 0 or fi["end_age"] <= fi["start_age"] else f"ages {fi['start_age']}-{fi['end_age']}"
-                        st.caption(f"Duration: {_fi_duration} | {'Taxable' if fi['taxable'] else 'Non-taxable'}")
+                        st.caption(f"Duration: {_fi_duration} | {fi['tax_type']}")
                         st.markdown("---")
 
                     if _fi_to_remove is not None:
@@ -3505,7 +4396,7 @@ elif nav == "Achieving":
                                     "Income": fi["name"] or "Income", "Annual Amount": TEA.money(fi["amount"]),
                                     "Ages": f"{fi['start_age']}-{_fi_eff_end}",
                                     "Inflates": "Yes" if fi["inflates"] else "No",
-                                    "Taxable": "Yes" if fi["taxable"] else "No",
+                                    "Tax Type": fi.get("tax_type", "Ordinary Income"),
                                 })
                         if _fi_summary:
                             st.markdown("#### Summary")
@@ -3653,7 +4544,7 @@ elif nav == "Achieving":
                             _fi_disp.append({
                                 "Income": fi.get("name") or "Income", "Annual $": TEA.money(fi["amount"]),
                                 "Ages": f"{fi['start_age']}-{_eff_end}",
-                                "Taxable": "Yes" if fi["taxable"] else "No", "Inflates": "Yes" if fi["inflates"] else "No",
+                                "Tax Type": fi.get("tax_type", "Ordinary Income"), "Inflates": "Yes" if fi["inflates"] else "No",
                             })
                         st.caption("Future Income:")
                         st.dataframe(pd.DataFrame(_fi_disp), use_container_width=True, hide_index=True)
@@ -3675,7 +4566,6 @@ elif nav == "Achieving":
                     _hide_cols = ["Total Wealth", "_net_draw"]
                     if all(r.get("Addl Expense", 0) == 0 for r in rows): _hide_cols.append("Addl Expense")
                     if all(r.get("Extra Income", 0) == 0 for r in rows): _hide_cols.append("Extra Income")
-                    if all(r.get("Accel PT", 0) == 0 for r in rows): _hide_cols.append("Accel PT")
                     if all(r.get("Harvest Gains", 0) == 0 for r in rows): _hide_cols.append("Harvest Gains")
                     if all(r.get("Other Inc", 0) == 0 for r in rows): _hide_cols.append("Other Inc")
                     _df_display = pd.DataFrame(rows).drop(columns=[c for c in _hide_cols if c in rows[0]], errors="ignore")
@@ -3871,11 +4761,9 @@ elif nav == "Achieving":
             order_key = strat["key"]; wf_order = strat["wf"]
             is_blend = strat["blend"]; pt_cap = strat["pt_cap"]
             adaptive_key = strat["adaptive"]
-            accel_bracket = strat.get("accel_bracket")
             ann_depl_yrs = strat.get("ann_depl_yrs"); ann_gains_only = strat.get("ann_gains_only", False)
             harvest_bracket = strat.get("harvest_bracket")
             _extra_kw = {}
-            if accel_bracket is not None: _extra_kw["extra_pretax_bracket"] = accel_bracket
             if ann_depl_yrs is not None:
                 _extra_kw["annuity_depletion_years"] = ann_depl_yrs
                 if ann_gains_only: _extra_kw["annuity_gains_only"] = True
@@ -3922,7 +4810,6 @@ elif nav == "Achieving":
             _strat_info = {"type": order_key, "pt_cap": strat["pt_cap"], "blend": strat["blend"],
                            "wf": strat["wf"], "prorata": order_key.startswith("prorata"),
                            "prorata_weights": _pr_weights, "adaptive_key": strat["adaptive"],
-                           "accel_bracket": strat.get("accel_bracket"),
                            "ann_depl_yrs": strat.get("ann_depl_yrs"),
                            "ann_gains_only": strat.get("ann_gains_only", False),
                            "conv_strat": strat.get("conv_strat", "none"),
@@ -4013,12 +4900,12 @@ elif nav == "Achieving":
                         if cap == 0: label = "Brokerage First (Pre-Tax $0/yr)"
                         elif cap >= 999999: label = "Pre-Tax First (Unlimited)"
                         else: label = f"Blend: Pre-Tax ${cap:,.0f}/yr + Brokerage"
-                        _spending_strategies.append({"key": "blend", "label": label, "wf": [], "blend": False, "pt_cap": cap, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _spending_strategies.append({"key": "prorata", "label": "Pro-Rata: All Accounts (Equal Weight)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _spending_strategies.append({"key": "prorata_pt_heavy", "label": "Pro-Rata: Heavy Pre-Tax (2x), Light Roth (0.25x)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _spending_strategies.append({"key": "prorata_no_roth", "label": "Pro-Rata: All Except Roth", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _spending_strategies.append({"key": "dynamic", "label": "Dynamic Blend (Marginal Cost)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    _spending_strategies.append({"key": "dynamic_heir", "label": "Dynamic Blend (Heir Arbitrage)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                        _spending_strategies.append({"key": "blend", "label": label, "wf": [], "blend": False, "pt_cap": cap, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "prorata", "label": "Pro-Rata: All Accounts (Equal Weight)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "prorata_pt_heavy", "label": "Pro-Rata: Heavy Pre-Tax (2x), Light Roth (0.25x)", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "prorata_no_roth", "label": "Pro-Rata: All Except Roth", "wf": [], "blend": False, "pt_cap": None, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "dynamic", "label": "Dynamic Blend (Marginal Cost)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                    _spending_strategies.append({"key": "dynamic_heir", "label": "Dynamic Blend (Heir Arbitrage)", "wf": [], "blend": True, "pt_cap": None, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     _wf_buckets = ["Taxable", "Pre-Tax", "Tax-Free", "Tax-Deferred"]
                     _wf_bucket_bals = {
                         "Taxable": a0["taxable"]["cash"] + a0["taxable"]["brokerage"] + a0["taxable"]["emergency_fund"],
@@ -4033,19 +4920,17 @@ elif nav == "Achieving":
                         _wf_key = " -> ".join(_wf_list)
                         if _wf_key not in _seen_wf:
                             _seen_wf.add(_wf_key)
-                            _spending_strategies.append({"key": "wf", "label": f"WF: {_wf_key}", "wf": _wf_list, "blend": False, "pt_cap": None, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
-                    for _ab_rate, _ab_label in [(0.12, "Accel PT: Fill 12% -> Brokerage"), (0.22, "Accel PT: Fill 22% -> Brokerage"), (0.24, "Accel PT: Fill 24% -> Brokerage"), ("irmaa", "Accel PT: Fill to IRMAA -> Brokerage")]:
-                        _spending_strategies.append({"key": "blend", "label": _ab_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": _ab_rate, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                            _spending_strategies.append({"key": "wf", "label": f"WF: {_wf_key}", "wf": _wf_list, "blend": False, "pt_cap": None, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
                     if a0["annuity"]["value"] > 0 and a0["annuity"]["value"] > a0["annuity"]["basis"]:
                         for _depl_yrs in [5, 10, 15]:
-                            _spending_strategies.append({"key": "blend", "label": f"Draw Ann Gains {_depl_yrs}yr", "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": None, "ann_depl_yrs": _depl_yrs, "ann_gains_only": True, "conv_strat": "none", "harvest_bracket": None})
-                    for _hv_accel, _hv_label in [(None, "Harvest 0% LTCG Gains"), (None, "Brokerage First + Harvest 0% Gains"), (0.12, "Accel PT Fill 12% + Harvest 0% Gains"), (0.22, "Accel PT Fill 22% + Harvest 0% Gains")]:
-                        _spending_strategies.append({"key": "blend", "label": _hv_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "accel_bracket": _hv_accel, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": 0.0})
+                            _spending_strategies.append({"key": "blend", "label": f"Draw Ann Gains {_depl_yrs}yr", "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "ann_depl_yrs": _depl_yrs, "ann_gains_only": True, "conv_strat": "none", "harvest_bracket": None})
+                    for _hv_accel, _hv_label in [(None, "Harvest 0% LTCG Gains"), (None, "Brokerage First + Harvest 0% Gains")]:
+                        _spending_strategies.append({"key": "blend", "label": _hv_label, "wf": [], "blend": False, "pt_cap": 0, "adaptive": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": 0.0})
 
                     # Adaptive strategies (separate list)
                     _adaptive_strategies = []
                     for _akey, _adef in TEA.ADAPTIVE_STRATEGIES.items():
-                        _adaptive_strategies.append({"key": "adaptive", "label": _adef["label"], "wf": [], "blend": False, "pt_cap": None, "adaptive": _akey, "accel_bracket": None, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
+                        _adaptive_strategies.append({"key": "adaptive", "label": _adef["label"], "wf": [], "blend": False, "pt_cap": None, "adaptive": _akey, "ann_depl_yrs": None, "conv_strat": "none", "harvest_bracket": None})
 
                     # ---- Build conversion strategies ----
                     try: conv_amounts = [float(x.strip()) for x in conv_amounts_str.split(",")]
@@ -4314,7 +5199,7 @@ elif nav == "Achieving":
                         with col3b: st.metric("vs Best", f"${_selected_combo['after_tax_estate'] - _best['after_tax_estate']:+,.0f}")
 
                     _opt_hide = ["Total Wealth", "_net_draw"]
-                    _zero_hide = ["Accel PT", "Harvest Gains"]
+                    _zero_hide = ["Harvest Gains"]
                     _sel_details = _selected_combo.get("_year_details", [])
                     if _sel_details:
                         with st.expander(f"Year-by-Year Detail: {_selected_combo_label}", expanded=True):
@@ -4365,9 +5250,10 @@ elif nav == "Achieving":
                             st.metric("After-Tax Estate", TEA.money(final_bc.get("Estate (Net)", 0)))
 
     # ════════════════════════════════════════════════════════════════
-    # TAB 5: Roth Conversion Opportunity
+    # TAB 5: Roth Conversion Opportunity (retired clients only)
     # ════════════════════════════════════════════════════════════════
-    with tab5:
+    if not _is_working:
+      with tab5:
         st.subheader("Roth Conversion Opportunity")
         st.write("Calculate how much you can convert to fill up to a target income level based on your current tax scenario.")
         # For pre-retirement users, fall back to base results; for retired, use Income Needs
@@ -4519,7 +5405,7 @@ elif nav == "Achieving":
                             _ret_yrs = max(_ret_yrs, spouse_plan_through_age - _spouse_ret_age)
                         _ei_params["years"] = _ret_yrs
                         _ei_params["start_year"] = current_year + years_to_ret
-                        _ei_params["spending_goal"] = D["living_expenses"] * (D["ret_pct"] / 100) * _inf_factor
+                        _ei_params["spending_goal"] = st.session_state.get("_fp_proj_spending", D["living_expenses"]) * (D["ret_pct"] / 100) * _inf_factor
                         _ei_params["current_age_filer"] = ret_age
                         _ei_params["current_age_spouse"] = (current_age_spouse + years_to_ret) if current_age_spouse else None
                         _ei_params["home_value"] = home_value * ((1 + home_appreciation) ** years_to_ret)
@@ -4745,3 +5631,11 @@ if _has_any_data:
     )
 else:
     st.caption("Run at least one analysis tab to generate a PDF report.")
+
+# ══════════════════════════════════════════════════════════════════════
+# DEFERRED SAVE — runs after all UI code has updated lists
+# ══════════════════════════════════════════════════════════════════════
+_pending = st.session_state.pop("_pending_save", None)
+if _pending:
+    _save_profile(_pending)
+    st.toast(f"Saved: {_pending}")
