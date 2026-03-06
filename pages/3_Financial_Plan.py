@@ -414,7 +414,7 @@ def _load_profile(name):
             _fi_item.setdefault("basis", 0.0)
         st.session_state.future_income = data["_future_income"]
     # Update cached widget keys to match loaded D values
-    _keep = {"_btn_load", "_sb_load_sel", "_btn_save"}
+    _keep = {"_btn_load", "_sb_load_sel", "_btn_save", "_sb_client_name", "fp_nav", "fp_data"}
     for wk in list(st.session_state.keys()):
         if wk.startswith("_w_"):
             _dkey = wk[3:]  # strip "_w_" prefix
@@ -424,8 +424,10 @@ def _load_profile(name):
                 del st.session_state[wk]
         elif wk.startswith("_sb_") and wk not in _keep:
             del st.session_state[wk]
-        elif wk.startswith("fp_rr_") or wk.startswith("fp_preret_"):
+        elif wk.startswith("fp_") and wk not in _keep:
             del st.session_state[wk]
+    # Delete sidebar client name key so widget re-initializes from D on next render
+    st.session_state.pop("_sb_client_name", None)
     # Sync working/retired radio (uses special key, not _w_is_working)
     st.session_state["_w_status_toggle"] = "Currently Working" if D["is_working"] else "Retired"
     # Set retirement readiness withdrawal order from D
@@ -580,7 +582,7 @@ def _load_tax_profile(name):
     D["curr_hsa"] = 0.0
 
     # Sync widget keys
-    _keep = {"_btn_load", "_sb_load_sel", "_btn_save"}
+    _keep = {"_btn_load", "_sb_load_sel", "_btn_save", "_sb_client_name", "fp_nav", "fp_data"}
     for wk in list(st.session_state.keys()):
         if wk.startswith("_w_"):
             _dkey = wk[3:]
@@ -590,8 +592,10 @@ def _load_tax_profile(name):
                 del st.session_state[wk]
         elif wk.startswith("_sb_") and wk not in _keep:
             del st.session_state[wk]
-        elif wk.startswith("fp_rr_") or wk.startswith("fp_preret_"):
+        elif wk.startswith("fp_") and wk not in _keep:
             del st.session_state[wk]
+    # Sync sidebar client name
+    st.session_state.pop("_sb_client_name", None)
     # Sync working/retired radio — tax profiles are always retired
     st.session_state["_w_status_toggle"] = "Retired"
     _so_keys = {"fp_rr_o1": "so1", "fp_rr_o2": "so2", "fp_rr_o3": "so3", "fp_rr_o4": "so4"}
@@ -615,30 +619,31 @@ if "_fp_v3_migrated" not in st.session_state:
 # ══════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════
+def _on_new_profile():
+    """on_click callback — runs before widgets render, so safe to modify keys."""
+    for k, v in _FP_DEFAULTS.items():
+        D[k] = v
+    st.session_state.additional_expenses = []
+    st.session_state.future_income = []
+    for ck in list(_COMP_DEFAULTS.keys()):
+        st.session_state[ck] = _COMP_DEFAULTS[ck]
+    for wk in list(st.session_state.keys()):
+        if wk.startswith(("_w_", "_sb_", "_ae_", "fp_ae_", "fp_rr_", "fp_preret_", "fp_opt_", "fp_")):
+            if wk not in {"_btn_save", "_btn_load", "_btn_new", "_sb_load_sel", "fp_nav", "fp_data"}:
+                del st.session_state[wk]
+    st.session_state["_fp_did_new"] = True
+
 with st.sidebar:
     st.subheader("Profile")
-    _pname = D.get("client_name", "").strip()
-    if _pname:
-        st.caption(f"**{_pname}**")
+    _pname = st.text_input("Client Name", value=D.get("client_name", ""),
+                           key="_sb_client_name", label_visibility="collapsed",
+                           placeholder="Client Name")
+    D["client_name"] = _pname
     c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("New", key="_btn_new"):
-            # Reset data dict to defaults
-            for k, v in _FP_DEFAULTS.items():
-                D[k] = v
-            # Clear user-entered lists
-            st.session_state.additional_expenses = []
-            st.session_state.future_income = []
-            # Clear computation state
-            for ck in list(_COMP_DEFAULTS.keys()):
-                st.session_state[ck] = _COMP_DEFAULTS[ck]
-            # Clear cached widget keys
-            for wk in list(st.session_state.keys()):
-                if wk.startswith(("_w_", "_sb_", "_ae_", "fp_ae_", "fp_rr_", "fp_preret_")):
-                    if wk not in {"_btn_save", "_btn_load", "_btn_new", "_sb_load_sel"}:
-                        del st.session_state[wk]
+        st.button("New", key="_btn_new", on_click=_on_new_profile)
+        if st.session_state.pop("_fp_did_new", False):
             st.toast("New profile started")
-            st.rerun()
     with c2:
         if st.button("Save", key="_btn_save") and _pname:
             st.session_state["_pending_save"] = _pname
@@ -2563,7 +2568,8 @@ if nav == "Planning":
     st.header("Planning")
     col1, col2 = st.columns(2)
     with col1:
-        w_text("Client Name", "client_name")
+        st.text_input("Client Name", value=_pname, disabled=True,
+                       help="Edit client name in the sidebar")
         w_select("Filing Status", ["Single", "Married Filing Jointly", "Head of Household"], "filing_status")
         w_num("Tax Year", "tax_year", min_value=2020, max_value=2100, step=1)
     with col2:
@@ -3273,10 +3279,13 @@ elif nav == "Receiving":
         st.session_state.future_income.pop(_fi_to_remove)
         st.rerun()
 
-    # --- RMD ---
+    # --- RMD / IRA Distributions ---
     st.divider()
-    w_check("Do you have an RMD? (e.g., inherited IRA)", "has_rmd")
-    if D["has_rmd"]:
+    _show_rmd = not D["is_working"]  # retired clients always see RMD section
+    if D["is_working"]:
+        w_check("Do you have an RMD? (e.g., inherited IRA)", "has_rmd")
+        _show_rmd = D["has_rmd"]
+    if _show_rmd:
         st.subheader("RMD Inputs")
         col1, col2 = st.columns(2)
         with col1:
@@ -3825,25 +3834,34 @@ elif nav == "Achieving":
         r_annuity = D["r_annuity"] / 100
         r_life = D["r_life"] / 100
 
-    # RMD
-    has_rmd = D["has_rmd"]
+    # RMD — retired clients always have RMD section; working clients need has_rmd checked
+    _is_working = D["is_working"]
+    has_rmd = D["has_rmd"] or not _is_working
     auto_rmd = D["auto_rmd"] and has_rmd
     pretax_balance_filer_prior = D["pretax_bal_filer_prior"] if has_rmd else 0.0
     pretax_balance_spouse_prior = (D["pretax_bal_spouse_prior"] if is_joint else 0.0) if has_rmd else 0.0
     baseline_pretax_distributions = D["baseline_pretax_dist"] if has_rmd else 0.0
     rmd_manual = D["rmd_manual"] if has_rmd else 0.0
 
-    # Spending
-    spending_goal = st.session_state.get("_fp_proj_spending", D["living_expenses"])
-    heir_tax_rate = D["heir_tax_rate"] / 100
-    spending_order = [D["so1"], D["so2"], D["so3"], D["so4"]]
-    surplus_dest_raw = D["surplus_dest"]
+    # Spending — pull from Tab 3 widget session state if set (persists across tab switches)
+    # fp_spending_goal stores living expenses only; add mortgage for engine
+    # _fp_proj_spending = inferred lifestyle spending (only meaningful for working clients)
+    _spending_fallback = (st.session_state.get("_fp_proj_spending", D["living_expenses"])
+                          if _is_working else D["living_expenses"])
+    spending_goal = st.session_state.get("fp_spending_goal", _spending_fallback)
+    spending_goal += float(mortgage_payment)  # mortgage doesn't inflate; engine splits it out
+    heir_tax_rate = st.session_state.get("fp_heir_tab3", D["heir_tax_rate"]) / 100
+    spending_order = [st.session_state.get("fp_so1", D["so1"]),
+                      st.session_state.get("fp_so2", D["so2"]),
+                      st.session_state.get("fp_so3", D["so3"]),
+                      st.session_state.get("fp_so4", D["so4"])]
+    surplus_dest_raw = st.session_state.get("fp_ret_surplus_dest", D["surplus_dest"])
     surplus_dest = surplus_dest_raw
     surplus_destination = "none" if surplus_dest_raw == "Don't Reinvest" else ("cash" if surplus_dest_raw == "Cash/Savings" else "brokerage")
 
     # Survivor
-    survivor_spending_pct = D["survivor_spend_pct"] if is_joint else 100
-    pension_survivor_pct = D["pension_survivor_pct"] if is_joint else 0
+    survivor_spending_pct = st.session_state.get("fp_survivor_spend_pct", D["survivor_spend_pct"]) if is_joint else 100
+    pension_survivor_pct = st.session_state.get("fp_pension_survivor_pct", D["pension_survivor_pct"]) if is_joint else 0
 
     # Plan-through ages
     filer_plan_through_age = int(D["filer_plan_age"])
@@ -3888,7 +3906,7 @@ elif nav == "Achieving":
     else:
         years = filer_plan_through_age - current_age_filer
     years = max(1, years)
-    start_year = max(current_year, int(tax_year))
+    start_year = st.session_state.get("fp_start_year", max(current_year, int(tax_year)))
 
     # Sync keys for PDF generation (use _fp_ prefix to avoid
     # colliding with page-2 widget-owned session-state keys)
@@ -4162,8 +4180,11 @@ elif nav == "Achieving":
         with tab2:
             st.subheader("Income Needs Analysis")
             if True:
-                net_needed = st.number_input("Net income needed", min_value=0.0, value=float(D["net_income_needed"]), step=1000.0, key="fp_net_needed")
+                net_needed = st.number_input("Net income needed (living expenses)", min_value=0.0, value=float(D["net_income_needed"]), step=1000.0, key="fp_net_needed")
                 D["net_income_needed"] = net_needed
+                _mtg_annual = float(mortgage_payment)
+                if _mtg_annual > 0:
+                    st.caption(f"Mortgage: {TEA.money(_mtg_annual)}/yr — added automatically → solve target {TEA.money(net_needed + _mtg_annual)}")
                 taxes_from_cash = st.checkbox("Pay taxes from cash (not from withdrawal)?", value=False, key="fp_taxes_from_cash")
                 _wd_sources = ["Taxable \u2013 Cash", "Taxable \u2013 Brokerage", "Pre-Tax \u2013 IRA/401k", "Annuity", "Roth", "Life Insurance (loan)"]
                 if is_joint:
@@ -4175,17 +4196,18 @@ elif nav == "Achieving":
                 if st.button("Calculate Income Needs", type="primary", key="fp_calc_needs"):
                     for _ae in st.session_state.additional_expenses:
                         _ae["calculated"] = False; _ae["tax_impact"] = None
+                    _solve_target = float(net_needed) + _mtg_annual
                     extra, base_case, solved, solved_assets, solved_inputs = TEA.solve_gross_up_with_assets(
                         st.session_state.base_inputs, st.session_state.assets, source,
-                        float(brokerage_gain_pct), float(net_needed), taxes_from_cash)
+                        float(brokerage_gain_pct), _solve_target, taxes_from_cash)
                     if extra is None:
-                        st.error(f"Insufficient assets in {source} ({TEA.money(avail)}) to meet the income need of {TEA.money(net_needed)}.")
+                        st.error(f"Insufficient assets in {source} ({TEA.money(avail)}) to meet the income need of {TEA.money(_solve_target)}.")
                     elif extra == 0.0:
-                        st.info(f"Your base income already meets or exceeds the {TEA.money(net_needed)} target \u2014 no additional withdrawal needed.")
+                        st.info(f"Your base income already meets or exceeds the {TEA.money(_solve_target)} target \u2014 no additional withdrawal needed.")
                         st.session_state.last_solved_results = base_case
                         st.session_state.last_solved_inputs = st.session_state.base_inputs
                         st.session_state.last_solved_assets = st.session_state.assets
-                        st.session_state.last_net_needed = net_needed
+                        st.session_state.last_net_needed = _solve_target
                         st.session_state.last_source = source
                         st.session_state.gross_from_needs = base_case["spendable_gross"]
                         st.session_state.last_withdrawal_proceeds = 0
@@ -4194,7 +4216,7 @@ elif nav == "Achieving":
                         st.session_state.last_solved_results = solved
                         st.session_state.last_solved_inputs = solved_inputs
                         st.session_state.last_solved_assets = solved_assets
-                        st.session_state.last_net_needed = net_needed
+                        st.session_state.last_net_needed = _solve_target
                         st.session_state.last_source = source
                         st.session_state.gross_from_needs = solved["spendable_gross"]
                         st.session_state.last_withdrawal_proceeds = extra
@@ -4411,10 +4433,15 @@ elif nav == "Achieving":
                 st.warning("Run Base Tax Estimator first.")
             else:
                 a0 = st.session_state.assets
+                _mtg_ann = float(mortgage_payment)
                 _default_spend = st.session_state.last_net_needed if st.session_state.last_net_needed else spending_goal
+                _default_living = max(0.0, _default_spend - _mtg_ann) if _mtg_ann > 0 else _default_spend
                 colL, colR = st.columns(2)
                 with colL:
-                    spending_goal = st.number_input("Annual Spending Goal (After-Tax)", value=_default_spend, step=5000.0, key="fp_spending_goal")
+                    _living_input = st.number_input("Annual Living Expenses (After-Tax)", value=_default_living, step=5000.0, key="fp_spending_goal")
+                    if _mtg_ann > 0:
+                        st.caption(f"+ Mortgage: {TEA.money(_mtg_ann)}/yr → Total spending: {TEA.money(_living_input + _mtg_ann)}")
+                    spending_goal = _living_input + _mtg_ann
                     if st.session_state.last_net_needed:
                         st.caption("(Pulled from Income Needs tab)")
                     heir_tax_rate = st.number_input("Heir Tax Rate (%)", value=D["heir_tax_rate"], step=1.0, key="fp_heir_tab3",
@@ -4860,7 +4887,8 @@ elif nav == "Achieving":
                 # ---- Controls ----
                 col1, col2 = st.columns(2)
                 with col1:
-                    opt_stop_age = st.number_input("Stop Conversions at Age", min_value=60, max_value=100, value=75, step=1, key="fp_opt_stop")
+                    _opt_stop_default = min(100, max(75, current_age_filer + 10))
+                    opt_stop_age = st.number_input("Stop Conversions at Age", min_value=60, max_value=100, value=_opt_stop_default, step=1, key="fp_opt_stop")
                     opt_conv_years = st.number_input("Max Years of Conversions", min_value=1, max_value=30, value=15, step=1, key="fp_opt_conv_years")
                 with col2:
                     st.markdown("**Common Thresholds**")
@@ -5416,6 +5444,8 @@ elif nav == "Achieving":
                         if _mtg_yrs_left <= 0:
                             _ei_params["mortgage_balance"] = 0.0
                             _ei_params["mortgage_payment"] = 0.0
+                        else:
+                            _ei_params["spending_goal"] += float(mortgage_payment)
                         # Scale investment income to projected brokerage size
                         _cur_brok = float(taxable_brokerage_bal)
                         _scale = _ret_brok / _cur_brok if _cur_brok > 0 and _ret_brok > 0 else 1.0
@@ -5637,5 +5667,8 @@ else:
 # ══════════════════════════════════════════════════════════════════════
 _pending = st.session_state.pop("_pending_save", None)
 if _pending:
-    _save_profile(_pending)
-    st.toast(f"Saved: {_pending}")
+    try:
+        _save_profile(_pending)
+        st.toast(f"Saved: {_pending}")
+    except Exception as _save_err:
+        st.error(f"Save failed: {_save_err}")

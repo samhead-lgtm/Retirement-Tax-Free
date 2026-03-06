@@ -724,6 +724,227 @@ def optimize_roth_conversions(balances_at_retire, base_params, spending_order,
     }
 
 
+# ── Unified Strategy Optimizer ──
+
+WATERFALL_VARIANTS = [
+    ("PreTax→Taxable→TF", ["Pre-Tax", "Taxable", "Tax-Free"]),
+    ("Taxable→PreTax→TF", ["Taxable", "Pre-Tax", "Tax-Free"]),
+    ("Taxable→TF→PreTax", ["Taxable", "Tax-Free", "Pre-Tax"]),
+]
+
+
+def _build_ss_variants(filer_age, spouse_age, retire_age, is_married, ssdi_f=False, ssdi_s=False):
+    """Build SS claiming age variants: {62, FRA(67), 70} per person, constrained by retire age."""
+    key_ages = [62, 67, 70]
+    filer_min = max(62, retire_age)
+    filer_ages = sorted(set(a for a in key_ages if a >= filer_min))
+    if not filer_ages:
+        filer_ages = [filer_min]
+    # SSDI: claim age is irrelevant (100% PIA), just use FRA placeholder
+    if ssdi_f:
+        filer_ages = [67]
+    if is_married and spouse_age is not None:
+        spouse_min = max(62, retire_age)
+        spouse_ages = sorted(set(a for a in key_ages if a >= spouse_min))
+        if not spouse_ages:
+            spouse_ages = [spouse_min]
+        if ssdi_s:
+            spouse_ages = [67]
+        variants = []
+        for fa in filer_ages:
+            for sa in spouse_ages:
+                label = f"SS {fa}/{sa}"
+                variants.append((label, fa, sa))
+        return variants
+    else:
+        return [(f"SS {fa}", fa, None) for fa in filer_ages]
+
+
+def _build_roth_variants(is_joint):
+    """Build Roth conversion variants for the unified optimizer."""
+    variants = [("No Conversion", "none", 0, 100)]
+    if is_joint:
+        variants.append(("Fill 22%", "fill_to_target", 238000, 85))
+        variants.append(("Fill 24%", "fill_to_target", 426000, 85))
+    else:
+        variants.append(("Fill 22%", "fill_to_target", 119000, 85))
+        variants.append(("Fill 24%", "fill_to_target", 213000, 85))
+    variants.append(("$50k/yr x 10yr", 50000, 0, None))  # stop_age filled at runtime
+    return variants
+
+
+def run_unified_optimizer(
+    current_age, years_to_ret, start_balances,
+    contrib_variants,     # [(label, contrib_dict, income_info), ...]
+    waterfall_variants,   # [(label, spending_order_list), ...]
+    ss_variants,          # [(label, filer_claim, spouse_claim), ...]
+    roth_variants,        # [(label, strategy, target_agi, stop_age_or_None), ...]
+    base_retire_params,   # from _build_retire_params()-like dict
+    salary_growth, pre_ret_return,
+    progress_callback=None,
+):
+    """Cross-product all 4 dimensions, run full accumulation → retirement for each combo.
+
+    Performance: caches accumulation by (contrib, roth) since waterfall/SS only affect retirement.
+
+    Returns dict with:
+        best_combo: {contrib, waterfall, ss, roth, estate, taxes}
+        best_detail: {accum_rows, retire_rows} for the winner
+        rankings: top combos sorted by estate
+        dimension_analysis: {dim_name: [(option, avg_estate), ...]}
+        total_combos: int
+    """
+    import copy
+
+    retire_age = base_retire_params.get("retire_age", 65)
+
+    # Phase 1: Accumulation cache — only contrib mix affects this (roth applied in retirement only)
+    accum_cache = {}  # (contrib_label, roth_label) -> (balances_dict, inherited_state, accum_rows)
+    total_accum = len(contrib_variants)
+    # Count valid combos (skip contradictory: Roth conversion + spend TF before PT)
+    n_compat_wf_conv = sum(1 for _, wo in waterfall_variants
+                           if wo.index("Tax-Free") > wo.index("Pre-Tax"))
+    n_all_wf = len(waterfall_variants)
+    n_roth_active = sum(1 for _, rs, _, _ in roth_variants if rs != "none")
+    n_roth_none = len(roth_variants) - n_roth_active
+    total_retire = len(contrib_variants) * len(ss_variants) * (
+        n_roth_none * n_all_wf + n_roth_active * n_compat_wf_conv)
+    total_steps = total_accum + total_retire
+    step = 0
+
+    # Roth conversions only affect retirement phase, not accumulation.
+    # Cache one accumulation per contribution variant (roth dim doesn't change accum).
+    _accum_by_contrib = {}
+    for c_label, c_dict, c_ii in contrib_variants:
+        ii = copy.deepcopy(c_ii)
+        accum = run_accumulation(current_age, years_to_ret,
+                                 copy.deepcopy(start_balances),
+                                 c_dict, salary_growth, pre_ret_return, ii)
+        ar = accum["rows"]
+        af = ar[-1] if ar else {}
+        bals = {
+            "pretax": float(af.get("Bal Pre-Tax", 0)),
+            "roth": float(af.get("Bal Roth", 0)),
+            "taxable": float(af.get("Bal Taxable", 0)),
+            "brokerage": float(accum.get("final_brokerage", af.get("Bal Taxable", 0))),
+            "cash": float(accum.get("final_cash", 0)),
+            "brokerage_basis": float(accum.get("final_basis", af.get("Bal Taxable", 0))),
+            "hsa": float(af.get("Bal HSA", 0)),
+        }
+        inh_state = accum.get("inherited_iras_state", [])
+        _accum_by_contrib[c_label] = (bals, inh_state, ar)
+        step += 1
+        if progress_callback:
+            progress_callback(step, total_steps, "Accumulation phase...")
+
+    # Expand accum cache: each (contrib, roth) points to same accum result
+    for c_label, c_dict, c_ii in contrib_variants:
+        for r_label, r_strategy, r_target, r_stop in roth_variants:
+            accum_cache[(c_label, r_label)] = _accum_by_contrib[c_label]
+
+    # Phase 2: Retirement cross-product
+    all_combos = []
+    for c_label, c_dict, c_ii in contrib_variants:
+        for r_label, r_strategy, r_target, r_stop in roth_variants:
+            bals, inh_state, accum_rows = accum_cache[(c_label, r_label)]
+            for w_label, w_order in waterfall_variants:
+                # Skip contradictory combos: don't spend Tax-Free before Pre-Tax
+                # while simultaneously converting Pre-Tax → Roth
+                if r_strategy != "none":
+                    tf_idx = w_order.index("Tax-Free") if "Tax-Free" in w_order else 99
+                    pt_idx = w_order.index("Pre-Tax") if "Pre-Tax" in w_order else 99
+                    if tf_idx < pt_idx:
+                        continue
+                for s_label, s_filer_claim, s_spouse_claim in ss_variants:
+                    params = copy.deepcopy(base_retire_params)
+                    # Apply roth conversion strategy to retirement phase
+                    if r_strategy != "none":
+                        params["roth_conversion_strategy"] = r_strategy
+                        params["roth_conversion_target_agi"] = r_target
+                        eff_stop = r_stop if r_stop is not None else (retire_age + 10)
+                        params["roth_conversion_stop_age"] = eff_stop
+                    # Apply SS claiming ages
+                    params["ss_filer_claim_age"] = s_filer_claim
+                    if s_spouse_claim is not None:
+                        params["ss_spouse_claim_age"] = s_spouse_claim
+                    # Apply inherited IRA state from accumulation
+                    params["inherited_iras"] = inh_state
+
+                    ret = run_retirement_projection(copy.deepcopy(bals), params, w_order)
+
+                    all_combos.append({
+                        "contrib": c_label,
+                        "waterfall": w_label,
+                        "ss": s_label,
+                        "roth": r_label,
+                        "estate": ret["estate"],
+                        "taxes": ret["total_taxes"],
+                        "final_total": ret["final_total"],
+                        "converted": ret.get("total_converted", 0),
+                        # Store keys for re-run
+                        "_c_label": c_label, "_r_label": r_label,
+                        "_w_order": w_order, "_s_fc": s_filer_claim, "_s_sc": s_spouse_claim,
+                        "_r_strategy": r_strategy, "_r_target": r_target, "_r_stop": r_stop,
+                    })
+                    step += 1
+                    if progress_callback:
+                        progress_callback(step, total_steps, f"Testing {c_label} / {w_label} / {s_label} / {r_label}")
+
+    all_combos.sort(key=lambda x: x["estate"], reverse=True)
+
+    # Dimension analysis: average estate per option within each dimension
+    def _dim_analysis(key):
+        from collections import defaultdict
+        sums = defaultdict(float)
+        counts = defaultdict(int)
+        for c in all_combos:
+            sums[c[key]] += c["estate"]
+            counts[c[key]] += 1
+        return sorted([(k, sums[k] / counts[k]) for k in sums], key=lambda x: x[1], reverse=True)
+
+    dimension_analysis = {
+        "Contribution Mix": _dim_analysis("contrib"),
+        "Withdrawal Order": _dim_analysis("waterfall"),
+        "SS Claiming": _dim_analysis("ss"),
+        "Roth Conversion": _dim_analysis("roth"),
+    }
+
+    # Re-run best combo for full detail
+    best = all_combos[0]
+    bals, inh_state, best_accum_rows = accum_cache[(best["_c_label"], best["_r_label"])]
+    params = copy.deepcopy(base_retire_params)
+    if best["_r_strategy"] != "none":
+        params["roth_conversion_strategy"] = best["_r_strategy"]
+        params["roth_conversion_target_agi"] = best["_r_target"]
+        eff_stop = best["_r_stop"] if best["_r_stop"] is not None else (retire_age + 10)
+        params["roth_conversion_stop_age"] = eff_stop
+    params["ss_filer_claim_age"] = best["_s_fc"]
+    if best["_s_sc"] is not None:
+        params["ss_spouse_claim_age"] = best["_s_sc"]
+    params["inherited_iras"] = inh_state
+    best_retire = run_retirement_projection(copy.deepcopy(bals), params, best["_w_order"])
+
+    return {
+        "best_combo": {
+            "contrib": best["contrib"],
+            "waterfall": best["waterfall"],
+            "ss": best["ss"],
+            "roth": best["roth"],
+            "estate": best["estate"],
+            "taxes": best["taxes"],
+            "final_total": best["final_total"],
+            "converted": best.get("converted", 0),
+        },
+        "best_detail": {
+            "accum_rows": best_accum_rows,
+            "retire_result": best_retire,
+        },
+        "rankings": all_combos[:50],  # top 50
+        "dimension_analysis": dimension_analysis,
+        "total_combos": len(all_combos),
+    }
+
+
 def run_monte_carlo(run_fn, n_sims=500, mean_return=0.07, return_std=0.12,
                     n_years=30, seed=None, mean_return_post=None, n_years_pre=0):
     """Run Monte Carlo simulation by randomizing year-by-year returns.
@@ -1877,7 +2098,7 @@ def run_retirement_projection(balances, params, spending_order):
 
 # ========== UI ==========
 st.title("Retirement Estimator – Accumulation Phase")
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Current Situation", "Savings Plan", "Projection", "Retirement Readiness", "Roth Conversion"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Current Situation", "Savings Plan", "Projection", "Retirement Readiness", "Roth Conversion", "Strategy Optimizer"])
 
 with st.sidebar:
     with st.expander("Save / Load Client Profile"):
@@ -3379,6 +3600,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
                 bal_brokerage *= (1 + yr_return - _div_drag)
                 bal_hsa *= (1 + yr_return)
             else:
+                yr_return = r_pretax  # use pretax rate as default for inherited IRAs
                 bal_pretax *= (1 + r_pretax)
                 bal_roth *= (1 + r_roth)
                 _div_drag = (div_yield + ann_cg_pct) if not reinvest_inv_income else 0.0
@@ -4532,3 +4754,235 @@ with tab5:
                                f"but MC median favors **{_mc5_mc_winner}**")
                 st.caption(f"Top {len(_mc5_top)} strategies tested with {int(_mc5_nsims)} simulations each, "
                            f"mean return {post_retire_return:.1%}, std dev {_mc5_std:.1%} (seed={_mc5_seed})")
+
+with tab6:
+    st.subheader("Unified Strategy Optimizer")
+    st.caption("Cross-products contribution mix, withdrawal order, SS claiming age, and Roth conversion strategies. "
+               "Runs full accumulation → retirement for each combo and ranks by after-tax estate.")
+
+    # Build contribution variants — same logic as Tab 3 Savings Vehicle Optimizer
+    _u6_tax_adv_pool = (contrib_401k_filer + contrib_401k_spouse +
+                         contrib_roth_ira + contrib_trad_ira +
+                         contrib_roth_ira_spouse + contrib_trad_ira_spouse +
+                         contrib_hsa)
+    _u6_emp_match = employer_match + (employer_match_spouse if is_joint else 0.0)
+
+    def _u6_build_contrib(favor_trad):
+        """Reallocate tax-advantaged pool to Traditional or Roth. Returns (contrib_dict, pretax_deductions)."""
+        rem = _u6_tax_adv_pool
+        pt = 0.0; ro = 0.0; hs = 0.0
+
+        # 1. 401(k) to employer match — filer
+        mc_f = min(salary_filer * employer_match_upto / 100, limit_401k, rem) if salary_filer > 0 else 0.0
+        if mc_f > 0:
+            if favor_trad: pt += mc_f
+            else: ro += mc_f
+            rem -= mc_f
+
+        # 1b. 401(k) to employer match — spouse
+        mc_s = 0.0
+        if is_joint and salary_spouse > 0 and employer_match_upto_spouse > 0:
+            mc_s = min(salary_spouse * employer_match_upto_spouse / 100, limit_401k_spouse, rem)
+            if mc_s > 0:
+                if favor_trad: pt += mc_s
+                else: ro += mc_s
+                rem -= mc_s
+
+        # 2. HSA to max
+        if hsa_limit > 0:
+            h = min(hsa_limit, rem)
+            hs += h; rem -= h
+
+        # 3. Roth IRA — filer
+        rl = effective_roth_limit
+        if backdoor_roth: rl = base_ira
+        elif roth_ira_limit < base_ira and backdoor_eligible: rl = base_ira
+        ri = min(rl, rem)
+        if rl > 0:
+            ro += ri; rem -= ri
+
+        # 3b. Roth IRA — spouse
+        if is_joint and salary_spouse > 0 and (roth_ira_limit_spouse > 0 or backdoor_roth_spouse):
+            sl = effective_roth_limit_spouse
+            if backdoor_roth_spouse: sl = base_ira_spouse
+            rs = min(sl, rem)
+            if sl > 0:
+                ro += rs; rem -= rs
+
+        # 4. 401(k) beyond match — filer
+        ab_f = max(0, limit_401k - mc_f) if salary_filer > 0 else 0
+        ex_f = min(ab_f, rem)
+        if ex_f > 0:
+            if favor_trad: pt += ex_f
+            else: ro += ex_f
+            rem -= ex_f
+
+        # 4b. 401(k) beyond match — spouse
+        if is_joint and salary_spouse > 0:
+            ab_s = max(0, limit_401k_spouse - mc_s)
+            ex_s = min(ab_s, rem)
+            if ex_s > 0:
+                if favor_trad: pt += ex_s
+                else: ro += ex_s
+                rem -= ex_s
+
+        spillover = max(0, rem)
+        pt += _u6_emp_match
+        contrib = {"pretax": pt, "roth": ro, "taxable": contrib_taxable + spillover, "hsa": hs}
+        emp_pretax_ded = (pt - _u6_emp_match) + hs
+        return contrib, emp_pretax_ded
+
+    _u6_cd_trad, _u6_ded_trad = _u6_build_contrib(True)
+    _u6_cd_roth, _u6_ded_roth = _u6_build_contrib(False)
+
+    _u6_ii_curr = dict(_income_info)
+    _u6_ii_trad = dict(_income_info); _u6_ii_trad["pretax_deductions"] = _u6_ded_trad
+    _u6_ii_roth = dict(_income_info); _u6_ii_roth["pretax_deductions"] = _u6_ded_roth
+
+    _u6_contrib_variants = [
+        ("Current", _contrib_dict, _u6_ii_curr),
+        ("Trad-Heavy", _u6_cd_trad, _u6_ii_trad),
+        ("Roth-Heavy", _u6_cd_roth, _u6_ii_roth),
+    ]
+
+    # SS variants
+    _u6_ss_variants = _build_ss_variants(
+        current_age, spouse_age, target_retirement_age, is_joint,
+        ssdi_filer, ssdi_spouse)
+
+    # Roth variants
+    _u6_roth_variants = _build_roth_variants(is_joint)
+    # Fill in stop_age for fixed-amount variant
+    _u6_roth_variants = [(lbl, strat, tgt, (target_retirement_age + 10) if stop is None else stop)
+                          for lbl, strat, tgt, stop in _u6_roth_variants]
+
+    # Show dimension summary
+    _u6_n_combos = len(_u6_contrib_variants) * len(WATERFALL_VARIANTS) * len(_u6_ss_variants) * len(_u6_roth_variants)
+    _u6_n_accum = len(_u6_contrib_variants)
+    st.markdown(f"**Dimensions:** {len(_u6_contrib_variants)} contrib × {len(WATERFALL_VARIANTS)} waterfall × "
+                f"{len(_u6_ss_variants)} SS × {len(_u6_roth_variants)} Roth = **{_u6_n_combos} combos** "
+                f"({_u6_n_accum} accumulation runs, {_u6_n_combos} retirement projections)")
+
+    if st.button("Run Unified Optimizer", type="primary", key="run_unified_opt"):
+        _u6_progress = st.progress(0, text="Starting optimizer...")
+
+        def _u6_progress_cb(step, total, msg):
+            pct = min(100, int(step / total * 100))
+            _u6_progress.progress(pct, text=msg)
+
+        _u6_base_params = _build_retire_params()
+
+        _u6_result = run_unified_optimizer(
+            current_age=current_age,
+            years_to_ret=years_to_retirement,
+            start_balances=_start_balances,
+            contrib_variants=_u6_contrib_variants,
+            waterfall_variants=WATERFALL_VARIANTS,
+            ss_variants=_u6_ss_variants,
+            roth_variants=_u6_roth_variants,
+            base_retire_params=_u6_base_params,
+            salary_growth=salary_growth,
+            pre_ret_return=pre_retire_return,
+            progress_callback=_u6_progress_cb,
+        )
+        _u6_progress.progress(100, text="Complete!")
+        _u6_progress.empty()
+
+        _u6_best = _u6_result["best_combo"]
+        _u6_detail = _u6_result["best_detail"]
+
+        # ── Winner Summary ──
+        st.markdown("### Winning Strategy")
+        _u6w1, _u6w2, _u6w3, _u6w4 = st.columns(4)
+        with _u6w1: st.metric("Contribution Mix", _u6_best["contrib"])
+        with _u6w2: st.metric("Withdrawal Order", _u6_best["waterfall"])
+        with _u6w3: st.metric("SS Claiming", _u6_best["ss"])
+        with _u6w4: st.metric("Roth Conversion", _u6_best["roth"])
+
+        _u6e1, _u6e2, _u6e3, _u6e4 = st.columns(4)
+        with _u6e1: st.metric("After-Tax Estate", money(_u6_best["estate"]))
+        with _u6e2: st.metric("Total Taxes", money(_u6_best["taxes"]))
+        with _u6e3: st.metric("Roth Converted", money(_u6_best["converted"]))
+        with _u6e4: st.metric("Combos Tested", f"{_u6_result['total_combos']:,}")
+
+        # Compare to current plan — find the combo that matches current settings
+        _u6_current_combo = next(
+            (c for c in _u6_result["rankings"]
+             if c["contrib"] == "Current"
+             and c["waterfall"] == WATERFALL_VARIANTS[0][0]
+             and c["roth"] == "No Conversion"
+             and c["ss"] == _u6_ss_variants[0][0]),
+            None)
+        if _u6_current_combo:
+            _u6_delta = _u6_best["estate"] - _u6_current_combo["estate"]
+            if _u6_delta > 0:
+                st.success(f"**Improvement over current plan: {money(_u6_delta)}** in after-tax estate")
+            elif _u6_delta == 0:
+                st.success("**Your current strategy is already optimal** across all tested combinations")
+            else:
+                st.info(f"Current plan is within {money(abs(_u6_delta))} of the best combination found")
+
+        # ── Dimension Impact Analysis ──
+        st.divider()
+        st.markdown("### Dimension Impact Analysis")
+        st.caption("Average estate per option within each dimension — shows which decisions matter most.")
+
+        _u6_dim = _u6_result["dimension_analysis"]
+        _u6_spreads = {}
+        for dim_name, options in _u6_dim.items():
+            if len(options) > 1:
+                spread = options[0][1] - options[-1][1]
+                _u6_spreads[dim_name] = spread
+
+        # Show which dimension matters most
+        if _u6_spreads:
+            _u6_most_impactful = max(_u6_spreads, key=_u6_spreads.get)
+            st.info(f"**Most impactful dimension: {_u6_most_impactful}** (spread: {money(_u6_spreads[_u6_most_impactful])})")
+
+        for dim_name, options in _u6_dim.items():
+            spread = _u6_spreads.get(dim_name, 0)
+            with st.expander(f"{dim_name} — spread: {money(spread)}", expanded=True):
+                _dim_df = pd.DataFrame([
+                    {"Option": opt, "Avg Estate": money(avg), "vs Best": money(avg - options[0][1])}
+                    for opt, avg in options
+                ])
+                st.dataframe(_dim_df, use_container_width=True, hide_index=True)
+
+        # ── Top Combos Table ──
+        st.divider()
+        st.markdown("### Top Combinations")
+        _u6_top = _u6_result["rankings"][:20]
+        _u6_top_df = pd.DataFrame([
+            {
+                "Rank": i + 1,
+                "Contribution": c["contrib"],
+                "Waterfall": c["waterfall"],
+                "SS Claiming": c["ss"],
+                "Roth Conv": c["roth"],
+                "Estate": money(c["estate"]),
+                "Taxes": money(c["taxes"]),
+                "Portfolio": money(c["final_total"]),
+            }
+            for i, c in enumerate(_u6_top)
+        ])
+        st.dataframe(_u6_top_df, use_container_width=True, hide_index=True)
+
+        # ── Detail for Best Combo ──
+        st.divider()
+        st.markdown("### Best Combo — Year-by-Year Detail")
+        with st.expander("Accumulation Phase"):
+            if _u6_detail["accum_rows"]:
+                st.dataframe(pd.DataFrame(_u6_detail["accum_rows"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("No accumulation rows (already at retirement)")
+
+        with st.expander("Retirement Phase"):
+            _u6_ret = _u6_detail["retire_result"]
+            if _u6_ret.get("rows"):
+                st.dataframe(pd.DataFrame(_u6_ret["rows"]), use_container_width=True, hide_index=True)
+                _u6_last = _u6_ret["rows"][-1]
+                _u6r1, _u6r2, _u6r3, _u6r4 = st.columns(4)
+                with _u6r1: st.metric("Final Portfolio", money(_u6_ret["final_total"]))
+                with _u6r2: st.metric("Final Estate", money(_u6_ret["estate"]))
+                with _u6r3: st.metric("Total Taxes", money(_u6_ret["total_taxes"]))
+                with _u6r4: st.metric("Roth Converted", money(_u6_ret.get("total_converted", 0)))

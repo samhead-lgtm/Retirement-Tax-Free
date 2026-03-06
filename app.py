@@ -1,7 +1,5 @@
 import streamlit as st
 
-st.set_page_config(page_title="RTF Financial Planning", layout="wide")
-
 # Password gate — only enforced when APP_PASSWORD is set (Streamlit Cloud)
 def check_password():
     try:

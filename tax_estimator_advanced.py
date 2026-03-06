@@ -1244,7 +1244,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
         balances: dict with keys cash, brokerage, pretax, roth, life,
                   annuity_value, annuity_basis, dyn_gain_pct
         base_year_inp: Base tax input dict (taxable_ira set to conversion only,
-                       cap_gain_loss set to investment income only, other_income=0)
+                       cap_gain_loss set to investment income only)
         p_base_cap_gain: Base capital gains from investment income
         inf_factor: Inflation factor for this year
         conversion_this_year: Roth conversion amount this year
@@ -1261,17 +1261,15 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
         inp = dict(base_year_inp)
         inp["taxable_ira"] = wd_pt + conversion_this_year
         inp["cap_gain_loss"] = p_base_cap_gain + cg
-        inp["other_income"] = ag
+        inp["other_income"] = inp["other_income"] + ag  # add annuity gains to existing other_income
         return inp
 
     def _tax_total(res):
         return res["total_tax"] + res["medicare_premiums"]
 
     def _probe_cost(res):
-        """Cost metric for source comparison.  Excludes Medicare when heir
-        arbitrage active so IRMAA cliffs don't cause year-to-year oscillation."""
-        if heir_tax_rate > 0:
-            return res["total_tax"]
+        """Cost metric for source comparison.  Always includes Medicare so
+        IRMAA bracket jumps are reflected in withdrawal source decisions."""
         return res["total_tax"] + res["medicare_premiums"]
 
     ann_total_gains = max(0.0, balances["annuity_value"] - balances["annuity_basis"])
@@ -1699,6 +1697,30 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     if adaptive_strategy and adaptive_strategy in ADAPTIVE_STRATEGIES:
         _adaptive_phases = ADAPTIVE_STRATEGIES[adaptive_strategy]["phases"]
 
+    # Adjust adaptive phase boundaries for clients already past the conversion age.
+    # E.g., Roth Sprint has until_age:73 / from_age:73.  For an 85-year-old, the
+    # conversion phase never fires.  Shift boundaries so the client gets some
+    # conversion years (half remaining projection, capped at 15).
+    _using_builtin_conv = False  # True when adaptive built-in conversions are active
+    if _adaptive_phases:
+        _first_conv_until = None
+        for _p in _adaptive_phases:
+            _cs = _p.get("conversion_strategy", "none")
+            if _cs not in ("none", 0, 0.0):
+                _first_conv_until = _p.get("until_age", 999)
+                break
+        if _first_conv_until is not None and _first_conv_until < 999 and current_age_filer >= _first_conv_until:
+            _new_until = current_age_filer + min(15, max(1, years // 2))
+            _shift = _new_until - _first_conv_until
+            _adaptive_phases = [dict(p) for p in _adaptive_phases]
+            for _p in _adaptive_phases:
+                if "until_age" in _p and _p["until_age"] < 999:
+                    _p["until_age"] += _shift
+                if "from_age" in _p and _p["from_age"] > 0:
+                    _p["from_age"] += _shift
+        # Detect whether adaptive built-in conversions are in play (no caller override)
+        _using_builtin_conv = (conversion_strategy == "none" or conversion_strategy == 0 or conversion_strategy == 0.0)
+
     for i in range(years):
         yr = start_year + i
         age_f = current_age_filer + i
@@ -1897,7 +1919,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         # Roth conversion (after RMD, before waterfall)
         conversion_this_year = 0.0
         _do_conv = (_yr_conv_strat != "none" and _yr_conv_strat != 0 and _yr_conv_strat != 0.0) if _adaptive_phases else do_conversions
-        if _do_conv and (i < conversion_years_limit or _adaptive_phases) and age_f < stop_conversion_age:
+        # For adaptive built-in conversions, the phase boundary controls the age cutoff
+        # (stop_conversion_age only applies to caller-override conversions)
+        _conv_age_ok = True if (_adaptive_phases and _using_builtin_conv) else (age_f < stop_conversion_age)
+        if _do_conv and (i < conversion_years_limit or _adaptive_phases) and _conv_age_ok:
             # Subtract QCD reserve — conversions don't deplete total wealth but they
             # DO deplete the pre-tax IRA, which is the only source for future QCDs.
             avail_pretax = max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve)
