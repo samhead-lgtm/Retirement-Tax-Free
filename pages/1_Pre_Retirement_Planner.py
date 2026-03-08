@@ -4224,6 +4224,7 @@ with tab3:
                            f"but MC median favors **{_mc3o_mc_winner}**")
             st.caption(f"All scenarios use the same {int(_mc3_nsims)} return sequences for fair comparison (seed={_mc3_seed})")
 
+
 with tab4:
     st.subheader("Retirement Readiness Analysis")
 

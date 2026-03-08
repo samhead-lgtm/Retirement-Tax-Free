@@ -2289,9 +2289,604 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, tab6, D, is_joint, filing_status,
             with _omc4: st.metric("90th Pctile", _mfmt_opt(_opt_mc.get("portfolio_p90", 0)))
             st.caption("Monte Carlo portfolio at end of plan (excludes home equity)")
 
+            if _opt_mc["success_rate"] < 0.75:
+                st.warning(
+                    "Changing your savings allocation alone does not reach 75% success. "
+                    "Run the **Retirement Readiness Optimizer** below to find what combination "
+                    "of delaying retirement, reducing spending, or saving more can get you there."
+                )
+
             # Store for persistence
             st.session_state._preret_opt = opt_results
             st.session_state._preret_opt_mc = _opt_mc
+
+        # ── Retirement Readiness Optimizer ──
+        st.divider()
+        st.markdown("### Retirement Readiness Optimizer")
+        st.caption("Finds what changes get you to 75% Monte Carlo success — or how much slack you have above it.")
+
+        if st.button("Run Readiness Optimizer", type="primary", key="fp_run_readiness"):
+            _rr_target = 0.75
+            _rr_scan_sims = 200
+            _rr_valid_sims = int(mc_sims)
+            _rr_seed = 42
+            _rr_curr_pct = D["ret_pct"]
+            _rr_spend_order = [D["so1"], D["so2"], D["so3"], D["so4"]]
+
+            # Compute workplace plan limits for savings allocation
+            if _plan_f == "401(k)":
+                _rr_wp_limit_f = _401k_limit + (_401k_catch_up if filer_50_plus else 0)
+            elif _plan_f == "SEP-IRA":
+                _rr_wp_limit_f = min(salary_filer * 0.25, _sep_max_cap)
+            elif _plan_f == "SIMPLE":
+                _rr_wp_limit_f = _simple_limit + (_simple_catch_up if filer_50_plus else 0)
+            else:
+                _rr_wp_limit_f = 0
+
+            if is_joint and salary_spouse > 0:
+                _rr_plan_s = D["plan_type_s"]
+                if _rr_plan_s == "401(k)":
+                    _rr_wp_limit_s = _401k_limit + (_401k_catch_up if spouse_50_plus else 0)
+                elif _rr_plan_s == "SEP-IRA":
+                    _rr_wp_limit_s = min(salary_spouse * 0.25, _sep_max_cap)
+                elif _rr_plan_s == "SIMPLE":
+                    _rr_wp_limit_s = _simple_limit + (_simple_catch_up if spouse_50_plus else 0)
+                else:
+                    _rr_wp_limit_s = 0
+            else:
+                _rr_wp_limit_s = 0
+
+            # Helper: allocate additional monthly savings
+            def _rr_allocate_savings(additional_monthly):
+                """Smart waterfall: fill tax-advantaged first, spill to taxable."""
+                extra_annual = additional_monthly * 12
+                breakdown = []
+                cd = dict(contrib_dict)
+                rem = extra_annual
+
+                # 1. Fill workplace plan — filer (as pretax)
+                room_f = max(0, _rr_wp_limit_f - contrib_401k_filer)
+                if room_f > 0 and rem > 0:
+                    add = min(room_f, rem)
+                    cd["pretax"] += add
+                    cd["pretax_filer"] = cd.get("pretax_filer", 0) + add
+                    rem -= add
+                    breakdown.append({"Vehicle": f"{_plan_f} (You)", "Additional": add,
+                                      "New Total": contrib_401k_filer + add})
+
+                # 2. Fill workplace plan — spouse (as pretax)
+                if is_joint and salary_spouse > 0 and _rr_wp_limit_s > 0:
+                    _sp_401k = contrib_401k_pretax_spouse + contrib_401k_roth_spouse
+                    room_s = max(0, _rr_wp_limit_s - _sp_401k)
+                    if room_s > 0 and rem > 0:
+                        add = min(room_s, rem)
+                        cd["pretax"] += add
+                        cd["pretax_spouse"] = cd.get("pretax_spouse", 0) + add
+                        rem -= add
+                        breakdown.append({"Vehicle": f"{D['plan_type_s']} (Spouse)", "Additional": add,
+                                          "New Total": _sp_401k + add})
+
+                # 3. Fill Roth IRA — filer
+                room_ira_f = max(0, ira_max_f - contrib_trad_ira - contrib_roth_ira)
+                if room_ira_f > 0 and rem > 0:
+                    add = min(room_ira_f, rem)
+                    cd["roth"] += add
+                    cd["roth_filer"] = cd.get("roth_filer", 0) + add
+                    rem -= add
+                    breakdown.append({"Vehicle": "Roth IRA (You)", "Additional": add,
+                                      "New Total": contrib_roth_ira + add})
+
+                # 4. Fill Roth IRA — spouse
+                if is_joint and salary_spouse > 0:
+                    room_ira_s = max(0, ira_max_s - contrib_trad_ira_spouse - contrib_roth_ira_spouse)
+                    if room_ira_s > 0 and rem > 0:
+                        add = min(room_ira_s, rem)
+                        cd["roth"] += add
+                        cd["roth_spouse"] = cd.get("roth_spouse", 0) + add
+                        rem -= add
+                        breakdown.append({"Vehicle": "Roth IRA (Spouse)", "Additional": add,
+                                          "New Total": contrib_roth_ira_spouse + add})
+
+                # 5. Fill HSA
+                if D["hsa_eligible"]:
+                    room_hsa = max(0, hsa_max - contrib_hsa)
+                    if room_hsa > 0 and rem > 0:
+                        add = min(room_hsa, rem)
+                        cd["hsa"] += add
+                        rem -= add
+                        breakdown.append({"Vehicle": "HSA", "Additional": add,
+                                          "New Total": contrib_hsa + add})
+
+                # 6. Remainder → taxable
+                if rem > 0:
+                    cd["taxable"] += rem
+                    breakdown.append({"Vehicle": "Taxable (spillover)", "Additional": rem,
+                                      "New Total": contrib_taxable + rem})
+
+                return cd, breakdown
+
+            # Closure factory for MC runs with overrides
+            def _rr_make_run_fn(retirement_age_override=None,
+                                spending_pct_override=None,
+                                additional_monthly_savings=0.0):
+                """Build MC closure with overrides. Returns (run_fn, n_years, ytr)."""
+                ra = retirement_age_override if retirement_age_override is not None else ret_age
+                ytr = max(1, ra - current_age_filer)
+                sp = spending_pct_override if spending_pct_override is not None else _rr_curr_pct
+                inf_factor = (1 + inflation) ** ytr
+                exp_at_ret = _proj_spending * (sp / 100) * inf_factor
+
+                if additional_monthly_savings > 0:
+                    cd_mod, _ = _rr_allocate_savings(additional_monthly_savings)
+                elif additional_monthly_savings < 0:
+                    cd_mod = dict(contrib_dict)
+                    cut = abs(additional_monthly_savings) * 12
+                    for key in ["taxable", "hsa", "roth", "pretax"]:
+                        if cut <= 0: break
+                        avail = cd_mod[key]
+                        take = min(cut, avail)
+                        cd_mod[key] -= take
+                        cut -= take
+                else:
+                    cd_mod = contrib_dict
+
+                _spouse_at_ret = (current_age_spouse + ytr) if current_age_spouse else None
+                _ret_yrs_f = filer_plan_through_age - ra
+                _ret_yrs_s = (spouse_plan_through_age - _spouse_at_ret) if (_spouse_at_ret and spouse_plan_through_age) else 0
+                _ret_years = max(1, max(_ret_yrs_f, _ret_yrs_s) + 1)
+                n_years = ytr + 1 + max(1, _ret_years)
+
+                def _run_fn(return_seq):
+                    _ii = dict(income_info)
+                    _ii["return_sequence"] = return_seq[:ytr + 1]
+                    _acc = engine.run_accumulation(
+                        current_age_filer, ytr, copy.deepcopy(start_balances),
+                        dict(cd_mod), salary_growth, pre_ret_return, _ii)
+                    _final = _acc["rows"][-1] if _acc["rows"] else {}
+                    _mc_brok = _acc.get("final_brokerage", _final.get("Bal Taxable", 0))
+                    _mc_cash = _acc.get("final_cash", 0)
+                    if _ire_liq_equity > 0:
+                        _mc_brok += _ire_liq_equity
+                    _bals = {
+                        "pretax": _final.get("Bal Pre-Tax", 0),
+                        "roth": _final.get("Bal Roth", 0),
+                        "brokerage": _mc_brok, "cash": _mc_cash,
+                        "taxable": _mc_brok + _mc_cash,
+                        "brokerage_basis": _acc.get("final_basis", 0) + _ire_liq_equity,
+                        "hsa": _final.get("Bal HSA", 0),
+                    }
+                    _rp = _build_retire_params(_acc)
+                    _rp["retire_age"] = ra
+                    _rp["retire_year"] = current_year + ytr
+                    _rp["expenses_at_retirement"] = exp_at_ret
+                    _rp["post_retire_return"] = mc_post_ret
+                    _rp["heir_bracket_option"] = "same"
+                    _rp["spouse_age_at_retire"] = _spouse_at_ret
+                    _rp["mortgage_years_at_retire"] = max(0, mtg_years - ytr)
+                    _rp["home_value_at_retire"] = home_value * ((1 + home_appreciation) ** ytr)
+                    _pen_f_cola = D["pension_cola_filer"] / 100
+                    _pen_s_cola = D["pension_cola_spouse"] / 100
+                    _rp["pension_filer_at_retire"] = pension_filer * ((1 + _pen_f_cola) ** ytr) if pension_filer > 0 else 0.0
+                    _rp["pension_spouse_at_retire"] = pension_spouse * ((1 + _pen_s_cola) ** ytr) if pension_spouse > 0 else 0.0
+                    if filer_ss_already and filer_ss_current > 0:
+                        _rp["ss_filer_fra"] = filer_ss_current * inf_factor
+                    else:
+                        _rp["ss_filer_fra"] = ss_filer_pia * inf_factor
+                    if is_joint and spouse_ss_already and spouse_ss_current > 0:
+                        _rp["ss_spouse_fra"] = spouse_ss_current * inf_factor
+                    else:
+                        _rp["ss_spouse_fra"] = ss_spouse_pia * inf_factor
+                    _oi_start_val = int(D["other_income_start_age"]) if int(D["other_income_start_age"]) > 0 else current_age_filer
+                    _oi_end_val = int(D["other_income_end_age"])
+                    if _oi_end_val > 0 and _oi_end_val <= ra:
+                        _rp["other_income"] = 0.0
+                    else:
+                        _oi_base = D["other_income"] * (inf_factor if D["other_income_inflate"] else 1.0)
+                        _rp["other_income"] = _oi_base + (_ire_keep_income if not inv_re_properties else 0.0)
+                    _rp["other_income_start_year"] = max(0, _oi_start_val - ra) if _oi_start_val > ra else 0
+                    _rp["other_income_years"] = (_oi_end_val - max(_oi_start_val, ra)) if (_oi_end_val > 0 and _oi_end_val > ra) else 0
+                    _ret_seq = return_seq[ytr + 1:] if len(return_seq) > ytr + 1 else None
+                    if _ret_seq and len(_ret_seq) >= _ret_years:
+                        _rp["return_sequence"] = _ret_seq
+                    result = engine.run_retirement_projection(_bals, _rp, _rr_spend_order)
+                    return {"estate": result["estate"], "final_total": result["final_total"],
+                            "retire_portfolio": _final.get("Portfolio", 0)}
+
+                return _run_fn, n_years, ytr
+
+            # Binary search helper
+            def _rr_binary_search(make_fn, lo, hi, step, target=0.75,
+                                  n_sims=200, seed=42, minimize=True):
+                """Find param value crossing target success rate."""
+                values = []
+                v = lo
+                while v <= hi + step * 0.01:
+                    values.append(round(v, 2))
+                    v += step
+                if not values:
+                    return {"found": False, "value": None, "success_rate": 0, "median_estate": 0}
+
+                # Test feasibility boundary
+                boundary_idx = -1 if minimize else 0
+                fn, ny, ytr = make_fn(values[boundary_idx])
+                mc = engine.run_monte_carlo(fn, n_sims=n_sims, mean_return=pre_ret_return,
+                                            return_std=mc_vol, n_years=ny, seed=seed,
+                                            mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                if mc["success_rate"] < target:
+                    return {"found": False, "value": values[boundary_idx],
+                            "success_rate": mc["success_rate"], "median_estate": mc["median_estate"]}
+
+                # Test if already solved at starting point
+                start_idx = 0 if minimize else -1
+                fn, ny, ytr = make_fn(values[start_idx])
+                mc = engine.run_monte_carlo(fn, n_sims=n_sims, mean_return=pre_ret_return,
+                                            return_std=mc_vol, n_years=ny, seed=seed,
+                                            mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                if mc["success_rate"] >= target:
+                    return {"found": True, "value": values[start_idx],
+                            "success_rate": mc["success_rate"], "median_estate": mc["median_estate"]}
+
+                # Binary search
+                lo_idx, hi_idx = 0, len(values) - 1
+                best = {"found": False, "value": None, "success_rate": 0, "median_estate": 0}
+                while lo_idx <= hi_idx:
+                    mid_idx = (lo_idx + hi_idx) // 2
+                    fn, ny, ytr = make_fn(values[mid_idx])
+                    mc = engine.run_monte_carlo(fn, n_sims=n_sims, mean_return=pre_ret_return,
+                                                return_std=mc_vol, n_years=ny, seed=seed,
+                                                mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                    sr = mc["success_rate"]
+                    if minimize:
+                        if sr >= target:
+                            best = {"found": True, "value": values[mid_idx],
+                                    "success_rate": sr, "median_estate": mc["median_estate"]}
+                            hi_idx = mid_idx - 1
+                        else:
+                            lo_idx = mid_idx + 1
+                    else:
+                        if sr >= target:
+                            best = {"found": True, "value": values[mid_idx],
+                                    "success_rate": sr, "median_estate": mc["median_estate"]}
+                            lo_idx = mid_idx + 1
+                        else:
+                            hi_idx = mid_idx - 1
+
+                return best
+
+            # ── Run baseline MC ──
+            _rr_progress = st.progress(0, text="Running baseline Monte Carlo...")
+            _rr_base_fn, _rr_base_ny, _rr_base_ytr = _rr_make_run_fn()
+            _rr_baseline_mc = engine.run_monte_carlo(
+                _rr_base_fn, n_sims=_rr_valid_sims, mean_return=pre_ret_return,
+                return_std=mc_vol, n_years=_rr_base_ny, seed=_rr_seed,
+                mean_return_post=mc_post_ret, n_years_pre=_rr_base_ytr + 1)
+            _rr_baseline_sr = _rr_baseline_mc["success_rate"]
+
+            _rr_c1, _rr_c2 = st.columns(2)
+            with _rr_c1: st.metric("Current Success Rate", f"{_rr_baseline_sr:.0%}")
+            with _rr_c2: st.metric("Target", f"{_rr_target:.0%}")
+
+            _rr_below = _rr_baseline_sr < _rr_target
+
+            if _rr_below:
+                # ══ BELOW TARGET: find what fixes it ══
+                _rr_results = {}
+
+                # Lever 1: Delay retirement
+                if ret_age < 75:
+                    _rr_progress.progress(5, text="Searching: delay retirement...")
+                    _rr_results["age"] = _rr_binary_search(
+                        lambda age: _rr_make_run_fn(retirement_age_override=age),
+                        ret_age, 75, 1, target=_rr_target, n_sims=_rr_scan_sims,
+                        seed=_rr_seed, minimize=True)
+                else:
+                    _rr_results["age"] = {"found": False, "value": 75, "success_rate": 0, "median_estate": 0}
+
+                # Lever 2: Reduce spending (0.5% steps for finer resolution)
+                _rr_progress.progress(20, text="Searching: reduce spending...")
+                _rr_results["spend"] = _rr_binary_search(
+                    lambda pct: _rr_make_run_fn(spending_pct_override=pct),
+                    60, _rr_curr_pct, 0.5, target=_rr_target, n_sims=_rr_scan_sims,
+                    seed=_rr_seed, minimize=False)
+
+                # Lever 3: Save more
+                _rr_progress.progress(40, text="Searching: increase savings...")
+                _rr_results["save"] = _rr_binary_search(
+                    lambda amt: _rr_make_run_fn(additional_monthly_savings=amt),
+                    0, 5000, 100, target=_rr_target, n_sims=_rr_scan_sims,
+                    seed=_rr_seed, minimize=True)
+
+                # Validate winners with full sims — refine if overshooting
+                _rr_progress.progress(55, text="Validating with full simulations...")
+                _rr_validated = {}
+
+                def _rr_run_full(make_kw):
+                    """Run full-sim MC for a single set of overrides."""
+                    fn, ny, ytr = _rr_make_run_fn(**make_kw)
+                    mc = engine.run_monte_carlo(fn, n_sims=_rr_valid_sims,
+                                                mean_return=pre_ret_return, return_std=mc_vol,
+                                                n_years=ny, seed=_rr_seed,
+                                                mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                    return mc["success_rate"], mc["median_estate"]
+
+                for key, res in _rr_results.items():
+                    if res["found"]:
+                        # Build override kwarg for this lever
+                        if key == "age":
+                            _kw_name = "retirement_age_override"
+                        elif key == "spend":
+                            _kw_name = "spending_pct_override"
+                        else:
+                            _kw_name = "additional_monthly_savings"
+                        _rr_sr, _rr_me = _rr_run_full({_kw_name: res["value"]})
+                        _rr_val = res["value"]
+
+                        # If overshooting, refine with binary search at full sims
+                        if _rr_sr > _rr_target + 0.03:
+                            # Define less-aggressive boundary and step for each lever
+                            if key == "age":
+                                # Search between current ret_age and found value
+                                _ref_lo, _ref_hi, _ref_step = ret_age, _rr_val, 1
+                                _ref_minimize = True
+                            elif key == "spend":
+                                # Search between found value and current spending %
+                                _ref_lo, _ref_hi, _ref_step = _rr_val, _rr_curr_pct, 0.5
+                                _ref_minimize = False
+                            else:
+                                # Search between 0 and found value
+                                _ref_lo, _ref_hi, _ref_step = 0, _rr_val, 100
+                                _ref_minimize = True
+
+                            _ref_result = _rr_binary_search(
+                                lambda v, _k=_kw_name: _rr_make_run_fn(**{_k: v}),
+                                _ref_lo, _ref_hi, _ref_step, target=_rr_target,
+                                n_sims=_rr_valid_sims, seed=_rr_seed,
+                                minimize=_ref_minimize)
+                            if _ref_result["found"]:
+                                _rr_val = _ref_result["value"]
+                                _rr_sr = _ref_result["success_rate"]
+                                _rr_me = _ref_result["median_estate"]
+
+                        _rr_validated[key] = {"value": _rr_val,
+                                              "success_rate": _rr_sr,
+                                              "median_estate": _rr_me}
+                    else:
+                        _rr_validated[key] = res
+
+                # Display independent levers
+                _rr_progress.progress(70, text="Building results...")
+                st.markdown("#### Independent Levers")
+                _rr_lever_rows = []
+
+                if _rr_results["age"]["found"]:
+                    v = _rr_validated["age"]
+                    delta = int(v["value"] - ret_age)
+                    _rr_lever_rows.append({
+                        "Lever": "Delay Retirement",
+                        "Change": f"Retire at {int(v['value'])} (+{delta} yr{'s' if delta != 1 else ''})",
+                        "Success Rate": f"{v['success_rate']:.0%}",
+                        "Median Estate": TEA.money(v["median_estate"]),
+                    })
+                else:
+                    _rr_lever_rows.append({
+                        "Lever": "Delay Retirement",
+                        "Change": f"Cannot reach {_rr_target:.0%} even at age 75",
+                        "Success Rate": f"{_rr_results['age']['success_rate']:.0%}",
+                        "Median Estate": TEA.money(_rr_results["age"]["median_estate"]),
+                    })
+
+                if _rr_results["spend"]["found"]:
+                    v = _rr_validated["spend"]
+                    _rr_sv = v["value"]
+                    cut = _rr_curr_pct - _rr_sv
+                    _rr_sfmt = f"{_rr_sv:g}"
+                    _rr_cfmt = f"{cut:g}"
+                    _rr_lever_rows.append({
+                        "Lever": "Reduce Spending",
+                        "Change": f"{_rr_sfmt}% of current ({_rr_cfmt}% cut)",
+                        "Success Rate": f"{v['success_rate']:.0%}",
+                        "Median Estate": TEA.money(v["median_estate"]),
+                    })
+                else:
+                    _rr_lever_rows.append({
+                        "Lever": "Reduce Spending",
+                        "Change": f"Cannot reach {_rr_target:.0%} even at 60%",
+                        "Success Rate": f"{_rr_results['spend']['success_rate']:.0%}",
+                        "Median Estate": TEA.money(_rr_results["spend"]["median_estate"]),
+                    })
+
+                if _rr_results["save"]["found"]:
+                    v = _rr_validated["save"]
+                    _rr_lever_rows.append({
+                        "Lever": "Increase Savings",
+                        "Change": f"+{TEA.money(v['value'])}/mo",
+                        "Success Rate": f"{v['success_rate']:.0%}",
+                        "Median Estate": TEA.money(v["median_estate"]),
+                    })
+                else:
+                    _rr_lever_rows.append({
+                        "Lever": "Increase Savings",
+                        "Change": f"Cannot reach {_rr_target:.0%} even at +$5,000/mo",
+                        "Success Rate": f"{_rr_results['save']['success_rate']:.0%}",
+                        "Median Estate": TEA.money(_rr_results["save"]["median_estate"]),
+                    })
+
+                st.dataframe(pd.DataFrame(_rr_lever_rows), use_container_width=True, hide_index=True)
+
+                # Combined combos (50/50 blends)
+                _rr_found_count = sum(1 for r in _rr_results.values() if r["found"])
+
+                if _rr_found_count >= 2:
+                    _rr_progress.progress(75, text="Testing combined approaches...")
+                    _rr_combos = []
+                    _rr_half_age = None; _rr_half_spend = None; _rr_half_save = None
+
+                    if _rr_results["age"]["found"]:
+                        _rr_half_age = ret_age + max(1, int(round((_rr_results["age"]["value"] - ret_age) / 2)))
+                    if _rr_results["spend"]["found"]:
+                        _rr_half_spend = _rr_curr_pct - max(0.5, round((_rr_curr_pct - _rr_validated["spend"]["value"]) / 2 * 2) / 2)
+                    if _rr_results["save"]["found"]:
+                        _rr_half_save = max(100, round(_rr_results["save"]["value"] / 2 / 100) * 100)
+
+                    # Age + Spending
+                    if _rr_half_age is not None and _rr_half_spend is not None:
+                        fn, ny, ytr = _rr_make_run_fn(
+                            retirement_age_override=_rr_half_age,
+                            spending_pct_override=_rr_half_spend)
+                        mc = engine.run_monte_carlo(fn, n_sims=_rr_valid_sims,
+                                                    mean_return=pre_ret_return, return_std=mc_vol,
+                                                    n_years=ny, seed=_rr_seed,
+                                                    mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                        _rr_combos.append({
+                            "Combination": f"Retire +{_rr_half_age - ret_age}yr + {_rr_curr_pct - _rr_half_spend:g}% spending cut",
+                            "Details": f"Age {_rr_half_age}, {_rr_half_spend:g}% spending",
+                            "Success Rate": f"{mc['success_rate']:.0%}",
+                            "Median Estate": TEA.money(mc["median_estate"]),
+                        })
+
+                    # Age + Savings
+                    if _rr_half_age is not None and _rr_half_save is not None:
+                        fn, ny, ytr = _rr_make_run_fn(
+                            retirement_age_override=_rr_half_age,
+                            additional_monthly_savings=_rr_half_save)
+                        mc = engine.run_monte_carlo(fn, n_sims=_rr_valid_sims,
+                                                    mean_return=pre_ret_return, return_std=mc_vol,
+                                                    n_years=ny, seed=_rr_seed,
+                                                    mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                        _rr_combos.append({
+                            "Combination": f"Retire +{_rr_half_age - ret_age}yr + save +{TEA.money(_rr_half_save)}/mo",
+                            "Details": f"Age {_rr_half_age}, +{TEA.money(_rr_half_save)}/mo",
+                            "Success Rate": f"{mc['success_rate']:.0%}",
+                            "Median Estate": TEA.money(mc["median_estate"]),
+                        })
+
+                    # Spending + Savings
+                    if _rr_half_spend is not None and _rr_half_save is not None:
+                        fn, ny, ytr = _rr_make_run_fn(
+                            spending_pct_override=_rr_half_spend,
+                            additional_monthly_savings=_rr_half_save)
+                        mc = engine.run_monte_carlo(fn, n_sims=_rr_valid_sims,
+                                                    mean_return=pre_ret_return, return_std=mc_vol,
+                                                    n_years=ny, seed=_rr_seed,
+                                                    mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                        _rr_combos.append({
+                            "Combination": f"{_rr_curr_pct - _rr_half_spend:g}% spending cut + save +{TEA.money(_rr_half_save)}/mo",
+                            "Details": f"{_rr_half_spend:g}% spending, +{TEA.money(_rr_half_save)}/mo",
+                            "Success Rate": f"{mc['success_rate']:.0%}",
+                            "Median Estate": TEA.money(mc["median_estate"]),
+                        })
+
+                    # All three
+                    if _rr_half_age is not None and _rr_half_spend is not None and _rr_half_save is not None:
+                        fn, ny, ytr = _rr_make_run_fn(
+                            retirement_age_override=_rr_half_age,
+                            spending_pct_override=_rr_half_spend,
+                            additional_monthly_savings=_rr_half_save)
+                        mc = engine.run_monte_carlo(fn, n_sims=_rr_valid_sims,
+                                                    mean_return=pre_ret_return, return_std=mc_vol,
+                                                    n_years=ny, seed=_rr_seed,
+                                                    mean_return_post=mc_post_ret, n_years_pre=ytr + 1)
+                        _rr_combos.append({
+                            "Combination": f"Retire +{_rr_half_age - ret_age}yr + {_rr_curr_pct - _rr_half_spend:g}% cut + save +{TEA.money(_rr_half_save)}/mo",
+                            "Details": f"Age {_rr_half_age}, {_rr_half_spend:g}%, +{TEA.money(_rr_half_save)}/mo",
+                            "Success Rate": f"{mc['success_rate']:.0%}",
+                            "Median Estate": TEA.money(mc["median_estate"]),
+                        })
+
+                    if _rr_combos:
+                        st.markdown("#### Combined Approaches (lighter-touch blends)")
+                        st.caption("Each lever at ~50% of its independent threshold — smaller changes that work together.")
+                        st.dataframe(pd.DataFrame(_rr_combos), use_container_width=True, hide_index=True)
+
+                elif _rr_found_count == 0:
+                    st.error("No single lever can reach 75% success. Consider combining multiple changes or consulting an advisor.")
+
+                # Savings allocation breakdown
+                if _rr_results["save"]["found"]:
+                    _, _rr_alloc = _rr_allocate_savings(_rr_results["save"]["value"])
+                    with st.expander("Where additional savings would go"):
+                        for item in _rr_alloc:
+                            st.write(f"**{item['Vehicle']}:** +{TEA.money(item['Additional'])}/yr → {TEA.money(item['New Total'])}/yr total")
+
+                _rr_progress.progress(100, text="Readiness analysis complete")
+                _rr_progress.empty()
+
+            else:
+                # ══ ABOVE TARGET: slack analysis ══
+                _rr_slack = {}
+                _rr_min_age = max(current_age_filer + 1, 55)
+                if ret_age > _rr_min_age:
+                    _rr_progress.progress(10, text="Analyzing slack: earlier retirement...")
+                    _rr_slack["age"] = _rr_binary_search(
+                        lambda age: _rr_make_run_fn(retirement_age_override=age),
+                        _rr_min_age, ret_age, 1, target=_rr_target, n_sims=_rr_scan_sims,
+                        seed=_rr_seed, minimize=True)
+
+                _rr_progress.progress(35, text="Analyzing slack: higher spending...")
+                _rr_slack["spend"] = _rr_binary_search(
+                    lambda pct: _rr_make_run_fn(spending_pct_override=pct),
+                    _rr_curr_pct, 150, 1, target=_rr_target, n_sims=_rr_scan_sims,
+                    seed=_rr_seed, minimize=False)
+
+                _rr_total_monthly = (contrib_dict["pretax"] + contrib_dict["roth"] +
+                                      contrib_dict["taxable"] + contrib_dict["hsa"]) / 12
+                if _rr_total_monthly > 100:
+                    _rr_progress.progress(60, text="Analyzing slack: lower savings...")
+                    _rr_slack["save_cut"] = _rr_binary_search(
+                        lambda cut: _rr_make_run_fn(additional_monthly_savings=-cut),
+                        0, _rr_total_monthly, 100, target=_rr_target, n_sims=_rr_scan_sims,
+                        seed=_rr_seed, minimize=False)
+
+                _rr_progress.progress(90, text="Building slack results...")
+                st.markdown("#### Slack Analysis — How Much Margin Do You Have?")
+                _rr_slack_rows = []
+
+                if "age" in _rr_slack and _rr_slack["age"]["found"]:
+                    earliest = int(_rr_slack["age"]["value"])
+                    delta = ret_age - earliest
+                    _rr_slack_rows.append({
+                        "Margin": "Retire Earlier",
+                        "Slack": f"Could retire at {earliest} ({delta} yr{'s' if delta != 1 else ''} earlier)",
+                        "Success Rate": f"{_rr_slack['age']['success_rate']:.0%}",
+                    })
+                elif "age" in _rr_slack:
+                    _rr_slack_rows.append({
+                        "Margin": "Retire Earlier",
+                        "Slack": f"Cannot retire earlier and stay at {_rr_target:.0%}",
+                        "Success Rate": "—",
+                    })
+
+                if "spend" in _rr_slack and _rr_slack["spend"]["found"]:
+                    max_pct = int(_rr_slack["spend"]["value"])
+                    extra = max_pct - _rr_curr_pct
+                    if extra > 0:
+                        _rr_slack_rows.append({
+                            "Margin": "Spend More",
+                            "Slack": f"Could spend {max_pct}% (+{extra}% more)",
+                            "Success Rate": f"{_rr_slack['spend']['success_rate']:.0%}",
+                        })
+                    else:
+                        _rr_slack_rows.append({
+                            "Margin": "Spend More",
+                            "Slack": f"Current {_rr_curr_pct}% is near the limit",
+                            "Success Rate": f"{_rr_slack['spend']['success_rate']:.0%}",
+                        })
+
+                if "save_cut" in _rr_slack and _rr_slack["save_cut"]["found"]:
+                    max_cut = _rr_slack["save_cut"]["value"]
+                    _rr_slack_rows.append({
+                        "Margin": "Save Less",
+                        "Slack": f"Could save {TEA.money(max_cut)}/mo less and still hit {_rr_target:.0%}",
+                        "Success Rate": f"{_rr_slack['save_cut']['success_rate']:.0%}",
+                    })
+
+                if _rr_slack_rows:
+                    st.dataframe(pd.DataFrame(_rr_slack_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Slack analysis couldn't run — you may already be at the boundary.")
+
+                _rr_progress.progress(100, text="Slack analysis complete")
+                _rr_progress.empty()
 
     # ════════════════════════════════════════════════════════════════
     # TAB 6 (PRE-RET): Strategy Optimizer
@@ -3840,6 +4435,11 @@ elif nav == "Achieving":
     auto_rmd = D["auto_rmd"] and has_rmd
     pretax_balance_filer_prior = D["pretax_bal_filer_prior"] if has_rmd else 0.0
     pretax_balance_spouse_prior = (D["pretax_bal_spouse_prior"] if is_joint else 0.0) if has_rmd else 0.0
+    # When auto-computing RMD and prior-year balance not entered, use current IRA balance
+    if auto_rmd and pretax_balance_filer_prior == 0:
+        pretax_balance_filer_prior = float(D.get("curr_trad_ira_f", 0))
+    if auto_rmd and pretax_balance_spouse_prior == 0 and is_joint:
+        pretax_balance_spouse_prior = float(D.get("curr_trad_ira_s", 0))
     baseline_pretax_distributions = D["baseline_pretax_dist"] if has_rmd else 0.0
     rmd_manual = D["rmd_manual"] if has_rmd else 0.0
 
@@ -4666,8 +5266,10 @@ elif nav == "Achieving":
                                 _yi = min(yr_i, len(rows) - 1)
                                 _spending = det_spending[_yi]; ss = det_ss[_yi]; pension = det_pension[_yi]; eff_tax = det_eff_tax[_yi]
                                 inv_inc = det_inv_inc[_yi]; extra_inc = det_extra_inc[_yi]
-                                _age_f = current_age_filer + yr_i
-                                _age_s = (current_age_spouse + yr_i) if current_age_spouse else None
+                                # Use IRS turning age for RMD (year - birth_year)
+                                _mc_yr = start_year + yr_i
+                                _age_f = (_mc_yr - filer_dob.year) if filer_dob else (current_age_filer + yr_i + 1)
+                                _age_s = ((_mc_yr - spouse_dob.year) if spouse_dob else None) if current_age_spouse else None
                                 rmd_f = TEA.compute_rmd_uniform_start73(s_pf, _age_f)
                                 rmd_s = TEA.compute_rmd_uniform_start73(s_ps, _age_s)
                                 rmd = rmd_f + rmd_s; s_pf -= rmd_f; s_ps -= rmd_s
@@ -4778,6 +5380,121 @@ elif nav == "Achieving":
                         st.line_chart(chart_df, use_container_width=True)
                         st.caption("Shaded bands: 10th\u201390th percentile range. Bold line: deterministic projection.")
 
+                # ── SS Claiming Age Analysis ──
+                _has_ss_choice = (
+                    (not filer_ss_already and filer_ss_fra > 0) or
+                    (is_joint and not spouse_ss_already and spouse_ss_fra > 0)
+                )
+                if _has_ss_choice:
+                    st.divider()
+                    st.markdown("### SS Claiming Age Analysis")
+                    st.caption("Tests every claiming age combination using your current spending strategy, "
+                               "scored across mortality scenarios to find the optimal claiming ages.")
+                    _ss3_c1, _ss3_c2 = st.columns(2)
+                    with _ss3_c1:
+                        _ss3_early_death = st.number_input(
+                            "Early death scenario age", value=80, min_value=70, max_value=90,
+                            step=1, key="fp_ss_early_death_tab3")
+                    with _ss3_c2:
+                        if is_joint:
+                            st.caption("Weights: 50% both survive / 25% filer dies early / 25% spouse dies early")
+                        else:
+                            st.caption("Weights: 50% survive to plan age / 50% early death")
+
+                    if st.button("Run SS Analysis", key="fp_run_ss_tab3"):
+                        _ss3_params = _build_tab3_params()
+                        _ss3_f_ages = []
+                        _ss3_s_ages = []
+                        if not _ss3_params["filer_ss_already"] and _ss3_params["filer_ss_fra"] > 0:
+                            _ss3_f_ages = list(range(max(62, current_age_filer), 71))
+                        if is_joint and not _ss3_params["spouse_ss_already"] and _ss3_params["spouse_ss_fra"] > 0:
+                            _ss3_s_ages = list(range(max(62, current_age_spouse), 71))
+
+                        if _ss3_f_ages and _ss3_s_ages:
+                            _ss3_combos = [(f"F{fa}/S{sa}", str(fa), str(sa)) for fa in _ss3_f_ages for sa in _ss3_s_ages]
+                        elif _ss3_f_ages:
+                            _ss3_combos = [(f"Filer {a}", str(a), None) for a in _ss3_f_ages]
+                        elif _ss3_s_ages:
+                            _ss3_combos = [(f"Spouse {a}", None, str(a)) for a in _ss3_s_ages]
+                        else:
+                            _ss3_combos = []
+
+                        if _ss3_combos:
+                            _ss3_results = []
+                            _ss3_bar = st.progress(0)
+                            _ss3_status = st.empty()
+                            for _si, (_ss3_lbl, _ss3_fc, _ss3_sc) in enumerate(_ss3_combos):
+                                _ss3_status.text(f"Testing {_ss3_lbl} ({_si+1}/{len(_ss3_combos)})")
+                                _sp = dict(_ss3_params)
+                                if _ss3_fc is not None: _sp["filer_ss_claim"] = _ss3_fc
+                                if _ss3_sc is not None: _sp["spouse_ss_claim"] = _ss3_sc
+                                _base_res = TEA.run_wealth_projection(a0, _sp, spending_order)
+                                _base_estate = _base_res["after_tax_estate"]
+                                _estate_fd = _base_estate
+                                _estate_sd = _base_estate
+                                if is_joint:
+                                    if _ss3_early_death < _sp.get("filer_plan_through_age", 95):
+                                        _sp_fd = dict(_sp)
+                                        _sp_fd["filer_plan_through_age"] = _ss3_early_death
+                                        _estate_fd = TEA.run_wealth_projection(a0, _sp_fd, spending_order)["after_tax_estate"]
+                                    if _ss3_early_death < _sp.get("spouse_plan_through_age", 95):
+                                        _sp_sd = dict(_sp)
+                                        _sp_sd["spouse_plan_through_age"] = _ss3_early_death
+                                        _estate_sd = TEA.run_wealth_projection(a0, _sp_sd, spending_order)["after_tax_estate"]
+                                    _weighted = 0.50 * _base_estate + 0.25 * _estate_fd + 0.25 * _estate_sd
+                                else:
+                                    _fpta = _sp.get("filer_plan_through_age", 95)
+                                    if int(_ss3_early_death) < _fpta:
+                                        _sp_fd = dict(_sp)
+                                        _sp_fd["filer_plan_through_age"] = int(_ss3_early_death)
+                                        # Single filer: engine ignores plan_through_age, must shorten years
+                                        _sp_fd["years"] = int(_ss3_early_death) - current_age_filer
+                                        _estate_fd = TEA.run_wealth_projection(a0, _sp_fd, spending_order)["after_tax_estate"]
+                                    _weighted = 0.50 * _base_estate + 0.50 * _estate_fd
+
+                                _ss3_results.append({
+                                    "label": _ss3_lbl,
+                                    "both_survive": _base_estate,
+                                    "filer_dies": _estate_fd,
+                                    "spouse_dies": _estate_sd,
+                                    "weighted": _weighted,
+                                    "total_ss": sum(r.get("SS", 0) for r in _base_res["year_details"]),
+                                })
+                                _ss3_bar.progress((_si + 1) / len(_ss3_combos))
+                            _ss3_bar.empty()
+                            _ss3_status.empty()
+                            _ss3_results.sort(key=lambda x: x["weighted"], reverse=True)
+                            st.session_state.tab3_ss_results = _ss3_results
+                            st.session_state._ss3_early_death_used = int(_ss3_early_death)
+                        else:
+                            st.info("No SS claiming age variants to test.")
+
+                    # Display results
+                    if st.session_state.get("tab3_ss_results"):
+                        _ssr = st.session_state.tab3_ss_results
+                        _best_ss = _ssr[0]
+                        _worst_ss = _ssr[-1]
+                        _ss3_used_age = st.session_state.get("_ss3_early_death_used", 80)
+                        st.success(f"**Best:** {_best_ss['label']} — Weighted Estate: **${_best_ss['weighted']:,.0f}** "
+                                   f"(+${_best_ss['weighted'] - _worst_ss['weighted']:,.0f} vs worst)  "
+                                   f"*[early death scenario: age {_ss3_used_age}]*")
+                        _ss3_rows = []
+                        for r in _ssr:
+                            _row = {
+                                "SS Claiming": r["label"],
+                                "Weighted Score": f"${r['weighted']:,.0f}",
+                                "Both Survive": f"${r['both_survive']:,.0f}",
+                            }
+                            if is_joint:
+                                _row[f"Filer Dies @ {_ss3_used_age}"] = f"${r['filer_dies']:,.0f}"
+                                _row[f"Spouse Dies @ {_ss3_used_age}"] = f"${r['spouse_dies']:,.0f}"
+                            else:
+                                _row[f"Dies @ {_ss3_used_age}"] = f"${r['filer_dies']:,.0f}"
+                            _row["Total SS Received"] = f"${r['total_ss']:,.0f}"
+                            _row["vs Best"] = f"${r['weighted'] - _best_ss['weighted']:+,.0f}"
+                            _ss3_rows.append(_row)
+                        st.dataframe(pd.DataFrame(_ss3_rows), use_container_width=True, hide_index=True)
+
         # ════════════════════════════════════════════════════════════════
         # TAB 4: Multigenerational Optimizer
         # ════════════════════════════════════════════════════════════════
@@ -4868,6 +5585,37 @@ elif nav == "Achieving":
                 "order": strat.get("key", strat.get("type", "")),
             }
 
+        def _compute_mortality_score(a0, base_params, strat, base_result, early_death_age, **run_kw):
+            """Run early-death scenarios and return weighted estate score."""
+            _base_estate = base_result["after_tax_estate"]
+            if is_joint:
+                # Filer dies early
+                if early_death_age < base_params.get("filer_plan_through_age", 95):
+                    _p_fd = dict(base_params)
+                    _p_fd["filer_plan_through_age"] = early_death_age
+                    _estate_fd = _run_single_strategy(a0, _p_fd, strat, **run_kw)["after_tax_estate"]
+                else:
+                    _estate_fd = _base_estate
+                # Spouse dies early
+                if early_death_age < base_params.get("spouse_plan_through_age", 95):
+                    _p_sd = dict(base_params)
+                    _p_sd["spouse_plan_through_age"] = early_death_age
+                    _estate_sd = _run_single_strategy(a0, _p_sd, strat, **run_kw)["after_tax_estate"]
+                else:
+                    _estate_sd = _base_estate
+                return 0.50 * _base_estate + 0.25 * _estate_fd + 0.25 * _estate_sd
+            else:
+                # Single: 50/50 survive vs die early
+                _fpta = base_params.get("filer_plan_through_age", 95)
+                if int(early_death_age) < _fpta:
+                    _p_fd = dict(base_params)
+                    _p_fd["filer_plan_through_age"] = int(early_death_age)
+                    _p_fd["years"] = int(early_death_age) - base_params.get("current_age_filer", 65)
+                    _estate_fd = _run_single_strategy(a0, _p_fd, strat, **run_kw)["after_tax_estate"]
+                else:
+                    _estate_fd = _base_estate
+                return 0.50 * _base_estate + 0.50 * _estate_fd
+
         with tab4:
             st.subheader("Multigenerational Optimizer")
             st.write("Jointly optimizes spending strategy and Roth conversions to maximize after-tax estate to heirs.")
@@ -4889,26 +5637,42 @@ elif nav == "Achieving":
                 with col1:
                     _opt_stop_default = min(100, max(75, current_age_filer + 10))
                     opt_stop_age = st.number_input("Stop Conversions at Age", min_value=60, max_value=100, value=_opt_stop_default, step=1, key="fp_opt_stop")
-                    opt_conv_years = st.number_input("Max Years of Conversions", min_value=1, max_value=30, value=15, step=1, key="fp_opt_conv_years")
                 with col2:
                     st.markdown("**Common Thresholds**")
                     if is_joint:
-                        st.write("22%: $206,700 | 24%: $394,600")
+                        st.write("22%: $211,400 | 24%: $403,550")
                         st.write("IRMAA: $218k | $274k | $342k | $410k")
                     else:
-                        st.write("22%: $103,350 | 24%: $197,300")
+                        st.write("22%: $105,700 | 24%: $201,775")
                         st.write("IRMAA: $109k | $137k | $171k | $205k")
+                deep_top_k = st.slider("Deep Search: Top N spending strategies", min_value=3, max_value=20, value=10, key="fp_opt_top_k")
+                with st.expander("Advanced Settings", expanded=False):
                     target_agi_input = st.number_input("Target AGI (for 'fill to bracket')", value=218000.0 if is_joint else 109000.0, step=10000.0, key="fp_opt_target")
-                conv_amounts_str = st.text_input("Conversion amounts to test (comma separated)", value="25000, 50000, 75000, 100000, 150000, 200000", key="fp_opt_amounts")
-                include_fill = st.checkbox("Also test 'Fill to Target AGI' strategy", value=True, key="fp_opt_fill")
-                include_bracket_fill = st.checkbox("Also test bracket-fill strategies", value=True, key="fp_opt_bracket_fill")
-                agi_cap_enabled = st.checkbox("Cap all strategies at Target AGI", value=True, key="fp_opt_agi_cap",
-                    help="When checked, bracket-fill and fixed-amount strategies won't exceed the Target AGI")
-                col_ds1, col_ds2 = st.columns(2)
-                with col_ds1:
-                    deep_top_k = st.slider("Deep Search: Top N spending strategies", min_value=3, max_value=20, value=10, key="fp_opt_top_k")
-                with col_ds2:
+                    conv_amounts_str = st.text_input("Conversion amounts to test (comma separated)", value="50000, 100000, 150000, 200000", key="fp_opt_amounts")
+                    include_fill = st.checkbox("Also test 'Fill to Target AGI' strategy", value=True, key="fp_opt_fill")
+                    include_bracket_fill = st.checkbox("Also test bracket-fill strategies", value=True, key="fp_opt_bracket_fill")
+                    agi_cap_enabled = st.checkbox("Cap all strategies at Target AGI", value=True, key="fp_opt_agi_cap",
+                        help="When checked, bracket-fill and fixed-amount strategies won't exceed the Target AGI")
                     test_adaptive_overrides = st.checkbox("Test adaptive strategies with override conversions", value=True, key="fp_opt_adaptive_overrides")
+                    _might_have_ss_dim = (
+                        (not filer_ss_already and filer_ss_fra > 0) or
+                        (is_joint and not spouse_ss_already and spouse_ss_fra > 0)
+                    )
+                    if _might_have_ss_dim:
+                        st.divider()
+                        st.markdown("**SS Claiming Optimization**")
+                        _use_mortality_weight = st.checkbox(
+                            "Score SS with mortality risk", value=True, key="fp_opt_mortality_ss",
+                            help="Scores each SS claiming age across 3 death scenarios to avoid always picking age 70")
+                        if _use_mortality_weight:
+                            _early_death_age = st.number_input(
+                                "Early death scenario age", value=80, min_value=70, max_value=90,
+                                step=1, key="fp_opt_early_death")
+                        else:
+                            _early_death_age = 80
+                    else:
+                        _use_mortality_weight = False
+                        _early_death_age = 80
 
                 if st.button("Run Optimizer", type="primary", key="fp_run_optimizer"):
                     params = _build_tab3_params()
@@ -4978,22 +5742,52 @@ elif nav == "Achieving":
                                          + params.get("interest_taxable", 0))
                         _is_jt = "joint" in params.get("filing_status", "").lower()
                         # Bracket tops (taxable income) + approximate standard deduction = AGI threshold
-                        _std_ded = 32300 if _is_jt else 16150  # approx 2025 std deduction for 65+
+                        _std_ded = 35500 if _is_jt else 18150  # approx 2026 std deduction for 65+
                         _bracket_agi_tops = {
-                            "fill_bracket_12": (96950 if _is_jt else 48475) + _std_ded,
-                            "fill_bracket_22": (206700 if _is_jt else 103350) + _std_ded,
-                            "fill_bracket_24": (394600 if _is_jt else 197300) + _std_ded,
+                            "fill_bracket_12": (100800 if _is_jt else 50400) + _std_ded,
+                            "fill_bracket_22": (211400 if _is_jt else 105700) + _std_ded,
+                            "fill_bracket_24": (403550 if _is_jt else 201775) + _std_ded,
                             "fill_irmaa_0": 218000 if _is_jt else 109000,
+                            "fill_irmaa_1": 274000 if _is_jt else 137000,
+                            "fill_irmaa_2": 342000 if _is_jt else 171000,
+                            "fill_irmaa_3": 410000 if _is_jt else 205000,
                         }
-                        for _bkey, _blabel in [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"), ("fill_irmaa_0", "Fill to IRMAA Tier 1")]:
+                        for _bkey, _blabel in [("fill_bracket_12", f"Fill 12% Bracket{_cap_tag}"), ("fill_bracket_22", f"Fill 22% Bracket{_cap_tag}"), ("fill_bracket_24", f"Fill 24% Bracket{_cap_tag}"),
+                                               ("fill_irmaa_0", "Fill to No IRMAA ($218k)"), ("fill_irmaa_1", "Fill to IRMAA Tier 1 ($274k)"), ("fill_irmaa_2", "Fill to IRMAA Tier 2 ($342k)"), ("fill_irmaa_3", "Fill to IRMAA Tier 3 ($410k)")]:
                             if _base_agi_est < _bracket_agi_tops[_bkey]:
                                 _conv_strategies.append((_bkey, _blabel))
                         _conv_strategies.append(("fill_heir_rate", f"Fill to Heir Rate ({heir_tax_rate:.0%})"))
 
+                    # ---- Build conversion year variants ----
+                    _max_conv_years = max(1, opt_stop_age - current_age_filer)
+                    _year_variants = sorted(set(y for y in [3, 5, 8, 10, 15, 20] if y <= _max_conv_years))
+                    if not _year_variants or _year_variants[-1] < _max_conv_years:
+                        _year_variants.append(_max_conv_years)
+
+                    # ---- Build SS claiming age variants ----
+                    _ss_variants = [("Current SS", None, None)]  # baseline: use profile settings
+                    if not params["filer_ss_already"] and params["filer_ss_fra"] > 0:
+                        _f_min_age = max(62, current_age_filer)
+                        _filer_claim_ages = list(range(_f_min_age, 71))
+                    else:
+                        _filer_claim_ages = []
+                    if is_joint and not params["spouse_ss_already"] and params["spouse_ss_fra"] > 0:
+                        _s_min_age = max(62, current_age_spouse)
+                        _spouse_claim_ages = list(range(_s_min_age, 71))
+                    else:
+                        _spouse_claim_ages = []
+                    if _filer_claim_ages and _spouse_claim_ages:
+                        _ss_variants = [(f"SS {fa}/{sa}", str(fa), str(sa)) for fa in _filer_claim_ages for sa in _spouse_claim_ages]
+                    elif _filer_claim_ages:
+                        _ss_variants = [(f"SS Filer {a}", str(a), None) for a in _filer_claim_ages]
+                    elif _spouse_claim_ages:
+                        _ss_variants = [(f"SS Spouse {a}", None, str(a)) for a in _spouse_claim_ages]
+                    _has_ss_dim = len(_ss_variants) > 1
+
                     # ---- Count total runs for progress ----
-                    _n_quick = len(_spending_strategies) + len(_adaptive_strategies)
-                    _n_deep_est = min(deep_top_k, len(_spending_strategies)) * len(_conv_strategies)
-                    if test_adaptive_overrides: _n_deep_est += min(3, len(_adaptive_strategies)) * len(_conv_strategies)
+                    _n_quick = (len(_spending_strategies) + len(_adaptive_strategies)) * len(_ss_variants)
+                    _n_deep_est = min(deep_top_k, len(_spending_strategies) * len(_ss_variants)) * len(_conv_strategies) * len(_year_variants)
+                    if test_adaptive_overrides: _n_deep_est += min(3, len(_adaptive_strategies) * len(_ss_variants)) * len(_conv_strategies) * len(_year_variants)
                     _n_total = _n_quick + _n_deep_est
 
                     all_results = []; _run_count = 0
@@ -5005,67 +5799,194 @@ elif nav == "Achieving":
                     status_text.text("Quick Scan: testing spending strategies...")
 
                     # Non-adaptive strategies — no conversions (stop_conversion_age=0)
-                    for _strat in _spending_strategies:
-                        status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']}")
-                        result = _run_single_strategy(a0, params, _strat, conv_strat="none", stop_age=0)
-                        pkg = _package_result(result, _strat, _strat["label"], "No Conversion", "quick")
-                        all_results.append(pkg)
-                        _run_count += 1
-                        progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
+                    for _ss_label, _ss_f_claim, _ss_s_claim in _ss_variants:
+                        _p = dict(params)
+                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
+                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
+                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
+                        for _strat in _spending_strategies:
+                            status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']}{_ss_tag}")
+                            result = _run_single_strategy(a0, _p, _strat, conv_strat="none", stop_age=0)
+                            pkg = _package_result(result, _strat, _strat["label"], "No Conversion", "quick")
+                            pkg["ss_label"] = _ss_label
+                            if _use_mortality_weight and _has_ss_dim:
+                                pkg["_mortality_score"] = _compute_mortality_score(
+                                    a0, _p, _strat, result, _early_death_age,
+                                    conv_strat="none", stop_age=0)
+                            else:
+                                pkg["_mortality_score"] = pkg["after_tax_estate"]
+                            all_results.append(pkg)
+                            _run_count += 1
+                            progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
 
                     # Adaptive strategies — WITH their built-in conversions (the key fix!)
-                    for _strat in _adaptive_strategies:
-                        status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']} (built-in conversions)")
-                        result = _run_single_strategy(a0, params, _strat, conv_strat="none",
-                                                       stop_age=opt_stop_age, target_agi=target_agi_input)
-                        pkg = _package_result(result, _strat, _strat["label"], "Built-in", "quick")
-                        all_results.append(pkg)
-                        _run_count += 1
-                        progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
+                    for _ss_label, _ss_f_claim, _ss_s_claim in _ss_variants:
+                        _p = dict(params)
+                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
+                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
+                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
+                        for _strat in _adaptive_strategies:
+                            status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']} (built-in conversions){_ss_tag}")
+                            result = _run_single_strategy(a0, _p, _strat, conv_strat="none",
+                                                           stop_age=opt_stop_age, target_agi=target_agi_input)
+                            pkg = _package_result(result, _strat, _strat["label"], "Built-in", "quick")
+                            pkg["ss_label"] = _ss_label
+                            if _use_mortality_weight and _has_ss_dim:
+                                pkg["_mortality_score"] = _compute_mortality_score(
+                                    a0, _p, _strat, result, _early_death_age,
+                                    conv_strat="none", stop_age=opt_stop_age, target_agi=target_agi_input)
+                            else:
+                                pkg["_mortality_score"] = pkg["after_tax_estate"]
+                            all_results.append(pkg)
+                            _run_count += 1
+                            progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
 
-                    # ---- Rank quick scan, select top K non-adaptive ----
+                    # ---- Rank quick scan, select top K non-adaptive (with SS variant) ----
                     _quick_non_adaptive = [r for r in all_results if r["scan_phase"] == "quick" and r["conversion_label"] == "No Conversion"]
-                    _quick_non_adaptive.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+                    _rank_key = "_mortality_score" if _use_mortality_weight and _has_ss_dim else "after_tax_estate"
+                    _quick_non_adaptive.sort(key=lambda x: x.get(_rank_key, x["after_tax_estate"]), reverse=True)
                     _top_k_spending = _quick_non_adaptive[:deep_top_k]
-                    _top_k_labels = set(r["spending_label"] for r in _top_k_spending)
-                    _top_k_strats = [s for s in _spending_strategies if s["label"] in _top_k_labels]
+                    # Build top-K combos carrying associated SS variant
+                    _top_k_combos = []
+                    _seen_combo_keys = set()
+                    for r in _top_k_spending:
+                        _combo_key = (r["spending_label"], r.get("ss_label", "Current SS"))
+                        if _combo_key not in _seen_combo_keys:
+                            _seen_combo_keys.add(_combo_key)
+                            _strat = next((s for s in _spending_strategies if s["label"] == r["spending_label"]), None)
+                            _ss = next((sv for sv in _ss_variants if sv[0] == r.get("ss_label", "Current SS")), _ss_variants[0])
+                            if _strat:
+                                _top_k_combos.append((_strat, _ss))
 
                     _quick_adaptive = [r for r in all_results if r["scan_phase"] == "quick" and r["conversion_label"] == "Built-in"]
-                    _quick_adaptive.sort(key=lambda x: x["after_tax_estate"], reverse=True)
-                    _top_adaptive_strats = []
+                    _quick_adaptive.sort(key=lambda x: x.get(_rank_key, x["after_tax_estate"]), reverse=True)
+                    _top_adaptive_combos = []
                     if test_adaptive_overrides:
-                        _top_adaptive_labels = set(r["spending_label"] for r in _quick_adaptive[:3])
-                        _top_adaptive_strats = [s for s in _adaptive_strategies if s["label"] in _top_adaptive_labels]
+                        _seen_adaptive = set()
+                        for r in _quick_adaptive:
+                            _akey = (r["spending_label"], r.get("ss_label", "Current SS"))
+                            if _akey not in _seen_adaptive:
+                                _seen_adaptive.add(_akey)
+                                _strat = next((s for s in _adaptive_strategies if s["label"] == r["spending_label"]), None)
+                                _ss = next((sv for sv in _ss_variants if sv[0] == r.get("ss_label", "Current SS")), _ss_variants[0])
+                                if _strat:
+                                    _top_adaptive_combos.append((_strat, _ss))
+                                if len(_top_adaptive_combos) >= 3:
+                                    break
 
                     # ════════════════════════════════════════════
-                    # DEEP SEARCH: top K spending × all conversions + top adaptive × overrides
+                    # DEEP SEARCH: top K spending (with SS) × all conversions + top adaptive × overrides
                     # ════════════════════════════════════════════
                     status_text.text("Deep Search: testing spending + conversion combos...")
 
-                    for _strat in _top_k_strats:
+                    for _strat, (_ss_label, _ss_f_claim, _ss_s_claim) in _top_k_combos:
+                        _p = dict(params)
+                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
+                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
+                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
                         for _conv_val, _conv_label in _conv_strategies:
-                            status_text.text(f"Deep Search ({_run_count + 1 - _n_quick}/{_n_deep_est}): {_strat['label']} + {_conv_label}")
-                            result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
-                                                           stop_age=opt_stop_age, target_agi=target_agi_input,
-                                                           conv_years=opt_conv_years, agi_cap=agi_cap_enabled)
-                            pkg = _package_result(result, _strat, _strat["label"], _conv_label, "deep")
-                            all_results.append(pkg)
-                            _run_count += 1
-                            _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
-                            progress_bar.progress(min(1.0, _deep_pct))
+                            for _cyrs in _year_variants:
+                                _deep_idx = _run_count + 1 - _n_quick
+                                status_text.text(f"Deep Search ({_deep_idx}/{_n_deep_est}): {_strat['label']} + {_conv_label} × {_cyrs}yr{_ss_tag}")
+                                result = _run_single_strategy(a0, _p, _strat, conv_strat=_conv_val,
+                                                               stop_age=opt_stop_age, target_agi=target_agi_input,
+                                                               conv_years=_cyrs, agi_cap=agi_cap_enabled)
+                                pkg = _package_result(result, _strat, _strat["label"],
+                                                      f"{_conv_label} × {_cyrs}yr", "deep")
+                                pkg["ss_label"] = _ss_label
+                                all_results.append(pkg)
+                                _run_count += 1
+                                _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
+                                progress_bar.progress(min(1.0, _deep_pct))
 
-                    # Adaptive overrides: top 3 adaptive × all explicit conversions
-                    for _strat in _top_adaptive_strats:
+                    # Adaptive overrides: top 3 adaptive (with SS) × all explicit conversions × year variants
+                    for _strat, (_ss_label, _ss_f_claim, _ss_s_claim) in _top_adaptive_combos:
+                        _p = dict(params)
+                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
+                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
+                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
                         for _conv_val, _conv_label in _conv_strategies:
-                            status_text.text(f"Deep Search ({_run_count + 1 - _n_quick}/{_n_deep_est}): {_strat['label']} + {_conv_label}")
-                            result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
-                                                           stop_age=opt_stop_age, target_agi=target_agi_input,
-                                                           conv_years=opt_conv_years, agi_cap=agi_cap_enabled)
-                            pkg = _package_result(result, _strat, _strat["label"], _conv_label, "deep")
-                            all_results.append(pkg)
-                            _run_count += 1
-                            _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
-                            progress_bar.progress(min(1.0, _deep_pct))
+                            for _cyrs in _year_variants:
+                                _deep_idx = _run_count + 1 - _n_quick
+                                status_text.text(f"Deep Search ({_deep_idx}/{_n_deep_est}): {_strat['label']} + {_conv_label} × {_cyrs}yr{_ss_tag}")
+                                result = _run_single_strategy(a0, _p, _strat, conv_strat=_conv_val,
+                                                               stop_age=opt_stop_age, target_agi=target_agi_input,
+                                                               conv_years=_cyrs, agi_cap=agi_cap_enabled)
+                                pkg = _package_result(result, _strat, _strat["label"],
+                                                      f"{_conv_label} × {_cyrs}yr", "deep")
+                                pkg["ss_label"] = _ss_label
+                                all_results.append(pkg)
+                                _run_count += 1
+                                _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
+                                progress_bar.progress(min(1.0, _deep_pct))
+
+                    # ════════════════════════════════════════════
+                    # REFINEMENT: $5k steps around best amount × year variants
+                    # ════════════════════════════════════════════
+                    _deep_fixed = [r for r in all_results if r["scan_phase"] == "deep"
+                                   and r["conversion_label"].startswith("$")]
+                    if _deep_fixed:
+                        _deep_fixed.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+                        _best_deep = _deep_fixed[0]
+                        # Parse the winning amount from label "$50,000/yr × 8yr" → 50000
+                        try:
+                            _amt_part = _best_deep["conversion_label"].split("×")[0].strip()
+                            _best_amt = float(_amt_part.replace("$","").replace(",","").replace("/yr",""))
+                        except Exception:
+                            _best_amt = None
+                        # Parse the winning years from label
+                        try:
+                            _yr_part = _best_deep["conversion_label"].split("×")[1].strip()
+                            _best_yrs = int(_yr_part.replace("yr",""))
+                        except Exception:
+                            _best_yrs = _year_variants[-1] if _year_variants else 15
+                        if _best_amt is not None:
+                            # Find the coarse step size (gap between tested amounts)
+                            _coarse_sorted = sorted(conv_amounts)
+                            _coarse_step = 50000
+                            for _ci in range(len(_coarse_sorted)):
+                                if abs(_coarse_sorted[_ci] - _best_amt) < 1:
+                                    if _ci > 0:
+                                        _coarse_step = _coarse_sorted[_ci] - _coarse_sorted[_ci - 1]
+                                    elif _ci < len(_coarse_sorted) - 1:
+                                        _coarse_step = _coarse_sorted[_ci + 1] - _coarse_sorted[_ci]
+                                    break
+                            _refine_lo = max(0, _best_amt - _coarse_step)
+                            _refine_hi = _best_amt + _coarse_step
+                            _refine_step = 5000
+                            _refine_amounts = [a for a in range(int(_refine_lo) + _refine_step,
+                                                                 int(_refine_hi), _refine_step)
+                                               if abs(a - _best_amt) >= _refine_step * 0.5]
+                            # Year variants for refinement: winning years ± a few steps
+                            _refine_years = sorted(set(y for y in range(max(1, _best_yrs - 4),
+                                                                         _best_yrs + 5)
+                                                       if 1 <= y <= _max_conv_years))
+                            _best_strat = next((s for s in _spending_strategies + _adaptive_strategies
+                                                if s["label"] == _best_deep["spending_label"]), None)
+                            if _best_strat and _refine_amounts:
+                                # Carry SS variant from best deep result
+                                _refine_ss = next((sv for sv in _ss_variants if sv[0] == _best_deep.get("ss_label", "Current SS")), _ss_variants[0])
+                                _refine_ss_label, _refine_ss_f, _refine_ss_s = _refine_ss
+                                _p_refine = dict(params)
+                                if _refine_ss_f is not None: _p_refine["filer_ss_claim"] = _refine_ss_f
+                                if _refine_ss_s is not None: _p_refine["spouse_ss_claim"] = _refine_ss_s
+                                _n_refine = len(_refine_amounts) * len(_refine_years)
+                                _ss_tag = f" [{_refine_ss_label}]" if _has_ss_dim else ""
+                                status_text.text(f"Refining: {len(_refine_amounts)} amounts × {len(_refine_years)} year durations...{_ss_tag}")
+                                progress_bar.progress(0.0)
+                                _ri_count = 0
+                                for _ramt in _refine_amounts:
+                                    for _ryrs in _refine_years:
+                                        _ri_count += 1
+                                        status_text.text(f"Refining ({_ri_count}/{_n_refine}): ${_ramt:,.0f}/yr × {_ryrs}yr{_ss_tag}")
+                                        result = _run_single_strategy(a0, _p_refine, _best_strat, conv_strat=float(_ramt),
+                                                                       stop_age=opt_stop_age, target_agi=target_agi_input,
+                                                                       conv_years=_ryrs, agi_cap=agi_cap_enabled)
+                                        pkg = _package_result(result, _best_strat, _best_strat["label"],
+                                                              f"${_ramt:,.0f}/yr × {_ryrs}yr", "refine")
+                                        pkg["ss_label"] = _refine_ss_label
+                                        all_results.append(pkg)
+                                        progress_bar.progress(_ri_count / _n_refine)
 
                     progress_bar.progress(1.0)
                     progress_bar.empty(); status_text.empty()
@@ -5078,7 +5999,7 @@ elif nav == "Achieving":
                     for r in all_results:
                         _merged = False
                         for d in _deduped:
-                            if d["spending_label"] == r["spending_label"] and abs(d["after_tax_estate"] - r["after_tax_estate"]) < 100:
+                            if d["spending_label"] == r["spending_label"] and d.get("ss_label", "") == r.get("ss_label", "") and abs(d["after_tax_estate"] - r["after_tax_estate"]) < 100:
                                 if "_group_members" not in d: d["_group_members"] = [d["conversion_label"]]
                                 d["_group_members"].append(r["conversion_label"]); d["_group_size"] = d.get("_group_size", 1) + 1; _merged = True; break
                         if not _merged: r["_group_members"] = [r["conversion_label"]]; r["_group_size"] = 1; _deduped.append(r)
@@ -5092,6 +6013,9 @@ elif nav == "Achieving":
                     st.session_state.opt_best_combo = all_results[0] if all_results else None
                     st.session_state.opt_best_details = all_results[0]["_year_details"] if all_results else None
                     st.session_state.opt_params = params
+                    st.session_state.opt_has_ss_dim = _has_ss_dim
+                    st.session_state.opt_use_mortality = _use_mortality_weight
+                    st.session_state.opt_early_death_age = _early_death_age
 
                     # Baseline = best spending-only (no conversion)
                     _spending_only = [r for r in all_results if r["conversion_label"] == "No Conversion"]
@@ -5128,9 +6052,19 @@ elif nav == "Achieving":
                     st.session_state.phase2_results = _p2_mapped if _p2_mapped else None
                     st.session_state.phase2_best_details = _global_best["_year_details"]
                     st.session_state.phase2_baseline_details = _best_spending_only["_year_details"]
-                    st.session_state.phase2_best_name = f"{_global_best['spending_label']} + {_global_best['conversion_label']}"
+                    _ss_suffix = f" [{_global_best.get('ss_label', '')}]" if _has_ss_dim else ""
+                    st.session_state.phase2_best_name = f"{_global_best['spending_label']} + {_global_best['conversion_label']}{_ss_suffix}"
 
-                    st.success(f"Tested {_run_count} combinations ({_n_quick} quick scan + {_run_count - _n_quick} deep search)")
+                    _ss_count_msg = f", {len(_ss_variants)} SS claiming variants" if _has_ss_dim else ""
+                    st.success(f"Tested {_run_count} combinations ({_n_quick} quick scan + {_run_count - _n_quick} deep search{_ss_count_msg})")
+                    if _has_ss_dim and _use_mortality_weight:
+                        _eda = _early_death_age
+                        if is_joint:
+                            st.caption(f"SS claiming ranked by mortality-weighted estate "
+                                       f"(early death at {_eda}, weights: 50% both survive / 25% each spouse)")
+                        else:
+                            st.caption(f"SS claiming ranked by mortality-weighted estate "
+                                       f"(early death at {_eda}, weights: 50% survive / 50% early death)")
 
                 # ════════════════════════════════════════════
                 # RESULTS DISPLAY
@@ -5138,12 +6072,14 @@ elif nav == "Achieving":
                 if st.session_state.opt_all_results:
                     _all = st.session_state.opt_all_results
                     _best = _all[0]
+                    _has_ss_dim = st.session_state.get("opt_has_ss_dim", False)
                     _spending_only = [r for r in _all if r["conversion_label"] == "No Conversion"]
                     _best_spending_only = _spending_only[0] if _spending_only else _best
                     _baseline_estate = _best_spending_only["after_tax_estate"]
 
                     # ---- Best Combo highlight ----
-                    _best_label = f"{_best['spending_label']} + {_best['conversion_label']}"
+                    _best_ss_tag = f" [{_best.get('ss_label', '')}]" if _has_ss_dim else ""
+                    _best_label = f"{_best['spending_label']} + {_best['conversion_label']}{_best_ss_tag}"
                     _improvement = _best["after_tax_estate"] - _baseline_estate
                     if _improvement > 100:
                         st.success(f"**Best:** {_best_label} — Estate: **${_best['after_tax_estate']:,.0f}** (+${_improvement:,.0f} vs spending-only)")
@@ -5154,7 +6090,8 @@ elif nav == "Achieving":
                     if len(_all) >= 2:
                         st.markdown("#### Top 5 Strategies")
                         for _t5i, _t5r in enumerate(_all[:5], 1):
-                            _t5_label = f"{_t5r['spending_label']} + {_t5r['conversion_label']}"
+                            _t5_ss_tag = f" [{_t5r.get('ss_label', '')}]" if _has_ss_dim else ""
+                            _t5_label = f"{_t5r['spending_label']} + {_t5r['conversion_label']}{_t5_ss_tag}"
                             _t5_delta = _t5r["after_tax_estate"] - _baseline_estate
                             _t5_delta_str = f" ({'+' if _t5_delta >= 0 else ''}{_t5_delta:,.0f} vs spending-only)" if abs(_t5_delta) > 100 else ""
                             st.markdown(f"{_t5i}. **{_t5_label}** — ${_t5r['after_tax_estate']:,.0f}{_t5_delta_str}")
@@ -5181,8 +6118,9 @@ elif nav == "Achieving":
                                 elif _type_tag == "blend": _cat = "Blend"
                                 elif _type_tag == "dynamic": _cat = "Dynamic"
                                 else: _cat = "Waterfall"
-                                _row = {"Type": _cat, "Strategy": r["spending_label"], "Conversion": r["conversion_label"],
-                                    "Net Estate": f"${r['after_tax_estate']:,.0f}", "Gross Estate": f"${r['gross_estate']:,.0f}",
+                                _row = {"Type": _cat, "Strategy": r["spending_label"], "Conversion": r["conversion_label"]}
+                                if _has_ss_dim: _row["SS Claiming"] = r.get("ss_label", "")
+                                _row.update({"Net Estate": f"${r['after_tax_estate']:,.0f}", "Gross Estate": f"${r['gross_estate']:,.0f}",
                                     "Total Taxes": f"${r['total_taxes']:,.0f}", "Converted": f"${r['total_converted']:,.0f}",
                                     "Drew Cash": f"${r.get('tot_wd_cash', 0):,.0f}", "Drew Taxable": f"${r.get('tot_wd_taxable', 0):,.0f}",
                                     "Drew Pre-Tax": f"${r.get('tot_wd_pretax', 0):,.0f}", "Drew Tax-Free": f"${r.get('tot_wd_roth', 0):,.0f}",
@@ -5190,7 +6128,9 @@ elif nav == "Achieving":
                                     "Final Pre-Tax": f"${r['final_pretax']:,.0f}", "Final Roth": f"${r['final_roth']:,.0f}",
                                     "Final Brokerage": f"${r['final_brokerage']:,.0f}", "Final Cash": f"${r.get('final_cash', 0):,.0f}",
                                     "Final Annuity": f"${r.get('final_annuity', 0):,.0f}", "Final Life": f"${r.get('final_life', 0):,.0f}",
-                                    "vs Best": f"${r['after_tax_estate'] - _quick_display[0]['after_tax_estate']:+,.0f}"}
+                                    "vs Best": f"${r['after_tax_estate'] - _quick_display[0]['after_tax_estate']:+,.0f}"})
+                                if st.session_state.get("opt_use_mortality", False) and _has_ss_dim:
+                                    _row["Mortality Score"] = f"${r.get('_mortality_score', r['after_tax_estate']):,.0f}"
                                 _gs = r.get("_group_size", 1)
                                 _row["# Tied"] = str(_gs) if _gs > 1 else ""
                                 _comp_rows.append(_row)
@@ -5204,23 +6144,25 @@ elif nav == "Achieving":
                     with st.expander("All Tested Combinations", expanded=False):
                         _combo_rows = []
                         for r in _all:
-                            _row = {"Spending Strategy": r["spending_label"], "Conversion": r["conversion_label"],
-                                "Net Estate": f"${r['after_tax_estate']:,.0f}", "Total Taxes": f"${r['total_taxes']:,.0f}",
+                            _row = {"Spending Strategy": r["spending_label"], "Conversion": r["conversion_label"]}
+                            if _has_ss_dim: _row["SS Claiming"] = r.get("ss_label", "")
+                            _row.update({"Net Estate": f"${r['after_tax_estate']:,.0f}", "Total Taxes": f"${r['total_taxes']:,.0f}",
                                 "Converted": f"${r['total_converted']:,.0f}",
-                                "vs Best": f"${r['after_tax_estate'] - _best['after_tax_estate']:+,.0f}"}
+                                "vs Best": f"${r['after_tax_estate'] - _best['after_tax_estate']:+,.0f}"})
                             _gs = r.get("_group_size", 1)
                             _row["# Tied"] = str(_gs) if _gs > 1 else ""
                             _combo_rows.append(_row)
                         st.dataframe(pd.DataFrame(_combo_rows), use_container_width=True, hide_index=True)
 
                     # ---- Combo selector + year-by-year detail ----
-                    _combo_labels = [f"{r['spending_label']} + {r['conversion_label']}" for r in _all]
+                    _combo_labels = [f"{r['spending_label']} + {r['conversion_label']}" + (f" [{r.get('ss_label', '')}]" if _has_ss_dim else "") for r in _all]
                     _selected_combo_label = st.selectbox("Select combination to view detail", _combo_labels, index=0, key="fp_opt_combo_select")
                     _selected_idx = _combo_labels.index(_selected_combo_label)
                     _selected_combo = _all[_selected_idx]
                     st.session_state.opt_selected_combo = _selected_combo
 
-                    if _selected_combo_label != f"{_best['spending_label']} + {_best['conversion_label']}":
+                    _best_combo_label = f"{_best['spending_label']} + {_best['conversion_label']}" + (f" [{_best.get('ss_label', '')}]" if _has_ss_dim else "")
+                    if _selected_combo_label != _best_combo_label:
                         col1b, col2b, col3b = st.columns(3)
                         with col1b: st.metric("Selected Gross Estate", f"${_selected_combo['gross_estate']:,.0f}")
                         with col2b: st.metric("Selected Net Estate", f"${_selected_combo['after_tax_estate']:,.0f}")
@@ -5307,8 +6249,8 @@ elif nav == "Achieving":
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("**Tax Bracket Tops (Taxable Income)**")
-                if is_joint: st.write("12% bracket: $96,950"); st.write("22% bracket: $206,700"); st.write("24% bracket: $394,600")
-                else: st.write("12% bracket: $48,475"); st.write("22% bracket: $103,350"); st.write("24% bracket: $197,300")
+                if is_joint: st.write("12% bracket: $100,800"); st.write("22% bracket: $211,400"); st.write("24% bracket: $403,550")
+                else: st.write("12% bracket: $50,400"); st.write("22% bracket: $105,700"); st.write("24% bracket: $201,775")
             with col2:
                 st.markdown("**IRMAA Thresholds (AGI)**")
                 if is_joint: st.write("No IRMAA: $218,000"); st.write("Tier 1: $274,000"); st.write("Tier 2: $342,000"); st.write("Tier 3: $410,000")
@@ -5319,7 +6261,7 @@ elif nav == "Achieving":
                 default_target = 218000.0 if is_joint else 109000.0
                 target_amount = st.number_input("Target AGI", value=default_target, step=1000.0, key="fp_tab5_target_amt"); current_level = solved_res["agi"]
             else:
-                default_target = 206700.0 if is_joint else 103350.0
+                default_target = 211400.0 if is_joint else 105700.0
                 target_amount = st.number_input("Target Taxable Income", value=default_target, step=1000.0, key="fp_tab5_target_amt"); current_level = solved_res["fed_taxable"]
             conversion_room = max(0.0, target_amount - current_level)
             # Only IRA balances are available for conversion (401k generally not convertible while employed)
