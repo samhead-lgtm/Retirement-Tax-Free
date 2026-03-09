@@ -327,17 +327,17 @@ def calc_rmd(age, pretax_balance):
 
 def get_federal_base_std(status, inf=1.0):
     s = status.lower()
-    val = 15750.0
-    if "joint" in s: val = 31500.0
-    elif "head" in s or "hoh" in s: val = 23625.0
+    val = 16100.0
+    if "joint" in s: val = 32200.0
+    elif "head" in s or "hoh" in s: val = 24150.0
     return val * inf
 
 def get_federal_traditional_extra(status, filer_65, spouse_65, inf=1.0):
     extra = 0.0
     is_joint = "joint" in status.lower()
-    base_add = 1600.0 if is_joint else 2000.0
+    base_add = 1650.0 if is_joint else 2050.0
     if filer_65: extra += base_add
-    if is_joint and spouse_65: extra += 1600.0
+    if is_joint and spouse_65: extra += 1650.0
     return extra * inf
 
 def get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf=1.0, tax_year=None):
@@ -355,17 +355,17 @@ def get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf=1.0, tax_ye
 def get_preferential_brackets(status, inf=1.0):
     key = "joint" if "joint" in status.lower() else "hoh" if "head" in status.lower() else "single"
     raw = {
-        "single": [(0, 48350, 0.0), (48350, 533400, 0.15), (533400, float("inf"), 0.20)],
-        "joint": [(0, 96700, 0.0), (96700, 600050, 0.15), (600050, float("inf"), 0.20)],
-        "hoh": [(0, 64750, 0.0), (64750, 566700, 0.15), (566700, float("inf"), 0.20)],
+        "single": [(0, 49450, 0.0), (49450, 545500, 0.15), (545500, float("inf"), 0.20)],
+        "joint": [(0, 98900, 0.0), (98900, 613700, 0.15), (613700, float("inf"), 0.20)],
+        "hoh": [(0, 66200, 0.0), (66200, 579600, 0.15), (579600, float("inf"), 0.20)],
     }[key]
     return [(l * inf, h * inf if h != float("inf") else h, r) for l, h, r in raw]
 
 def calculate_federal_tax(taxable_income, preferential_amount, status, inf=1.0):
     key = "joint" if "joint" in status.lower() else "hoh" if "head" in status.lower() else "single"
     raw_ordinary = {
-        "single": [(0,11925,0.10),(11925,48475,0.12),(48475,103350,0.22),(103350,197300,0.24),(197300,250525,0.32),(250525,626350,0.35),(626350,float("inf"),0.37)],
-        "joint": [(0,23850,0.10),(23850,96950,0.12),(96950,206700,0.22),(206700,394600,0.24),(394600,501050,0.32),(501050,751600,0.35),(751600,float("inf"),0.37)],
+        "single": [(0,12400,0.10),(12400,50400,0.12),(50400,105700,0.22),(105700,201775,0.24),(201775,256225,0.32),(256225,640600,0.35),(640600,float("inf"),0.37)],
+        "joint": [(0,24800,0.10),(24800,100800,0.12),(100800,211400,0.22),(211400,403550,0.24),(403550,512450,0.32),(512450,768700,0.35),(768700,float("inf"),0.37)],
         "hoh": [(0,17000,0.10),(17000,64850,0.12),(64850,103350,0.22),(103350,197300,0.24),(197300,250500,0.32),(250500,626350,0.35),(626350,float("inf"),0.37)],
     }[key]
     ordinary_brackets = [(l*inf, h*inf if h != float("inf") else h, r) for l,h,r in raw_ordinary]
@@ -455,26 +455,26 @@ def annuity_gains(val, basis): return max(0.0, float(val) - float(basis))
 
 def get_fed_brackets(status, inf=1.0):
     if "joint" in status.lower():
-        raw = [(0,23850,0.10),(23850,96950,0.12),(96950,206700,0.22),(206700,394600,0.24),
-               (394600,501050,0.32),(501050,751600,0.35),(751600,float("inf"),0.37)]
+        raw = [(0,24800,0.10),(24800,100800,0.12),(100800,211400,0.22),(211400,403550,0.24),
+               (403550,512450,0.32),(512450,768700,0.35),(768700,float("inf"),0.37)]
     elif "head" in status.lower():
         raw = [(0,17000,0.10),(17000,64850,0.12),(64850,103350,0.22),(103350,197300,0.24),
                (197300,250500,0.32),(250500,626350,0.35),(626350,float("inf"),0.37)]
     else:
-        raw = [(0,11925,0.10),(11925,48475,0.12),(48475,103350,0.22),(103350,197300,0.24),
-               (197300,250525,0.32),(250525,626350,0.35),(626350,float("inf"),0.37)]
+        raw = [(0,12400,0.10),(12400,50400,0.12),(50400,105700,0.22),(105700,201775,0.24),
+               (201775,256225,0.32),(256225,640600,0.35),(640600,float("inf"),0.37)]
     return [(l*inf, h*inf if h != float("inf") else h, r) for l,h,r in raw]
 
 def get_std_deduction(status, filer_65, spouse_65, inf=1.0):
     if "joint" in status.lower():
-        base = 31500.0
-        extra = (1600.0 if filer_65 else 0) + (1600.0 if spouse_65 else 0)
+        base = 32200.0
+        extra = (1650.0 if filer_65 else 0) + (1650.0 if spouse_65 else 0)
     elif "head" in status.lower():
-        base = 23625.0
-        extra = 2000.0 if filer_65 else 0
+        base = 24150.0
+        extra = 2050.0 if filer_65 else 0
     else:
-        base = 15750.0
-        extra = 2000.0 if filer_65 else 0
+        base = 16100.0
+        extra = 2050.0 if filer_65 else 0
     return (base + extra) * inf
 
 def calc_taxable_ss(other_income, gross_ss, status):
@@ -534,14 +534,14 @@ def calc_cg_tax(cap_gains, ordinary_taxable, status, inf=1.0):
     if cap_gains <= 0:
         return 0.0
     if "joint" in status.lower():
-        b0 = 96700 * inf   # top of 0% bracket
-        b1 = 600050 * inf  # top of 15% bracket
+        b0 = 98900 * inf   # top of 0% bracket
+        b1 = 613700 * inf  # top of 15% bracket
     elif "head" in status.lower():
-        b0 = 64750 * inf
-        b1 = 566700 * inf
+        b0 = 66200 * inf
+        b1 = 579600 * inf
     else:
-        b0 = 48350 * inf
-        b1 = 533400 * inf
+        b0 = 49450 * inf
+        b1 = 545500 * inf
     cg_start = ordinary_taxable
     cg_end = ordinary_taxable + cap_gains
     cg_at_0 = max(0.0, min(cg_end, b0) - cg_start)
@@ -664,8 +664,8 @@ def _get_bracket_top(target_bracket_rate, filing_status, inf=1.0):
     """Return the taxable-income ceiling for a given marginal bracket rate."""
     key = "joint" if "joint" in filing_status.lower() else "hoh" if "head" in filing_status.lower() else "single"
     raw = {
-        "single": [(0,11925,0.10),(11925,48475,0.12),(48475,103350,0.22),(103350,197300,0.24),(197300,250525,0.32),(250525,626350,0.35),(626350,float("inf"),0.37)],
-        "joint": [(0,23850,0.10),(23850,96950,0.12),(96950,206700,0.22),(206700,394600,0.24),(394600,501050,0.32),(501050,751600,0.35),(751600,float("inf"),0.37)],
+        "single": [(0,12400,0.10),(12400,50400,0.12),(50400,105700,0.22),(105700,201775,0.24),(201775,256225,0.32),(256225,640600,0.35),(640600,float("inf"),0.37)],
+        "joint": [(0,24800,0.10),(24800,100800,0.12),(100800,211400,0.22),(211400,403550,0.24),(403550,512450,0.32),(512450,768700,0.35),(768700,float("inf"),0.37)],
         "hoh": [(0,17000,0.10),(17000,64850,0.12),(64850,103350,0.22),(103350,197300,0.24),(197300,250500,0.32),(250500,626350,0.35),(626350,float("inf"),0.37)],
     }[key]
     for _lo, hi, rate in raw:
@@ -2811,6 +2811,10 @@ def run_retirement_projection(balances, params, spending_order):
     bracket_growth = params.get("bracket_growth", inflation)
     medicare_growth = params.get("medicare_growth", inflation)
     post_return = params["post_retire_return"]
+    r_pretax = params.get("r_pretax", post_return)
+    r_roth = params.get("r_roth", post_return)
+    r_taxable = params.get("r_taxable", post_return)
+    r_hsa = params.get("r_hsa", post_return)
     filing_status = params["filing_status"]
     state_rate = params["state_tax_rate"]
     _sc_dependents = params.get("dependents", 0)
@@ -3272,18 +3276,29 @@ def run_retirement_projection(balances, params, spending_order):
         total_taxes_paid += taxes + yr_medicare
 
         # Growth
-        yr_return = return_sequence[i] if return_sequence else post_return
-        bal_pt = max(0.0, bal_pt) * (1 + yr_return)
-        bal_ro = max(0.0, bal_ro) * (1 + yr_return)
+        if return_sequence:
+            yr_excess = return_sequence[i] - post_return
+            r_pt_yr = r_pretax + yr_excess
+            r_ro_yr = r_roth + yr_excess
+            r_tx_yr = r_taxable + yr_excess
+            r_hs_yr = r_hsa + yr_excess
+        else:
+            r_pt_yr = r_pretax
+            r_ro_yr = r_roth
+            r_tx_yr = r_taxable
+            r_hs_yr = r_hsa
+
+        bal_pt = max(0.0, bal_pt) * (1 + r_pt_yr)
+        bal_ro = max(0.0, bal_ro) * (1 + r_ro_yr)
         # Brokerage: reduce by div + interest yield since those flow to spending income
-        bal_brokerage = max(0.0, bal_brokerage) * (1 + yr_return - div_yield - brok_int_yield)
+        bal_brokerage = max(0.0, bal_brokerage) * (1 + r_tx_yr - div_yield - brok_int_yield)
         bal_cash = max(0.0, bal_cash) * (1 + cash_int_rate)
-        bal_hs = max(0.0, bal_hs) * (1 + yr_return)
+        bal_hs = max(0.0, bal_hs) * (1 + r_hs_yr)
         bal_tx = bal_brokerage + bal_cash
         # Grow remaining inherited IRA balances
         for idx in range(len(ret_inherited_iras)):
             if ret_iira_bals[idx] > 0:
-                ret_iira_bals[idx] *= (1 + yr_return)
+                ret_iira_bals[idx] *= (1 + r_pt_yr)
 
         # Appreciate home, investment RE, life insurance, annuity
         if i > 0:
@@ -3884,14 +3899,15 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             brokerage_basis += c_taxable
             bal_cash += c_cash_contrib
             bal_hsa += c_hsa
-            # Per-account growth (MC return sequence overrides all rates)
+            # Per-account growth (MC return sequence applies shock offset to each account's rate)
             if accum_return_sequence:
                 yr_return = accum_return_sequence[yr]
-                bal_pretax *= (1 + yr_return)
-                bal_roth *= (1 + yr_return)
+                yr_excess = yr_return - pre_ret_return
+                bal_pretax *= (1 + r_pretax + yr_excess)
+                bal_roth *= (1 + r_roth + yr_excess)
                 _div_drag = (div_yield + ann_cg_pct + _brok_int_yield) if not reinvest_inv_income else 0.0
-                bal_brokerage *= (1 + yr_return - _div_drag)
-                bal_hsa *= (1 + yr_return)
+                bal_brokerage *= (1 + r_taxable + yr_excess - _div_drag)
+                bal_hsa *= (1 + r_hsa + yr_excess)
             else:
                 bal_pretax *= (1 + r_pretax)
                 bal_roth *= (1 + r_roth)
@@ -3904,7 +3920,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             # Grow remaining inherited IRA balances
             for idx in range(len(inherited_iras)):
                 if iira_bals[idx] > 0:
-                    iira_bals[idx] *= (1 + (accum_return_sequence[yr] if accum_return_sequence else r_pretax))
+                    iira_bals[idx] *= (1 + r_pretax + (yr_excess if accum_return_sequence else 0.0))
 
         bal_taxable = bal_brokerage + bal_cash
         bal_inherited_total = sum(iira_bals)

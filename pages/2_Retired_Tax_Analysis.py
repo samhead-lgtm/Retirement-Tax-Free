@@ -186,17 +186,17 @@ def compute_rmd_uniform_start73(balance, age):
 
 def get_federal_base_std(status, inf=1.0):
     s = status.lower()
-    val = 15750.0
-    if "joint" in s: val = 31500.0
-    elif "head" in s or "hoh" in s: val = 23625.0
+    val = 16100.0
+    if "joint" in s: val = 32200.0
+    elif "head" in s or "hoh" in s: val = 24150.0
     return val * inf
 
 def get_federal_traditional_extra(status, filer_65, spouse_65, inf=1.0):
     extra = 0.0
     is_joint = "joint" in status.lower()
-    base_add = 1600.0 if is_joint else 2000.0
+    base_add = 1650.0 if is_joint else 2050.0
     if filer_65: extra += base_add
-    if is_joint and spouse_65: extra += 1600.0
+    if is_joint and spouse_65: extra += 1650.0
     return extra * inf
 
 def get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf=1.0, tax_year=None):
@@ -214,18 +214,18 @@ def get_federal_enhanced_extra(agi, filer_65, spouse_65, status, inf=1.0, tax_ye
 def get_preferential_brackets(status, inf=1.0):
     key = "joint" if "joint" in status.lower() else "hoh" if "head" in status.lower() else "single"
     raw = {
-        "single": [(0, 48350, 0.0), (48350, 533400, 0.15), (533400, float("inf"), 0.20)],
-        "joint": [(0, 96700, 0.0), (96700, 600050, 0.15), (600050, float("inf"), 0.20)],
-        "hoh": [(0, 64750, 0.0), (64750, 566700, 0.15), (566700, float("inf"), 0.20)],
+        "single": [(0, 49450, 0.0), (49450, 545500, 0.15), (545500, float("inf"), 0.20)],
+        "joint": [(0, 98900, 0.0), (98900, 613700, 0.15), (613700, float("inf"), 0.20)],
+        "hoh": [(0, 66200, 0.0), (66200, 579600, 0.15), (579600, float("inf"), 0.20)],
     }[key]
     return [(l * inf, h * inf if h != float("inf") else h, r) for l, h, r in raw]
 
 def calculate_federal_tax(taxable_income, preferential_amount, status, inf=1.0):
     key = "joint" if "joint" in status.lower() else "hoh" if "head" in status.lower() else "single"
     raw_ordinary = {
-        "single": [(0,11925,0.10),(11925,48475,0.12),(48475,103350,0.22),(103350,197300,0.24),(197300,250525,0.32),(250525,626350,0.35),(626350,float("inf"),0.37)],
-        "joint": [(0,23850,0.10),(23850,96950,0.12),(96950,206700,0.22),(206700,394600,0.24),(394600,501050,0.32),(501050,751600,0.35),(751600,float("inf"),0.37)],
-        "hoh": [(0,17000,0.10),(17000,64850,0.12),(64850,103350,0.22),(103350,197300,0.24),(197300,250500,0.32),(250500,626350,0.35),(626350,float("inf"),0.37)],
+        "single": [(0,12400,0.10),(12400,50400,0.12),(50400,105700,0.22),(105700,201775,0.24),(201775,256225,0.32),(256225,640600,0.35),(640600,float("inf"),0.37)],
+        "joint": [(0,24800,0.10),(24800,100800,0.12),(100800,211400,0.22),(211400,403550,0.24),(403550,512450,0.32),(512450,768700,0.35),(768700,float("inf"),0.37)],
+        "hoh": [(0,17700,0.10),(17700,67450,0.12),(67450,105700,0.22),(105700,201750,0.24),(201750,256200,0.32),(256200,640600,0.35),(640600,float("inf"),0.37)],
     }[key]
     ordinary_brackets = [(l*inf, h*inf if h != float("inf") else h, r) for l,h,r in raw_ordinary]
     taxable_income = max(0.0, float(taxable_income))
@@ -310,9 +310,9 @@ def _get_bracket_top(target_bracket_rate, filing_status, inf=1.0):
     """Return the taxable-income ceiling for a given marginal bracket rate."""
     key = "joint" if "joint" in filing_status.lower() else "hoh" if "head" in filing_status.lower() else "single"
     raw = {
-        "single": [(0,11925,0.10),(11925,48475,0.12),(48475,103350,0.22),(103350,197300,0.24),(197300,250525,0.32),(250525,626350,0.35),(626350,float("inf"),0.37)],
-        "joint": [(0,23850,0.10),(23850,96950,0.12),(96950,206700,0.22),(206700,394600,0.24),(394600,501050,0.32),(501050,751600,0.35),(751600,float("inf"),0.37)],
-        "hoh": [(0,17000,0.10),(17000,64850,0.12),(64850,103350,0.22),(103350,197300,0.24),(197300,250500,0.32),(250500,626350,0.35),(626350,float("inf"),0.37)],
+        "single": [(0,12400,0.10),(12400,50400,0.12),(50400,105700,0.22),(105700,201775,0.24),(201775,256225,0.32),(256225,640600,0.35),(640600,float("inf"),0.37)],
+        "joint": [(0,24800,0.10),(24800,100800,0.12),(100800,211400,0.22),(211400,403550,0.24),(403550,512450,0.32),(512450,768700,0.35),(768700,float("inf"),0.37)],
+        "hoh": [(0,17700,0.10),(17700,67450,0.12),(67450,105700,0.22),(105700,201750,0.24),(201750,256200,0.32),(256200,640600,0.35),(640600,float("inf"),0.37)],
     }[key]
     for _lo, hi, rate in raw:
         if abs(rate - target_bracket_rate) < 0.001:
@@ -1408,7 +1408,17 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
 
         # Step 6: Tax-free sources (last resort)
         if shortfall > 1.0:
-            if conversion_this_year == 0:
+            # During conversion years, prefer non-Roth sources to avoid the
+            # wasteful pattern of converting then immediately withdrawing.
+            # BUT if all other sources are exhausted, allow Roth as a fallback
+            # to prevent unfunded spending holes.
+            _other_exhausted = (
+                wd_cash >= balances["cash"] - 1
+                and wd_brokerage >= balances["brokerage"] - 1
+                and wd_pretax >= balances["pretax"] - 1
+                and wd_annuity >= balances["annuity_value"] - 1
+            )
+            if conversion_this_year == 0 or _other_exhausted:
                 avail = balances["roth"] - wd_roth
                 pull = min(shortfall, max(0.0, avail))
                 if pull > 0:
@@ -1545,6 +1555,13 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     _ss_current_year = params.get("current_year", start_year)
     # Whether we have detail params to compute SS year-by-year
     _ss_have_detail = _ss_filer_dob is not None
+
+    # Birth years for IRS "turning age" calculations (RMD, QCD, 65+ deduction).
+    # IRS uses the age you attain during the calendar year, not your age on any
+    # specific date.  year - birth_year gives the correct turning age.
+    _filer_birth_year = (_ss_filer_dob.year if hasattr(_ss_filer_dob, 'year') else int(str(_ss_filer_dob)[:4])) if _ss_filer_dob else None
+    _spouse_birth_year = (_ss_spouse_dob.year if hasattr(_ss_spouse_dob, 'year') else int(str(_ss_spouse_dob)[:4])) if _ss_spouse_dob else None
+
     # Fallback: static base amounts (backward compatible)
     ss_filer_base = params.get("gross_ss_filer")
     ss_spouse_base = params.get("gross_ss_spouse", 0.0)
@@ -1725,11 +1742,17 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr = start_year + i
         age_f = current_age_filer + i
         age_s = (current_age_spouse + i) if current_age_spouse else None
+        # IRS "turning age" = year - birth_year.  Used for RMD, QCD, and 65+
+        # thresholds because the IRS uses the age attained during the calendar
+        # year, not the age on any specific date.  Falls back to age_f + 1
+        # (approximation) when DOB is unavailable.
+        _turning_f = (yr - _filer_birth_year) if _filer_birth_year else age_f + 1
+        _turning_s = (yr - _spouse_birth_year) if _spouse_birth_year else ((age_s + 1) if age_s is not None else None)
         inf_factor = (1 + inflation) ** i
         bracket_inf = (1 + bracket_growth) ** i
         medicare_inf = (1 + medicare_growth) ** i
-        filer_65 = age_f >= 65
-        spouse_65 = age_s >= 65 if age_s else False
+        filer_65 = _turning_f >= 65
+        spouse_65 = _turning_s >= 65 if _turning_s is not None else False
 
         # Age-gate sidebar incomes (0 end_age = ongoing)
         _wages_end = p_wages_end if p_wages_end > p_wages_start else 999
@@ -1843,10 +1866,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 _pen_spouse_yr *= pension_survivor_pct_val
         pen_now = _pen_filer_yr + _pen_spouse_yr
 
-        # Pre-tax: RMD
+        # Pre-tax: RMD (uses IRS turning age, not current age)
         boy_pretax = curr_pre_filer + curr_pre_spouse
-        rmd_f = compute_rmd_uniform_start73(curr_pre_filer, age_f)
-        rmd_s = compute_rmd_uniform_start73(curr_pre_spouse, age_s)
+        rmd_f = compute_rmd_uniform_start73(curr_pre_filer, _turning_f)
+        rmd_s = compute_rmd_uniform_start73(curr_pre_spouse, _turning_s)
         rmd_total = rmd_f + rmd_s
         curr_pre_filer -= rmd_f
         curr_pre_spouse -= rmd_s
@@ -1856,7 +1879,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         yr_qcd = 0.0
         qcd_beyond_rmd = 0.0
         _qcd_base = p_qcd_annual if p_qcd_annual > 0 else (p_charitable if p_charitable > 0 else 0.0)
-        if _qcd_base > 0 and age_f >= 70:
+        if _qcd_base > 0 and _turning_f >= 70:
             is_joint_yr = "joint" in _yr_filing_status.lower()
             qcd_cap = (210000.0 if is_joint_yr else 105000.0) * inf_factor
             yr_qcd_requested = min(_qcd_base * inf_factor, qcd_cap)
@@ -1893,7 +1916,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     s = start_bal
                     for _fy in range(1, _rem):
                         s *= (1 + r_pretax)
-                        _sa = age_f + _fy
+                        _sa = _turning_f + _fy  # use IRS turning age
                         _sr = compute_rmd_uniform_start73(s, _sa)
                         s -= _sr
                         if _sa >= 70:  # QCD only starts at age 70½
@@ -1928,12 +1951,11 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             avail_pretax = max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve)
             if avail_pretax > 0:
                 _yr_conv_strategy = _yr_conv_strat
-                # Estimate spending-driven pre-tax withdrawal so bracket fill accounts for it
-                _est_fixed = ss_now + pen_now + taxable_rmd + spendable_inv + p_wages + p_other_income
-                _est_spending_wd = max(0.0, total_spend_need - _est_fixed)
-                # Use taxable RMD (net of QCD) — QCD-covered RMD is excluded from AGI.
-                # IRA depletion risk is separately managed by the QCD floor (below).
-                base_taxable = pen_now + taxable_rmd + yr_interest + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income + _est_spending_wd
+                # base_taxable = known income only (SS handled separately).
+                # Spending withdrawals are NOT pre-estimated here — the actual
+                # spending strategy (blend / waterfall / prorata) determines the
+                # source downstream and the iterative tax calc handles it.
+                base_taxable = pen_now + taxable_rmd + yr_interest + yr_ordinary_div + yr_cap_gain + p_wages + p_other_income
                 if _yr_conv_strategy == "fill_to_target":
                     room = max(0.0, target_agi * bracket_inf - base_taxable - ss_now * 0.85)
                     conversion_this_year = min(room, avail_pretax)
@@ -1977,15 +1999,16 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
                 # QCD floor: never drain IRA below the level where RMDs can fund QCDs
                 if _qcd_base > 0 and conversion_this_year > 0:
-                    _next_age_f = age_f + 1
-                    _next_age_s = (age_s + 1) if age_s else None
-                    _has_rmd_next = (_next_age_f >= 73) or (_next_age_s is not None and _next_age_s >= 73)
+                    # Use turning age for next year's RMD eligibility
+                    _next_turning_f = _turning_f + 1
+                    _next_turning_s = (_turning_s + 1) if _turning_s is not None else None
+                    _has_rmd_next = (_next_turning_f >= 73) or (_next_turning_s is not None and _next_turning_s >= 73)
                     if _has_rmd_next:
                         _next_qcd = _qcd_base * ((1 + inflation) ** (i + 1))
                         # Use youngest RMD-eligible spouse's divisor (most conservative)
                         _floor_ages = []
-                        if _next_age_f >= 73: _floor_ages.append(_next_age_f)
-                        if _next_age_s is not None and _next_age_s >= 73: _floor_ages.append(_next_age_s)
+                        if _next_turning_f >= 73: _floor_ages.append(_next_turning_f)
+                        if _next_turning_s is not None and _next_turning_s >= 73: _floor_ages.append(_next_turning_s)
                         _floor_div = max(UNIFORM_LIFETIME.get(min(a, 120), UNIFORM_LIFETIME[120]) for a in _floor_ages)
                         # Need: (remaining * (1 + growth)) / divisor >= next_qcd
                         # So remaining >= next_qcd * divisor / (1 + growth)
@@ -2192,7 +2215,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 # 2. Pre-tax up to the annual cap (fills low brackets), reserving for QCD
                 if shortfall > 0:
                     avail_pt = max(0.0, curr_pre_filer + curr_pre_spouse - wd_pretax - qcd_reserve)
-                    pt_room = max(0.0, _pt_cap - wd_pretax - rmd_total - qcd_beyond_rmd)  # RMD counts toward cap
+                    pt_room = max(0.0, _pt_cap - wd_pretax - rmd_total - qcd_beyond_rmd)  # RMD + voluntary QCD count as pretax outflows
                     pull = min(shortfall, avail_pt, pt_room)
                     if pull > 0:
                         wd_pretax += pull; shortfall -= pull
@@ -2222,8 +2245,17 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         wd_pretax += pull; shortfall -= pull
 
                 # 6. Tax-free last resort (Roth, then Life)
+                #    During conversion years, skip Roth unless all other sources
+                #    are exhausted — prevents unfunded spending when pretax is
+                #    depleted by conversion and no cash/brokerage exists.
                 if shortfall > 0:
-                    if conversion_this_year == 0:
+                    _other_dry = (
+                        wd_cash >= curr_cash - 1
+                        and wd_brokerage >= curr_brokerage - 1
+                        and wd_pretax >= (curr_pre_filer + curr_pre_spouse) - 1
+                        and wd_annuity >= curr_ann - 1
+                    )
+                    if conversion_this_year == 0 or _other_dry:
                         avail = max(0.0, curr_roth - wd_roth)
                         pull = min(shortfall, avail)
                         if pull > 0:
@@ -2293,9 +2325,13 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 avail_cash = max(0.0, curr_cash - wd_cash)
                 avail_brok = max(0.0, curr_brokerage - wd_brokerage)
                 avail_pt = max(0.0, curr_pre_filer + curr_pre_spouse - wd_pretax - qcd_reserve)
-                avail_roth = max(0.0, curr_roth - wd_roth) if conversion_this_year == 0 else 0.0
-                avail_life = max(0.0, curr_life - wd_life) if life_spend_cv else 0.0
                 avail_ann = max(0.0, curr_ann - wd_annuity)
+                # Allow Roth during conversion years only when all other sources exhausted
+                _pr_other_dry = (
+                    avail_cash < 1 and avail_brok < 1 and avail_pt < 1 and avail_ann < 1
+                )
+                avail_roth = max(0.0, curr_roth - wd_roth) if (conversion_this_year == 0 or _pr_other_dry) else 0.0
+                avail_life = max(0.0, curr_life - wd_life) if life_spend_cv else 0.0
 
                 w_cash = avail_cash * _pw.get("cash", 1.0)
                 w_brok = avail_brok * _pw.get("brokerage", 1.0)
@@ -2412,6 +2448,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                                 pulled = True
 
                     elif bucket == "Tax-Free":
+                        # During conversion years, skip Roth in normal
+                        # waterfall order but allow as last-resort fallback
+                        # (see post-waterfall fallback below).
                         if conversion_this_year == 0:
                             avail = curr_roth - wd_roth
                             pull = min(shortfall, max(0.0, avail))
@@ -2448,7 +2487,18 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                             pulled = True
 
                 if not pulled:
-                    break
+                    # Last-resort Roth fallback: during conversion years the
+                    # waterfall skips Roth, but if all other buckets are dry
+                    # we must tap Roth to prevent unfunded spending.
+                    if shortfall > 0 and conversion_this_year > 0:
+                        avail = max(0.0, curr_roth - wd_roth)
+                        pull = min(shortfall, avail)
+                        if pull > 0:
+                            wd_roth += pull
+                            shortfall -= pull
+                            pulled = True
+                    if not pulled:
+                        break
 
             # Final tax calc with settled withdrawals
             dyn_gain_pct = max(0.0, 1.0 - brokerage_basis / curr_brokerage) if curr_brokerage > 0 else 0.0
@@ -2630,7 +2680,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         net_estate_yr = at_wealth_yr + home_equity + curr_inv_re_val - _estate_tax_yr
 
         # Total income for display (all taxable income sources)
-        total_income_disp = ss_now + pen_now + spendable_inv + rmd_total + conversion_this_year + yr_extra_income + p_wages + p_other_income + p_tax_exempt_interest + wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
+        total_income_disp = ss_now + pen_now + spendable_inv + taxable_rmd + conversion_this_year + yr_extra_income + p_wages + p_other_income + p_tax_exempt_interest + wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
 
         _status_label = ""
         if first_death_idx is not None:
@@ -2675,6 +2725,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "Portfolio": round(total_wealth_yr, 0),
             "Total Wealth": round(total_wealth_yr, 0),
         })
+        if mtg_balance > 0:
+            row["Mortgage"] = round(curr_mtg_bal, 0)
         if curr_home_val > 0 or home_val > 0:
             row["Home Value"] = round(curr_home_val, 0)
             row["Home Equity"] = round(home_equity, 0)
@@ -4376,9 +4428,10 @@ with tab3:
                         inv_inc = det_inv_inc[_yi]
                         extra_inc = det_extra_inc[_yi]
 
-                        # RMDs from actual pre-tax balances
-                        _age_f = current_age_filer + yr_i
-                        _age_s = (current_age_spouse + yr_i) if current_age_spouse else None
+                        # RMDs from actual pre-tax balances (use IRS turning age)
+                        _mc_yr = int(tax_year) + yr_i
+                        _age_f = (_mc_yr - filer_dob.year) if filer_dob else (current_age_filer + yr_i + 1)
+                        _age_s = ((_mc_yr - spouse_dob.year) if spouse_dob else None) if current_age_spouse else None
                         rmd_f = compute_rmd_uniform_start73(s_pf, _age_f)
                         rmd_s = compute_rmd_uniform_start73(s_ps, _age_s)
                         rmd = rmd_f + rmd_s
@@ -4709,20 +4762,32 @@ with tab4:
             status_text.empty()
             results.sort(key=lambda x: x["after_tax_estate"], reverse=True)
 
-            # Deduplicate: group strategies with nearly identical estates (<$100 apart)
-            _deduped = []
+            # Deduplicate: within each strategy type, collapse results within 1% of each other
+            _type_groups = {}
             for r in results:
-                _merged = False
-                for d in _deduped:
-                    if abs(d["after_tax_estate"] - r["after_tax_estate"]) < 100:
-                        d["_group_members"].append(r["waterfall"])
-                        d["_group_size"] += 1
-                        _merged = True
-                        break
-                if not _merged:
-                    r["_group_members"] = [r["waterfall"]]
-                    r["_group_size"] = 1
-                    _deduped.append(r)
+                _tkey = r["order"] if not r["order"].startswith("prorata") else "prorata"
+                _type_groups.setdefault(_tkey, []).append(r)
+
+            _deduped = []
+            for _tkey, _tgroup in _type_groups.items():
+                # Already sorted by estate desc (global sort preserved)
+                _kept_in_type = []
+                for r in _tgroup:
+                    merged = False
+                    if _kept_in_type:
+                        _last = _kept_in_type[-1]
+                        if _last["after_tax_estate"] > 0 and \
+                           (_last["after_tax_estate"] - r["after_tax_estate"]) / _last["after_tax_estate"] <= 0.01:
+                            _last["_group_members"].append(r["waterfall"])
+                            _last["_group_size"] += 1
+                            merged = True
+                    if not merged:
+                        r["_group_members"] = [r["waterfall"]]
+                        r["_group_size"] = 1
+                        _kept_in_type.append(r)
+                _deduped.extend(_kept_in_type)
+
+            _deduped.sort(key=lambda x: x["after_tax_estate"], reverse=True)
             results = _deduped
 
             st.session_state.phase1_results = results
@@ -5187,7 +5252,7 @@ with tab5:
             default_target = 218000.0 if is_joint else 109000.0
             target_amount = st.number_input("Target AGI", value=default_target, step=1000.0, key="tab5_target_amt"); current_level = solved_res["agi"]
         else:
-            default_target = 206700.0 if is_joint else 103350.0
+            default_target = 211400.0 if is_joint else 105700.0
             target_amount = st.number_input("Target Taxable Income", value=default_target, step=1000.0, key="tab5_target_amt"); current_level = solved_res["fed_taxable"]
         conversion_room = max(0.0, target_amount - current_level)
         available_pretax = st.session_state.assets["pretax"]["balance"] if st.session_state.assets else 0.0

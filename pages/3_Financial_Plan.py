@@ -235,6 +235,23 @@ _CMA_CORR = [
 _CMA_CORR_NP = np.array(_CMA_CORR)
 _CMA_CHOLESKY = np.linalg.cholesky(_CMA_CORR_NP)
 
+# SSA 2023 Period Life Table — unisex (average male/female) annual death probability q(x)
+_SSA_QX = {
+    62: 0.0094, 63: 0.0101, 64: 0.0110, 65: 0.0118, 66: 0.0128, 67: 0.0139,
+    68: 0.0151, 69: 0.0164, 70: 0.0179, 71: 0.0196, 72: 0.0215, 73: 0.0237,
+    74: 0.0261, 75: 0.0289, 76: 0.0321, 77: 0.0358, 78: 0.0401, 79: 0.0451,
+    80: 0.0508, 81: 0.0574, 82: 0.0650, 83: 0.0738, 84: 0.0840, 85: 0.0957,
+    86: 0.1091, 87: 0.1244, 88: 0.1418, 89: 0.1613, 90: 0.1831,
+    91: 0.2071, 92: 0.2333, 93: 0.2614, 94: 0.2910, 95: 0.3218,
+}
+
+def _ssa_survival(from_age, to_age):
+    """Probability of surviving from from_age to to_age using SSA period life table."""
+    p = 1.0
+    for a in range(int(from_age), int(to_age)):
+        p *= (1.0 - _SSA_QX.get(a, 0.25))
+    return p
+
 # Computation state (not persisted in profiles)
 _COMP_DEFAULTS = {
     "base_results": None, "base_inputs": None, "assets": None,
@@ -1172,6 +1189,8 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, tab6, D, is_joint, filing_status,
             "inflation": inflation, "bracket_growth": bracket_growth,
             "medicare_growth": medicare_growth,
             "post_retire_return": post_ret_return,
+            "r_pretax": r_pretax, "r_roth": r_roth,
+            "r_taxable": r_taxable, "r_hsa": r_roth,
             "filing_status": filing_status,
             "state_tax_rate": state_rate,
             "dependents": int(D["dependents"]),
@@ -1453,6 +1472,8 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, tab6, D, is_joint, filing_status,
                         "inflation": inflation, "bracket_growth": bracket_growth,
                         "medicare_growth": medicare_growth,
                         "post_retire_return": post_ret_return,
+                        "r_pretax": r_pretax, "r_roth": r_roth,
+                        "r_taxable": r_taxable, "r_hsa": r_roth,
                         "filing_status": filing_status,
                         "state_tax_rate": state_rate,
                         "dependents": int(D["dependents"]),
@@ -2932,18 +2953,29 @@ def _fp_pre_ret_tabs(tab2, tab3, tab4, tab6, D, is_joint, filing_status,
             0, employee_ira_f, 0, employee_ira_s,
             contrib_hsa, contrib_taxable)
 
-        _u6_contrib_variants = [
-            ("Current", dict(contrib_dict), dict(income_info)),
-            ("Trad-Heavy", _u6_cd_trad, _u6_ii_trad),
-            ("Roth-Heavy", _u6_cd_roth, _u6_ii_roth),
-        ]
+        if years_to_ret <= 0:
+            # Already retired — contribution mix is irrelevant
+            _u6_contrib_variants = [("Current", dict(contrib_dict), dict(income_info))]
+        else:
+            _u6_contrib_variants = [
+                ("Current", dict(contrib_dict), dict(income_info)),
+                ("Trad-Heavy", _u6_cd_trad, _u6_ii_trad),
+                ("Roth-Heavy", _u6_cd_roth, _u6_ii_roth),
+            ]
 
         # ── Build SS variants ──
         _u6_ssdi_f = D["ssdi_filer"]
         _u6_ssdi_s = D["ssdi_spouse"] if is_joint else False
-        _u6_ss_variants = engine._build_ss_variants(
-            current_age_filer, current_age_spouse, ret_age, is_joint,
-            _u6_ssdi_f, _u6_ssdi_s)
+        _u6_filer_ss_locked = filer_ss_already or current_age_filer >= 70
+        _u6_spouse_ss_locked = (not is_joint) or spouse_ss_already or (current_age_spouse is not None and current_age_spouse >= 70)
+        if _u6_filer_ss_locked and _u6_spouse_ss_locked:
+            # SS claiming is already locked — single variant with current claim ages
+            _u6_ss_variants = [(f"SS {ss_filer_claim_age}" + (f"/{ss_spouse_claim_age}" if is_joint else ""),
+                                ss_filer_claim_age, ss_spouse_claim_age if is_joint else None)]
+        else:
+            _u6_ss_variants = engine._build_ss_variants(
+                current_age_filer, current_age_spouse, ret_age, is_joint,
+                _u6_ssdi_f, _u6_ssdi_s)
 
         # ── Build Roth variants ──
         _u6_roth_variants = engine._build_roth_variants(filing_status == "Married Filing Jointly")
@@ -5388,18 +5420,8 @@ elif nav == "Achieving":
                 if _has_ss_choice:
                     st.divider()
                     st.markdown("### SS Claiming Age Analysis")
-                    st.caption("Tests every claiming age combination using your current spending strategy, "
-                               "scored across mortality scenarios to find the optimal claiming ages.")
-                    _ss3_c1, _ss3_c2 = st.columns(2)
-                    with _ss3_c1:
-                        _ss3_early_death = st.number_input(
-                            "Early death scenario age", value=80, min_value=70, max_value=90,
-                            step=1, key="fp_ss_early_death_tab3")
-                    with _ss3_c2:
-                        if is_joint:
-                            st.caption("Weights: 50% both survive / 25% filer dies early / 25% spouse dies early")
-                        else:
-                            st.caption("Weights: 50% survive to plan age / 50% early death")
+                    st.caption("Tests every claiming age combination, scored by actuarial-weighted estate "
+                               "across mortality scenarios using SSA survival probabilities.")
 
                     if st.button("Run SS Analysis", key="fp_run_ss_tab3"):
                         _ss3_params = _build_tab3_params()
@@ -5420,80 +5442,283 @@ elif nav == "Achieving":
                             _ss3_combos = []
 
                         if _ss3_combos:
+                            # Determine death ages for actuarial testing (every 5 years)
+                            _ss3_ref_age = current_age_filer
+                            _ss3_plan_age = filer_plan_through_age
+                            if is_joint and current_age_spouse:
+                                _ss3_ref_age = min(current_age_filer, current_age_spouse)
+                            if is_joint and spouse_plan_through_age:
+                                _ss3_plan_age = max(filer_plan_through_age, spouse_plan_through_age)
+                            _ss3_death_ages = list(range(max(75, _ss3_ref_age + 5), _ss3_plan_age - 4, 5))
+
+                            # Bucket boundaries (midpoints between consecutive death ages)
+                            _ss3_bounds = [_ss3_ref_age]
+                            for _bi in range(len(_ss3_death_ages) - 1):
+                                _ss3_bounds.append((_ss3_death_ages[_bi] + _ss3_death_ages[_bi + 1]) // 2)
+                            _ss3_bounds.append(_ss3_plan_age)
+
+                            # Pre-compute survival/death probabilities per person
+                            _f_surv_plan = _ssa_survival(current_age_filer, filer_plan_through_age)
+                            _f_die_at = {}
+                            for _di, _da in enumerate(_ss3_death_ages):
+                                _f_die_at[_da] = max(0.0, _ssa_survival(current_age_filer, _ss3_bounds[_di]) -
+                                                          _ssa_survival(current_age_filer, _ss3_bounds[_di + 1]))
+                            if is_joint and current_age_spouse and spouse_plan_through_age:
+                                _s_surv_plan = _ssa_survival(current_age_spouse, spouse_plan_through_age)
+                                _s_die_at = {}
+                                for _di, _da in enumerate(_ss3_death_ages):
+                                    _s_die_at[_da] = max(0.0, _ssa_survival(current_age_spouse, _ss3_bounds[_di]) -
+                                                              _ssa_survival(current_age_spouse, _ss3_bounds[_di + 1]))
+
                             _ss3_results = []
                             _ss3_bar = st.progress(0)
                             _ss3_status = st.empty()
-                            for _si, (_ss3_lbl, _ss3_fc, _ss3_sc) in enumerate(_ss3_combos):
-                                _ss3_status.text(f"Testing {_ss3_lbl} ({_si+1}/{len(_ss3_combos)})")
-                                _sp = dict(_ss3_params)
-                                if _ss3_fc is not None: _sp["filer_ss_claim"] = _ss3_fc
-                                if _ss3_sc is not None: _sp["spouse_ss_claim"] = _ss3_sc
-                                _base_res = TEA.run_wealth_projection(a0, _sp, spending_order)
-                                _base_estate = _base_res["after_tax_estate"]
-                                _estate_fd = _base_estate
-                                _estate_sd = _base_estate
-                                if is_joint:
-                                    if _ss3_early_death < _sp.get("filer_plan_through_age", 95):
-                                        _sp_fd = dict(_sp)
-                                        _sp_fd["filer_plan_through_age"] = _ss3_early_death
-                                        _estate_fd = TEA.run_wealth_projection(a0, _sp_fd, spending_order)["after_tax_estate"]
-                                    if _ss3_early_death < _sp.get("spouse_plan_through_age", 95):
-                                        _sp_sd = dict(_sp)
-                                        _sp_sd["spouse_plan_through_age"] = _ss3_early_death
-                                        _estate_sd = TEA.run_wealth_projection(a0, _sp_sd, spending_order)["after_tax_estate"]
-                                    _weighted = 0.50 * _base_estate + 0.25 * _estate_fd + 0.25 * _estate_sd
-                                else:
-                                    _fpta = _sp.get("filer_plan_through_age", 95)
-                                    if int(_ss3_early_death) < _fpta:
-                                        _sp_fd = dict(_sp)
-                                        _sp_fd["filer_plan_through_age"] = int(_ss3_early_death)
-                                        # Single filer: engine ignores plan_through_age, must shorten years
-                                        _sp_fd["years"] = int(_ss3_early_death) - current_age_filer
-                                        _estate_fd = TEA.run_wealth_projection(a0, _sp_fd, spending_order)["after_tax_estate"]
-                                    _weighted = 0.50 * _base_estate + 0.50 * _estate_fd
+                            _n_combos = len(_ss3_combos)
 
-                                _ss3_results.append({
-                                    "label": _ss3_lbl,
-                                    "both_survive": _base_estate,
-                                    "filer_dies": _estate_fd,
-                                    "spouse_dies": _estate_sd,
-                                    "weighted": _weighted,
-                                    "total_ss": sum(r.get("SS", 0) for r in _base_res["year_details"]),
-                                })
-                                _ss3_bar.progress((_si + 1) / len(_ss3_combos))
+                            if is_joint and _ss3_death_ages:
+                                # ── Joint: two-phase approach ──
+                                # Phase 1: base case for all combos
+                                _base_estates = {}
+                                _base_total_ss = {}
+                                for _si, (_lbl, _fc, _sc) in enumerate(_ss3_combos):
+                                    _ss3_status.text(f"Phase 1: {_lbl} ({_si+1}/{_n_combos})")
+                                    _sp = dict(_ss3_params)
+                                    if _fc is not None: _sp["filer_ss_claim"] = _fc
+                                    if _sc is not None: _sp["spouse_ss_claim"] = _sc
+                                    _res = TEA.run_wealth_projection(a0, _sp, spending_order)
+                                    _base_estates[_lbl] = _res["after_tax_estate"]
+                                    _base_total_ss[_lbl] = sum(r.get("SS", 0) for r in _res["year_details"])
+                                    _ss3_bar.progress(int(50 * (_si + 1) / _n_combos))
+
+                                # Take top N for actuarial pass + ensure extremes are included for breakeven
+                                _top_n = min(10, _n_combos)
+                                _sorted_base = sorted(_base_estates.items(), key=lambda x: x[1], reverse=True)
+                                _top_labels = set(lbl for lbl, _ in _sorted_base[:_top_n])
+                                _top_labels.add(_ss3_combos[0][0])
+                                _top_labels.add(_ss3_combos[-1][0])
+
+                                # Phase 2: death scenarios for top combos
+                                _death_scenarios = {}
+                                _phase2_runs = len(_top_labels) * len(_ss3_death_ages) * 2
+                                _phase2_done = 0
+                                for _lbl, _fc, _sc in _ss3_combos:
+                                    if _lbl not in _top_labels:
+                                        continue
+                                    _death_scenarios[_lbl] = {}
+                                    _sp = dict(_ss3_params)
+                                    if _fc is not None: _sp["filer_ss_claim"] = _fc
+                                    if _sc is not None: _sp["spouse_ss_claim"] = _sc
+                                    for _da in _ss3_death_ages:
+                                        _death_scenarios[_lbl][_da] = {}
+                                        # Filer dies at age _da
+                                        if _da < filer_plan_through_age:
+                                            _sp_fd = dict(_sp); _sp_fd["filer_plan_through_age"] = _da
+                                            _death_scenarios[_lbl][_da]["filer_dies"] = TEA.run_wealth_projection(
+                                                a0, _sp_fd, spending_order)["after_tax_estate"]
+                                        else:
+                                            _death_scenarios[_lbl][_da]["filer_dies"] = _base_estates[_lbl]
+                                        _phase2_done += 1
+                                        # Spouse dies at age _da
+                                        if _da < spouse_plan_through_age:
+                                            _sp_sd = dict(_sp); _sp_sd["spouse_plan_through_age"] = _da
+                                            _death_scenarios[_lbl][_da]["spouse_dies"] = TEA.run_wealth_projection(
+                                                a0, _sp_sd, spending_order)["after_tax_estate"]
+                                        else:
+                                            _death_scenarios[_lbl][_da]["spouse_dies"] = _base_estates[_lbl]
+                                        _phase2_done += 1
+                                        _ss3_status.text(f"Phase 2: {_lbl} @ {_da} ({_phase2_done}/{_phase2_runs})")
+                                        _ss3_bar.progress(50 + int(50 * _phase2_done / max(1, _phase2_runs)))
+
+                                # Compute actuarial weights (calendar-time aligned)
+                                _raw_weights = [("base", _f_surv_plan * _s_surv_plan)]
+                                for _da in _ss3_death_ages:
+                                    _yrs_f = _da - current_age_filer
+                                    _raw_weights.append((f"filer_dies_{_da}",
+                                        _f_die_at[_da] * _ssa_survival(current_age_spouse, current_age_spouse + _yrs_f)))
+                                    _yrs_s = _da - current_age_spouse
+                                    _raw_weights.append((f"spouse_dies_{_da}",
+                                        _s_die_at[_da] * _ssa_survival(current_age_filer, current_age_filer + _yrs_s)))
+                                _w_total = sum(w for _, w in _raw_weights)
+                                _norm_weights = [(k, w / _w_total) for k, w in _raw_weights] if _w_total > 0 else [("base", 1.0)]
+
+                                # Score all combos
+                                for _lbl, _fc, _sc in _ss3_combos:
+                                    if _lbl in _top_labels and _lbl in _death_scenarios:
+                                        _act = 0.0
+                                        for _wk, _wv in _norm_weights:
+                                            if _wk == "base":
+                                                _act += _wv * _base_estates[_lbl]
+                                            elif _wk.startswith("filer_dies_"):
+                                                _d = int(_wk.rsplit("_", 1)[1])
+                                                _act += _wv * _death_scenarios[_lbl][_d]["filer_dies"]
+                                            else:
+                                                _d = int(_wk.rsplit("_", 1)[1])
+                                                _act += _wv * _death_scenarios[_lbl][_d]["spouse_dies"]
+                                    else:
+                                        _act = _base_estates[_lbl]
+                                    _ss3_results.append({
+                                        "label": _lbl, "actuarial": _act,
+                                        "both_survive": _base_estates[_lbl],
+                                        "death_scenarios": _death_scenarios.get(_lbl, {}),
+                                        "total_ss": _base_total_ss[_lbl],
+                                    })
+
+                            elif not is_joint and _ss3_death_ages:
+                                # ── Single: one projection per combo, read estate from year_details ──
+                                for _si, (_lbl, _fc, _sc) in enumerate(_ss3_combos):
+                                    _ss3_status.text(f"Testing {_lbl} ({_si+1}/{_n_combos})")
+                                    _sp = dict(_ss3_params)
+                                    if _fc is not None: _sp["filer_ss_claim"] = _fc
+                                    if _sc is not None: _sp["spouse_ss_claim"] = _sc
+                                    _res = TEA.run_wealth_projection(a0, _sp, spending_order)
+                                    _base_estate = _res["after_tax_estate"]
+                                    _total_ss = sum(r.get("SS", 0) for r in _res["year_details"])
+                                    # Build age -> estate map from year_details
+                                    _age_estate = {}
+                                    for _row in _res["year_details"]:
+                                        _age_estate[int(_row.get("Age", 0))] = _row.get("Estate (Net)", _base_estate)
+                                    # Compute actuarial score
+                                    _act = _f_surv_plan * _base_estate
+                                    _death_vals = {}
+                                    for _da in _ss3_death_ages:
+                                        _ev = _age_estate.get(_da, _base_estate)
+                                        _death_vals[_da] = _ev
+                                        _act += _f_die_at[_da] * _ev
+                                    _w_sum = _f_surv_plan + sum(_f_die_at[d] for d in _ss3_death_ages)
+                                    if _w_sum > 0:
+                                        _act /= _w_sum
+                                    _ss3_results.append({
+                                        "label": _lbl, "actuarial": _act,
+                                        "both_survive": _base_estate,
+                                        "death_scenarios": {d: {"filer_dies": _death_vals[d]} for d in _ss3_death_ages},
+                                        "total_ss": _total_ss,
+                                    })
+                                    _ss3_bar.progress((_si + 1) / _n_combos)
+                                # Build normalized weights for display
+                                _norm_weights = [("base", _f_surv_plan)]
+                                for _da in _ss3_death_ages:
+                                    _norm_weights.append((f"filer_dies_{_da}", _f_die_at[_da]))
+                                _w_total = sum(w for _, w in _norm_weights)
+                                _norm_weights = [(k, w / _w_total) for k, w in _norm_weights] if _w_total > 0 else [("base", 1.0)]
+
+                            else:
+                                # No death ages — base case only
+                                for _si, (_lbl, _fc, _sc) in enumerate(_ss3_combos):
+                                    _ss3_status.text(f"Testing {_lbl} ({_si+1}/{_n_combos})")
+                                    _sp = dict(_ss3_params)
+                                    if _fc is not None: _sp["filer_ss_claim"] = _fc
+                                    if _sc is not None: _sp["spouse_ss_claim"] = _sc
+                                    _res = TEA.run_wealth_projection(a0, _sp, spending_order)
+                                    _ss3_results.append({
+                                        "label": _lbl, "actuarial": _res["after_tax_estate"],
+                                        "both_survive": _res["after_tax_estate"],
+                                        "death_scenarios": {},
+                                        "total_ss": sum(r.get("SS", 0) for r in _res["year_details"]),
+                                    })
+                                    _ss3_bar.progress((_si + 1) / _n_combos)
+                                _norm_weights = [("base", 1.0)]
+
                             _ss3_bar.empty()
                             _ss3_status.empty()
-                            _ss3_results.sort(key=lambda x: x["weighted"], reverse=True)
+                            _ss3_results.sort(key=lambda x: x["actuarial"], reverse=True)
                             st.session_state.tab3_ss_results = _ss3_results
-                            st.session_state._ss3_early_death_used = int(_ss3_early_death)
+                            st.session_state._ss3_death_ages = _ss3_death_ages
+                            st.session_state._ss3_weights = _norm_weights
+                            st.session_state._ss3_is_joint = is_joint
+                            st.session_state._ss3_early_label = _ss3_combos[0][0]
+                            st.session_state._ss3_late_label = _ss3_combos[-1][0]
                         else:
                             st.info("No SS claiming age variants to test.")
 
                     # Display results
-                    if st.session_state.get("tab3_ss_results"):
+                    if st.session_state.get("tab3_ss_results") and "actuarial" in st.session_state.tab3_ss_results[0]:
                         _ssr = st.session_state.tab3_ss_results
+                        _ss3_da = st.session_state.get("_ss3_death_ages", [])
+                        _ss3_wt = st.session_state.get("_ss3_weights", [])
+                        _ss3_jt = st.session_state.get("_ss3_is_joint", False)
                         _best_ss = _ssr[0]
                         _worst_ss = _ssr[-1]
-                        _ss3_used_age = st.session_state.get("_ss3_early_death_used", 80)
-                        st.success(f"**Best:** {_best_ss['label']} — Weighted Estate: **${_best_ss['weighted']:,.0f}** "
-                                   f"(+${_best_ss['weighted'] - _worst_ss['weighted']:,.0f} vs worst)  "
-                                   f"*[early death scenario: age {_ss3_used_age}]*")
+                        st.success(f"**Best:** {_best_ss['label']} — Actuarial Score: **${_best_ss['actuarial']:,.0f}** "
+                                   f"(+${_best_ss['actuarial'] - _worst_ss['actuarial']:,.0f} vs worst)")
+
+                        # Actuarial weight caption
+                        _wt_parts = []
+                        for _wk, _wv in _ss3_wt:
+                            if _wk == "base":
+                                _wt_parts.append(f"Both survive: {_wv:.1%}")
+                            elif _wk.startswith("filer_dies_"):
+                                _da_s = _wk.rsplit("_", 1)[1]
+                                _wt_parts.append(f"{'Filer' if _ss3_jt else 'Dies'}@{_da_s}: {_wv:.1%}")
+                            elif _wk.startswith("spouse_dies_"):
+                                _da_s = _wk.rsplit("_", 1)[1]
+                                _wt_parts.append(f"Spouse@{_da_s}: {_wv:.1%}")
+                        st.caption("Actuarial weights (SSA life table): " + " \u00b7 ".join(_wt_parts))
+
+                        # Results table
                         _ss3_rows = []
                         for r in _ssr:
                             _row = {
                                 "SS Claiming": r["label"],
-                                "Weighted Score": f"${r['weighted']:,.0f}",
+                                "Actuarial Score": f"${r['actuarial']:,.0f}",
                                 "Both Survive": f"${r['both_survive']:,.0f}",
                             }
-                            if is_joint:
-                                _row[f"Filer Dies @ {_ss3_used_age}"] = f"${r['filer_dies']:,.0f}"
-                                _row[f"Spouse Dies @ {_ss3_used_age}"] = f"${r['spouse_dies']:,.0f}"
-                            else:
-                                _row[f"Dies @ {_ss3_used_age}"] = f"${r['filer_dies']:,.0f}"
-                            _row["Total SS Received"] = f"${r['total_ss']:,.0f}"
-                            _row["vs Best"] = f"${r['weighted'] - _best_ss['weighted']:+,.0f}"
+                            _ds = r.get("death_scenarios", {})
+                            for _da in _ss3_da:
+                                if _da in _ds:
+                                    if _ss3_jt:
+                                        _row[f"F@{_da}"] = f"${_ds[_da].get('filer_dies', 0):,.0f}"
+                                        _row[f"S@{_da}"] = f"${_ds[_da].get('spouse_dies', 0):,.0f}"
+                                    else:
+                                        _row[f"Dies@{_da}"] = f"${_ds[_da].get('filer_dies', 0):,.0f}"
+                                else:
+                                    if _ss3_jt:
+                                        _row[f"F@{_da}"] = "\u2014"
+                                        _row[f"S@{_da}"] = "\u2014"
+                                    else:
+                                        _row[f"Dies@{_da}"] = "\u2014"
+                            _row["Total SS"] = f"${r['total_ss']:,.0f}"
+                            _row["vs Best"] = f"${r['actuarial'] - _best_ss['actuarial']:+,.0f}"
                             _ss3_rows.append(_row)
                         st.dataframe(pd.DataFrame(_ss3_rows), use_container_width=True, hide_index=True)
+
+                        # Breakeven analysis
+                        if len(_ssr) >= 2 and _ss3_da:
+                            _early_lbl = st.session_state.get("_ss3_early_label")
+                            _late_lbl = st.session_state.get("_ss3_late_label")
+                            _early_r = next((r for r in _ssr if r["label"] == _early_lbl), None)
+                            _late_r = next((r for r in _ssr if r["label"] == _late_lbl), None)
+                            if _early_r and _late_r and _early_r["death_scenarios"] and _late_r["death_scenarios"]:
+                                _de = _early_r["death_scenarios"]
+                                _dl = _late_r["death_scenarios"]
+                                # Build comparison: (age, early_estate, late_estate)
+                                _cmp_pts = []
+                                for _da in _ss3_da:
+                                    if _da in _de and _da in _dl:
+                                        if _ss3_jt:
+                                            _ee = (_de[_da].get("filer_dies", 0) + _de[_da].get("spouse_dies", 0)) / 2.0
+                                            _le = (_dl[_da].get("filer_dies", 0) + _dl[_da].get("spouse_dies", 0)) / 2.0
+                                        else:
+                                            _ee = _de[_da].get("filer_dies", 0)
+                                            _le = _dl[_da].get("filer_dies", 0)
+                                        _cmp_pts.append((_da, _ee, _le))
+                                _cmp_pts.append((filer_plan_through_age, _early_r["both_survive"], _late_r["both_survive"]))
+                                # Find crossover: where late - early goes from negative to positive
+                                _diffs = [(age, le - ee) for age, ee, le in _cmp_pts]
+                                _crossover = None
+                                for _ci in range(len(_diffs) - 1):
+                                    if _diffs[_ci][1] < 0 and _diffs[_ci + 1][1] >= 0:
+                                        _a1, _d1 = _diffs[_ci]
+                                        _a2, _d2 = _diffs[_ci + 1]
+                                        if _d2 != _d1:
+                                            _crossover = int(_a1 + (-_d1) / (_d2 - _d1) * (_a2 - _a1))
+                                        break
+                                if _crossover:
+                                    st.info(f"**Breakeven:** {_late_lbl} overtakes {_early_lbl} "
+                                            f"if you survive past age **{_crossover}**")
+                                elif all(d >= 0 for _, d in _diffs):
+                                    st.info(f"**{_late_lbl}** (delayed claiming) wins at all tested ages")
+                                elif all(d <= 0 for _, d in _diffs):
+                                    st.info(f"**{_early_lbl}** (early claiming) wins at all tested ages")
 
         # ════════════════════════════════════════════════════════════════
         # TAB 4: Multigenerational Optimizer
@@ -5585,37 +5810,6 @@ elif nav == "Achieving":
                 "order": strat.get("key", strat.get("type", "")),
             }
 
-        def _compute_mortality_score(a0, base_params, strat, base_result, early_death_age, **run_kw):
-            """Run early-death scenarios and return weighted estate score."""
-            _base_estate = base_result["after_tax_estate"]
-            if is_joint:
-                # Filer dies early
-                if early_death_age < base_params.get("filer_plan_through_age", 95):
-                    _p_fd = dict(base_params)
-                    _p_fd["filer_plan_through_age"] = early_death_age
-                    _estate_fd = _run_single_strategy(a0, _p_fd, strat, **run_kw)["after_tax_estate"]
-                else:
-                    _estate_fd = _base_estate
-                # Spouse dies early
-                if early_death_age < base_params.get("spouse_plan_through_age", 95):
-                    _p_sd = dict(base_params)
-                    _p_sd["spouse_plan_through_age"] = early_death_age
-                    _estate_sd = _run_single_strategy(a0, _p_sd, strat, **run_kw)["after_tax_estate"]
-                else:
-                    _estate_sd = _base_estate
-                return 0.50 * _base_estate + 0.25 * _estate_fd + 0.25 * _estate_sd
-            else:
-                # Single: 50/50 survive vs die early
-                _fpta = base_params.get("filer_plan_through_age", 95)
-                if int(early_death_age) < _fpta:
-                    _p_fd = dict(base_params)
-                    _p_fd["filer_plan_through_age"] = int(early_death_age)
-                    _p_fd["years"] = int(early_death_age) - base_params.get("current_age_filer", 65)
-                    _estate_fd = _run_single_strategy(a0, _p_fd, strat, **run_kw)["after_tax_estate"]
-                else:
-                    _estate_fd = _base_estate
-                return 0.50 * _base_estate + 0.50 * _estate_fd
-
         with tab4:
             st.subheader("Multigenerational Optimizer")
             st.write("Jointly optimizes spending strategy and Roth conversions to maximize after-tax estate to heirs.")
@@ -5654,25 +5848,6 @@ elif nav == "Achieving":
                     agi_cap_enabled = st.checkbox("Cap all strategies at Target AGI", value=True, key="fp_opt_agi_cap",
                         help="When checked, bracket-fill and fixed-amount strategies won't exceed the Target AGI")
                     test_adaptive_overrides = st.checkbox("Test adaptive strategies with override conversions", value=True, key="fp_opt_adaptive_overrides")
-                    _might_have_ss_dim = (
-                        (not filer_ss_already and filer_ss_fra > 0) or
-                        (is_joint and not spouse_ss_already and spouse_ss_fra > 0)
-                    )
-                    if _might_have_ss_dim:
-                        st.divider()
-                        st.markdown("**SS Claiming Optimization**")
-                        _use_mortality_weight = st.checkbox(
-                            "Score SS with mortality risk", value=True, key="fp_opt_mortality_ss",
-                            help="Scores each SS claiming age across 3 death scenarios to avoid always picking age 70")
-                        if _use_mortality_weight:
-                            _early_death_age = st.number_input(
-                                "Early death scenario age", value=80, min_value=70, max_value=90,
-                                step=1, key="fp_opt_early_death")
-                        else:
-                            _early_death_age = 80
-                    else:
-                        _use_mortality_weight = False
-                        _early_death_age = 80
 
                 if st.button("Run Optimizer", type="primary", key="fp_run_optimizer"):
                     params = _build_tab3_params()
@@ -5764,30 +5939,10 @@ elif nav == "Achieving":
                     if not _year_variants or _year_variants[-1] < _max_conv_years:
                         _year_variants.append(_max_conv_years)
 
-                    # ---- Build SS claiming age variants ----
-                    _ss_variants = [("Current SS", None, None)]  # baseline: use profile settings
-                    if not params["filer_ss_already"] and params["filer_ss_fra"] > 0:
-                        _f_min_age = max(62, current_age_filer)
-                        _filer_claim_ages = list(range(_f_min_age, 71))
-                    else:
-                        _filer_claim_ages = []
-                    if is_joint and not params["spouse_ss_already"] and params["spouse_ss_fra"] > 0:
-                        _s_min_age = max(62, current_age_spouse)
-                        _spouse_claim_ages = list(range(_s_min_age, 71))
-                    else:
-                        _spouse_claim_ages = []
-                    if _filer_claim_ages and _spouse_claim_ages:
-                        _ss_variants = [(f"SS {fa}/{sa}", str(fa), str(sa)) for fa in _filer_claim_ages for sa in _spouse_claim_ages]
-                    elif _filer_claim_ages:
-                        _ss_variants = [(f"SS Filer {a}", str(a), None) for a in _filer_claim_ages]
-                    elif _spouse_claim_ages:
-                        _ss_variants = [(f"SS Spouse {a}", None, str(a)) for a in _spouse_claim_ages]
-                    _has_ss_dim = len(_ss_variants) > 1
-
                     # ---- Count total runs for progress ----
-                    _n_quick = (len(_spending_strategies) + len(_adaptive_strategies)) * len(_ss_variants)
-                    _n_deep_est = min(deep_top_k, len(_spending_strategies) * len(_ss_variants)) * len(_conv_strategies) * len(_year_variants)
-                    if test_adaptive_overrides: _n_deep_est += min(3, len(_adaptive_strategies) * len(_ss_variants)) * len(_conv_strategies) * len(_year_variants)
+                    _n_quick = len(_spending_strategies) + len(_adaptive_strategies)
+                    _n_deep_est = min(deep_top_k, len(_spending_strategies)) * len(_conv_strategies) * len(_year_variants)
+                    if test_adaptive_overrides: _n_deep_est += min(3, len(_adaptive_strategies)) * len(_conv_strategies) * len(_year_variants)
                     _n_total = _n_quick + _n_deep_est
 
                     all_results = []; _run_count = 0
@@ -5799,122 +5954,76 @@ elif nav == "Achieving":
                     status_text.text("Quick Scan: testing spending strategies...")
 
                     # Non-adaptive strategies — no conversions (stop_conversion_age=0)
-                    for _ss_label, _ss_f_claim, _ss_s_claim in _ss_variants:
-                        _p = dict(params)
-                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
-                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
-                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
-                        for _strat in _spending_strategies:
-                            status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']}{_ss_tag}")
-                            result = _run_single_strategy(a0, _p, _strat, conv_strat="none", stop_age=0)
-                            pkg = _package_result(result, _strat, _strat["label"], "No Conversion", "quick")
-                            pkg["ss_label"] = _ss_label
-                            if _use_mortality_weight and _has_ss_dim:
-                                pkg["_mortality_score"] = _compute_mortality_score(
-                                    a0, _p, _strat, result, _early_death_age,
-                                    conv_strat="none", stop_age=0)
-                            else:
-                                pkg["_mortality_score"] = pkg["after_tax_estate"]
-                            all_results.append(pkg)
-                            _run_count += 1
-                            progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
+                    for _strat in _spending_strategies:
+                        status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']}")
+                        result = _run_single_strategy(a0, params, _strat, conv_strat="none", stop_age=0)
+                        pkg = _package_result(result, _strat, _strat["label"], "No Conversion", "quick")
+                        all_results.append(pkg)
+                        _run_count += 1
+                        progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
 
-                    # Adaptive strategies — WITH their built-in conversions (the key fix!)
-                    for _ss_label, _ss_f_claim, _ss_s_claim in _ss_variants:
-                        _p = dict(params)
-                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
-                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
-                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
-                        for _strat in _adaptive_strategies:
-                            status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']} (built-in conversions){_ss_tag}")
-                            result = _run_single_strategy(a0, _p, _strat, conv_strat="none",
-                                                           stop_age=opt_stop_age, target_agi=target_agi_input)
-                            pkg = _package_result(result, _strat, _strat["label"], "Built-in", "quick")
-                            pkg["ss_label"] = _ss_label
-                            if _use_mortality_weight and _has_ss_dim:
-                                pkg["_mortality_score"] = _compute_mortality_score(
-                                    a0, _p, _strat, result, _early_death_age,
-                                    conv_strat="none", stop_age=opt_stop_age, target_agi=target_agi_input)
-                            else:
-                                pkg["_mortality_score"] = pkg["after_tax_estate"]
-                            all_results.append(pkg)
-                            _run_count += 1
-                            progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
+                    # Adaptive strategies — WITH their built-in conversions
+                    for _strat in _adaptive_strategies:
+                        status_text.text(f"Quick Scan ({_run_count + 1}/{_n_quick}): {_strat['label']} (built-in conversions)")
+                        result = _run_single_strategy(a0, params, _strat, conv_strat="none",
+                                                       stop_age=opt_stop_age, target_agi=target_agi_input)
+                        pkg = _package_result(result, _strat, _strat["label"], "Built-in", "quick")
+                        all_results.append(pkg)
+                        _run_count += 1
+                        progress_bar.progress(min(1.0, _run_count / _n_total * 0.4))
 
-                    # ---- Rank quick scan, select top K non-adaptive (with SS variant) ----
+                    # ---- Rank quick scan, select top K for deep search ----
                     _quick_non_adaptive = [r for r in all_results if r["scan_phase"] == "quick" and r["conversion_label"] == "No Conversion"]
-                    _rank_key = "_mortality_score" if _use_mortality_weight and _has_ss_dim else "after_tax_estate"
-                    _quick_non_adaptive.sort(key=lambda x: x.get(_rank_key, x["after_tax_estate"]), reverse=True)
-                    _top_k_spending = _quick_non_adaptive[:deep_top_k]
-                    # Build top-K combos carrying associated SS variant
-                    _top_k_combos = []
-                    _seen_combo_keys = set()
-                    for r in _top_k_spending:
-                        _combo_key = (r["spending_label"], r.get("ss_label", "Current SS"))
-                        if _combo_key not in _seen_combo_keys:
-                            _seen_combo_keys.add(_combo_key)
-                            _strat = next((s for s in _spending_strategies if s["label"] == r["spending_label"]), None)
-                            _ss = next((sv for sv in _ss_variants if sv[0] == r.get("ss_label", "Current SS")), _ss_variants[0])
-                            if _strat:
-                                _top_k_combos.append((_strat, _ss))
+                    _quick_non_adaptive.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+                    _top_k_strats = []
+                    for r in _quick_non_adaptive:
+                        _strat = next((s for s in _spending_strategies if s["label"] == r["spending_label"]), None)
+                        if _strat:
+                            _top_k_strats.append(_strat)
+                        if len(_top_k_strats) >= deep_top_k: break
 
                     _quick_adaptive = [r for r in all_results if r["scan_phase"] == "quick" and r["conversion_label"] == "Built-in"]
-                    _quick_adaptive.sort(key=lambda x: x.get(_rank_key, x["after_tax_estate"]), reverse=True)
-                    _top_adaptive_combos = []
+                    _quick_adaptive.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+                    _top_adaptive_strats = []
                     if test_adaptive_overrides:
-                        _seen_adaptive = set()
                         for r in _quick_adaptive:
-                            _akey = (r["spending_label"], r.get("ss_label", "Current SS"))
-                            if _akey not in _seen_adaptive:
-                                _seen_adaptive.add(_akey)
-                                _strat = next((s for s in _adaptive_strategies if s["label"] == r["spending_label"]), None)
-                                _ss = next((sv for sv in _ss_variants if sv[0] == r.get("ss_label", "Current SS")), _ss_variants[0])
-                                if _strat:
-                                    _top_adaptive_combos.append((_strat, _ss))
-                                if len(_top_adaptive_combos) >= 3:
-                                    break
+                            _strat = next((s for s in _adaptive_strategies if s["label"] == r["spending_label"]), None)
+                            if _strat:
+                                _top_adaptive_strats.append(_strat)
+                            if len(_top_adaptive_strats) >= 3:
+                                break
 
                     # ════════════════════════════════════════════
-                    # DEEP SEARCH: top K spending (with SS) × all conversions + top adaptive × overrides
+                    # DEEP SEARCH: top K spending × all conversions + top adaptive × overrides
                     # ════════════════════════════════════════════
                     status_text.text("Deep Search: testing spending + conversion combos...")
 
-                    for _strat, (_ss_label, _ss_f_claim, _ss_s_claim) in _top_k_combos:
-                        _p = dict(params)
-                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
-                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
-                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
+                    for _strat in _top_k_strats:
                         for _conv_val, _conv_label in _conv_strategies:
                             for _cyrs in _year_variants:
                                 _deep_idx = _run_count + 1 - _n_quick
-                                status_text.text(f"Deep Search ({_deep_idx}/{_n_deep_est}): {_strat['label']} + {_conv_label} × {_cyrs}yr{_ss_tag}")
-                                result = _run_single_strategy(a0, _p, _strat, conv_strat=_conv_val,
+                                status_text.text(f"Deep Search ({_deep_idx}/{_n_deep_est}): {_strat['label']} + {_conv_label} × {_cyrs}yr")
+                                result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
                                                                stop_age=opt_stop_age, target_agi=target_agi_input,
                                                                conv_years=_cyrs, agi_cap=agi_cap_enabled)
                                 pkg = _package_result(result, _strat, _strat["label"],
                                                       f"{_conv_label} × {_cyrs}yr", "deep")
-                                pkg["ss_label"] = _ss_label
                                 all_results.append(pkg)
                                 _run_count += 1
                                 _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
                                 progress_bar.progress(min(1.0, _deep_pct))
 
-                    # Adaptive overrides: top 3 adaptive (with SS) × all explicit conversions × year variants
-                    for _strat, (_ss_label, _ss_f_claim, _ss_s_claim) in _top_adaptive_combos:
-                        _p = dict(params)
-                        if _ss_f_claim is not None: _p["filer_ss_claim"] = _ss_f_claim
-                        if _ss_s_claim is not None: _p["spouse_ss_claim"] = _ss_s_claim
-                        _ss_tag = f" [{_ss_label}]" if _has_ss_dim else ""
+                    # Adaptive overrides: top 3 adaptive × all explicit conversions × year variants
+                    for _strat in _top_adaptive_strats:
                         for _conv_val, _conv_label in _conv_strategies:
                             for _cyrs in _year_variants:
                                 _deep_idx = _run_count + 1 - _n_quick
-                                status_text.text(f"Deep Search ({_deep_idx}/{_n_deep_est}): {_strat['label']} + {_conv_label} × {_cyrs}yr{_ss_tag}")
-                                result = _run_single_strategy(a0, _p, _strat, conv_strat=_conv_val,
+                                status_text.text(f"Deep Search ({_deep_idx}/{_n_deep_est}): {_strat['label']} + {_conv_label} × {_cyrs}yr")
+                                result = _run_single_strategy(a0, params, _strat, conv_strat=_conv_val,
                                                                stop_age=opt_stop_age, target_agi=target_agi_input,
                                                                conv_years=_cyrs, agi_cap=agi_cap_enabled)
                                 pkg = _package_result(result, _strat, _strat["label"],
                                                       f"{_conv_label} × {_cyrs}yr", "deep")
-                                pkg["ss_label"] = _ss_label
                                 all_results.append(pkg)
                                 _run_count += 1
                                 _deep_pct = 0.4 + 0.6 * (_run_count - _n_quick) / max(1, _n_deep_est)
@@ -5964,27 +6073,19 @@ elif nav == "Achieving":
                             _best_strat = next((s for s in _spending_strategies + _adaptive_strategies
                                                 if s["label"] == _best_deep["spending_label"]), None)
                             if _best_strat and _refine_amounts:
-                                # Carry SS variant from best deep result
-                                _refine_ss = next((sv for sv in _ss_variants if sv[0] == _best_deep.get("ss_label", "Current SS")), _ss_variants[0])
-                                _refine_ss_label, _refine_ss_f, _refine_ss_s = _refine_ss
-                                _p_refine = dict(params)
-                                if _refine_ss_f is not None: _p_refine["filer_ss_claim"] = _refine_ss_f
-                                if _refine_ss_s is not None: _p_refine["spouse_ss_claim"] = _refine_ss_s
                                 _n_refine = len(_refine_amounts) * len(_refine_years)
-                                _ss_tag = f" [{_refine_ss_label}]" if _has_ss_dim else ""
-                                status_text.text(f"Refining: {len(_refine_amounts)} amounts × {len(_refine_years)} year durations...{_ss_tag}")
+                                status_text.text(f"Refining: {len(_refine_amounts)} amounts × {len(_refine_years)} year durations...")
                                 progress_bar.progress(0.0)
                                 _ri_count = 0
                                 for _ramt in _refine_amounts:
                                     for _ryrs in _refine_years:
                                         _ri_count += 1
-                                        status_text.text(f"Refining ({_ri_count}/{_n_refine}): ${_ramt:,.0f}/yr × {_ryrs}yr{_ss_tag}")
-                                        result = _run_single_strategy(a0, _p_refine, _best_strat, conv_strat=float(_ramt),
+                                        status_text.text(f"Refining ({_ri_count}/{_n_refine}): ${_ramt:,.0f}/yr × {_ryrs}yr")
+                                        result = _run_single_strategy(a0, params, _best_strat, conv_strat=float(_ramt),
                                                                        stop_age=opt_stop_age, target_agi=target_agi_input,
                                                                        conv_years=_ryrs, agi_cap=agi_cap_enabled)
                                         pkg = _package_result(result, _best_strat, _best_strat["label"],
                                                               f"${_ramt:,.0f}/yr × {_ryrs}yr", "refine")
-                                        pkg["ss_label"] = _refine_ss_label
                                         all_results.append(pkg)
                                         progress_bar.progress(_ri_count / _n_refine)
 
@@ -5992,18 +6093,52 @@ elif nav == "Achieving":
                     progress_bar.empty(); status_text.empty()
 
                     # ════════════════════════════════════════════
-                    # MERGE & RANK — dedup within $100
+                    # MERGE & RANK — type-aware dedup (1% within each strategy type)
                     # ════════════════════════════════════════════
                     all_results.sort(key=lambda x: x["after_tax_estate"], reverse=True)
-                    _deduped = []
+                    _type_groups = {}
                     for r in all_results:
-                        _merged = False
-                        for d in _deduped:
-                            if d["spending_label"] == r["spending_label"] and d.get("ss_label", "") == r.get("ss_label", "") and abs(d["after_tax_estate"] - r["after_tax_estate"]) < 100:
-                                if "_group_members" not in d: d["_group_members"] = [d["conversion_label"]]
-                                d["_group_members"].append(r["conversion_label"]); d["_group_size"] = d.get("_group_size", 1) + 1; _merged = True; break
-                        if not _merged: r["_group_members"] = [r["conversion_label"]]; r["_group_size"] = 1; _deduped.append(r)
-                    all_results = _deduped
+                        _tkey = r["_strat_info"]["type"]
+                        if _tkey.startswith("prorata"):
+                            _tkey = "prorata"
+                        _type_groups.setdefault(_tkey, []).append(r)
+
+                    _deduped = []
+                    for _tkey, _tgroup in _type_groups.items():
+                        # Already sorted by estate desc (global sort preserved)
+                        _kept_in_type = []
+                        for r in _tgroup:
+                            merged = False
+                            if _kept_in_type:
+                                _last = _kept_in_type[-1]
+                                if _last["after_tax_estate"] > 0 and \
+                                   (_last["after_tax_estate"] - r["after_tax_estate"]) / _last["after_tax_estate"] <= 0.01:
+                                    if "_group_members" not in _last: _last["_group_members"] = [_last["conversion_label"]]
+                                    _last["_group_members"].append(r.get("conversion_label", r["spending_label"]))
+                                    _last["_group_size"] = _last.get("_group_size", 1) + 1
+                                    merged = True
+                            if not merged:
+                                r["_group_members"] = [r.get("conversion_label", r["spending_label"])]
+                                r["_group_size"] = 1
+                                _kept_in_type.append(r)
+                        _deduped.extend(_kept_in_type)
+
+                    _deduped.sort(key=lambda x: x["after_tax_estate"], reverse=True)
+
+                    # Second pass: global dedup across types — merge results within 1% of each other
+                    _global_deduped = []
+                    for r in _deduped:
+                        merged = False
+                        if _global_deduped:
+                            _last = _global_deduped[-1]
+                            if _last["after_tax_estate"] > 0 and \
+                               (_last["after_tax_estate"] - r["after_tax_estate"]) / _last["after_tax_estate"] <= 0.01:
+                                _last["_group_members"].append(r["spending_label"])
+                                _last["_group_size"] += 1
+                                merged = True
+                        if not merged:
+                            _global_deduped.append(r)
+                    all_results = _global_deduped
 
                     # Store in session state
                     _quick_results = [r for r in all_results if r["scan_phase"] == "quick"]
@@ -6013,9 +6148,7 @@ elif nav == "Achieving":
                     st.session_state.opt_best_combo = all_results[0] if all_results else None
                     st.session_state.opt_best_details = all_results[0]["_year_details"] if all_results else None
                     st.session_state.opt_params = params
-                    st.session_state.opt_has_ss_dim = _has_ss_dim
-                    st.session_state.opt_use_mortality = _use_mortality_weight
-                    st.session_state.opt_early_death_age = _early_death_age
+                    st.session_state.opt_has_ss_dim = False
 
                     # Baseline = best spending-only (no conversion)
                     _spending_only = [r for r in all_results if r["conversion_label"] == "No Conversion"]
@@ -6052,19 +6185,9 @@ elif nav == "Achieving":
                     st.session_state.phase2_results = _p2_mapped if _p2_mapped else None
                     st.session_state.phase2_best_details = _global_best["_year_details"]
                     st.session_state.phase2_baseline_details = _best_spending_only["_year_details"]
-                    _ss_suffix = f" [{_global_best.get('ss_label', '')}]" if _has_ss_dim else ""
-                    st.session_state.phase2_best_name = f"{_global_best['spending_label']} + {_global_best['conversion_label']}{_ss_suffix}"
+                    st.session_state.phase2_best_name = f"{_global_best['spending_label']} + {_global_best['conversion_label']}"
 
-                    _ss_count_msg = f", {len(_ss_variants)} SS claiming variants" if _has_ss_dim else ""
-                    st.success(f"Tested {_run_count} combinations ({_n_quick} quick scan + {_run_count - _n_quick} deep search{_ss_count_msg})")
-                    if _has_ss_dim and _use_mortality_weight:
-                        _eda = _early_death_age
-                        if is_joint:
-                            st.caption(f"SS claiming ranked by mortality-weighted estate "
-                                       f"(early death at {_eda}, weights: 50% both survive / 25% each spouse)")
-                        else:
-                            st.caption(f"SS claiming ranked by mortality-weighted estate "
-                                       f"(early death at {_eda}, weights: 50% survive / 50% early death)")
+                    st.success(f"Tested {_run_count} combinations ({_n_quick} quick scan + {_run_count - _n_quick} deep search)")
 
                 # ════════════════════════════════════════════
                 # RESULTS DISPLAY
@@ -6072,29 +6195,45 @@ elif nav == "Achieving":
                 if st.session_state.opt_all_results:
                     _all = st.session_state.opt_all_results
                     _best = _all[0]
-                    _has_ss_dim = st.session_state.get("opt_has_ss_dim", False)
                     _spending_only = [r for r in _all if r["conversion_label"] == "No Conversion"]
                     _best_spending_only = _spending_only[0] if _spending_only else _best
                     _baseline_estate = _best_spending_only["after_tax_estate"]
 
                     # ---- Best Combo highlight ----
-                    _best_ss_tag = f" [{_best.get('ss_label', '')}]" if _has_ss_dim else ""
-                    _best_label = f"{_best['spending_label']} + {_best['conversion_label']}{_best_ss_tag}"
+                    _best_label = f"{_best['spending_label']} + {_best['conversion_label']}"
                     _improvement = _best["after_tax_estate"] - _baseline_estate
                     if _improvement > 100:
                         st.success(f"**Best:** {_best_label} — Estate: **${_best['after_tax_estate']:,.0f}** (+${_improvement:,.0f} vs spending-only)")
                     else:
                         st.success(f"**Best:** {_best_label} — Estate: **${_best['after_tax_estate']:,.0f}**")
 
-                    # ---- Top 5 ----
+                    # ---- Top 5 (grouped by estate tier) ----
                     if len(_all) >= 2:
                         st.markdown("#### Top 5 Strategies")
-                        for _t5i, _t5r in enumerate(_all[:5], 1):
-                            _t5_ss_tag = f" [{_t5r.get('ss_label', '')}]" if _has_ss_dim else ""
-                            _t5_label = f"{_t5r['spending_label']} + {_t5r['conversion_label']}{_t5_ss_tag}"
-                            _t5_delta = _t5r["after_tax_estate"] - _baseline_estate
+                        _t5_tiers = []
+                        for _t5r in _all:
+                            _t5_label = f"{_t5r['spending_label']} + {_t5r['conversion_label']}"
+                            _t5_est = _t5r["after_tax_estate"]
+                            # Merge into existing tier if within $500
+                            _t5_merged = False
+                            for _tier in _t5_tiers:
+                                if abs(_tier["estate"] - _t5_est) < 500:
+                                    _tier["labels"].append(_t5_label)
+                                    _t5_merged = True
+                                    break
+                            if not _t5_merged:
+                                _t5_tiers.append({"estate": _t5_est, "labels": [_t5_label]})
+                            if len(_t5_tiers) >= 5:
+                                break
+                        for _t5i, _tier in enumerate(_t5_tiers, 1):
+                            _t5_delta = _tier["estate"] - _baseline_estate
                             _t5_delta_str = f" ({'+' if _t5_delta >= 0 else ''}{_t5_delta:,.0f} vs spending-only)" if abs(_t5_delta) > 100 else ""
-                            st.markdown(f"{_t5i}. **{_t5_label}** — ${_t5r['after_tax_estate']:,.0f}{_t5_delta_str}")
+                            if len(_tier["labels"]) == 1:
+                                st.markdown(f"{_t5i}. **{_tier['labels'][0]}** — ${_tier['estate']:,.0f}{_t5_delta_str}")
+                            else:
+                                st.markdown(f"{_t5i}. **{_tier['labels'][0]}** — ${_tier['estate']:,.0f}{_t5_delta_str}")
+                                _tied = ", ".join(_tier["labels"][1:])
+                                st.caption(f"   Tied: {_tied}")
 
                     # ---- Summary metrics ----
                     _has_et = _best.get("estate_tax", 0) > 0
@@ -6119,7 +6258,6 @@ elif nav == "Achieving":
                                 elif _type_tag == "dynamic": _cat = "Dynamic"
                                 else: _cat = "Waterfall"
                                 _row = {"Type": _cat, "Strategy": r["spending_label"], "Conversion": r["conversion_label"]}
-                                if _has_ss_dim: _row["SS Claiming"] = r.get("ss_label", "")
                                 _row.update({"Net Estate": f"${r['after_tax_estate']:,.0f}", "Gross Estate": f"${r['gross_estate']:,.0f}",
                                     "Total Taxes": f"${r['total_taxes']:,.0f}", "Converted": f"${r['total_converted']:,.0f}",
                                     "Drew Cash": f"${r.get('tot_wd_cash', 0):,.0f}", "Drew Taxable": f"${r.get('tot_wd_taxable', 0):,.0f}",
@@ -6129,8 +6267,6 @@ elif nav == "Achieving":
                                     "Final Brokerage": f"${r['final_brokerage']:,.0f}", "Final Cash": f"${r.get('final_cash', 0):,.0f}",
                                     "Final Annuity": f"${r.get('final_annuity', 0):,.0f}", "Final Life": f"${r.get('final_life', 0):,.0f}",
                                     "vs Best": f"${r['after_tax_estate'] - _quick_display[0]['after_tax_estate']:+,.0f}"})
-                                if st.session_state.get("opt_use_mortality", False) and _has_ss_dim:
-                                    _row["Mortality Score"] = f"${r.get('_mortality_score', r['after_tax_estate']):,.0f}"
                                 _gs = r.get("_group_size", 1)
                                 _row["# Tied"] = str(_gs) if _gs > 1 else ""
                                 _comp_rows.append(_row)
@@ -6145,7 +6281,6 @@ elif nav == "Achieving":
                         _combo_rows = []
                         for r in _all:
                             _row = {"Spending Strategy": r["spending_label"], "Conversion": r["conversion_label"]}
-                            if _has_ss_dim: _row["SS Claiming"] = r.get("ss_label", "")
                             _row.update({"Net Estate": f"${r['after_tax_estate']:,.0f}", "Total Taxes": f"${r['total_taxes']:,.0f}",
                                 "Converted": f"${r['total_converted']:,.0f}",
                                 "vs Best": f"${r['after_tax_estate'] - _best['after_tax_estate']:+,.0f}"})
@@ -6155,13 +6290,13 @@ elif nav == "Achieving":
                         st.dataframe(pd.DataFrame(_combo_rows), use_container_width=True, hide_index=True)
 
                     # ---- Combo selector + year-by-year detail ----
-                    _combo_labels = [f"{r['spending_label']} + {r['conversion_label']}" + (f" [{r.get('ss_label', '')}]" if _has_ss_dim else "") for r in _all]
+                    _combo_labels = [f"{r['spending_label']} + {r['conversion_label']}" for r in _all]
                     _selected_combo_label = st.selectbox("Select combination to view detail", _combo_labels, index=0, key="fp_opt_combo_select")
                     _selected_idx = _combo_labels.index(_selected_combo_label)
                     _selected_combo = _all[_selected_idx]
                     st.session_state.opt_selected_combo = _selected_combo
 
-                    _best_combo_label = f"{_best['spending_label']} + {_best['conversion_label']}" + (f" [{_best.get('ss_label', '')}]" if _has_ss_dim else "")
+                    _best_combo_label = f"{_best['spending_label']} + {_best['conversion_label']}"
                     if _selected_combo_label != _best_combo_label:
                         col1b, col2b, col3b = st.columns(3)
                         with col1b: st.metric("Selected Gross Estate", f"${_selected_combo['gross_estate']:,.0f}")
@@ -6218,6 +6353,163 @@ elif nav == "Achieving":
                             st.metric("Final Roth", TEA.money(final_bc.get("Bal Roth", 0)))
                             st.metric("Final Taxable", TEA.money(final_bc.get("Bal Cash", 0) + final_bc.get("Bal Taxable", 0)))
                             st.metric("After-Tax Estate", TEA.money(final_bc.get("Estate (Net)", 0)))
+
+                    # ---- Monte Carlo Stress Test ----
+                    st.divider()
+                    st.markdown("### Monte Carlo Stress Test")
+                    st.caption("Runs randomized return simulations on top strategies to test robustness.")
+                    _mc_n_strats = st.slider("Strategies to test", 1, 5, value=3, key="fp_opt_mc_n")
+
+                    if st.button("Run MC Stress Test", key="fp_opt_mc_run"):
+                        # Build unique estate tiers (same grouping as Top 5)
+                        _mc_tiers = []
+                        for r in _all:
+                            _merged = False
+                            for t in _mc_tiers:
+                                if abs(t["result"]["after_tax_estate"] - r["after_tax_estate"]) < 500:
+                                    _merged = True; break
+                            if not _merged:
+                                _mc_tiers.append({"result": r, "label": f"{r['spending_label']} + {r['conversion_label']}"})
+                            if len(_mc_tiers) >= _mc_n_strats: break
+
+                        n_sims = int(mc_simulations)
+                        n_years_mc = int(years)
+                        rng = np.random.default_rng(42)
+
+                        # Re-derive correlated MC variables (may not be in scope from Tab 3)
+                        _opt_use_corr = D["use_asset_alloc"] and mc_volatility is None
+                        if _opt_use_corr:
+                            _opt_mc_vols = np.array([D["cma_us_equity_vol"], D["cma_intl_equity_vol"],
+                                                     D["cma_fixed_income_vol"], D["cma_real_assets_vol"],
+                                                     D["cma_cash_vol"]]) / 100
+                            _opt_mc_flds = ["eq", "intl", "fi", "re"]
+                            def _opt_mc_w(acct_key):
+                                w = [D[f"aa_{acct_key}_{fk}"] / 100 for fk in _opt_mc_flds]
+                                w.append(max(0, 1 - sum(w)))
+                                return np.array(w)
+                            _ow_taxable = _opt_mc_w("taxable")
+                            _ow_pretax_f = _opt_mc_w("pretax_f")
+                            _ow_pretax_s = _opt_mc_w("pretax_s") if is_joint else _ow_pretax_f
+                            _ow_roth = _opt_mc_w("roth_f")
+                            _ow_annuity = _opt_mc_w("annuity")
+                            _oL = _CMA_CHOLESKY
+
+                        # Init balances from current assets
+                        _oi_cash = a0["taxable"]["cash"]
+                        _oi_brok = a0["taxable"]["brokerage"]
+                        _oi_pf = float(pretax_bal_filer_current)
+                        _oi_ps = float(pretax_bal_spouse_current)
+                        _oi_roth = a0["taxfree"]["roth"]
+                        _oi_life = a0["taxfree"]["life_cash_value"]
+                        _oi_ann = a0["annuity"]["value"]
+
+                        _mc_comparison = []
+                        progress = st.progress(0, text="Running MC stress test...")
+                        for ti, tier in enumerate(_mc_tiers):
+                            rows_t = tier["result"]["_year_details"]
+
+                            # Extract deterministic flows from this strategy's year details
+                            _det_spending = [r["Spending"] for r in rows_t]
+                            _det_ss = [r["SS"] for r in rows_t]
+                            _det_pension = [r["Pension"] for r in rows_t]
+                            _det_inv_inc = [r.get("Inv Inc", 0) for r in rows_t]
+                            _det_extra_inc = [r.get("Extra Income", 0) for r in rows_t]
+                            _det_eff_tax = []
+                            for r in rows_t:
+                                inc = r.get("Total Income", 0)
+                                tx = r.get("Taxes", 0) + r.get("Medicare", 0)
+                                _det_eff_tax.append(tx / inc if inc > 1 else 0.15)
+
+                            ending_portfolios = np.zeros(n_sims)
+                            ran_out_year = np.full(n_sims, n_years_mc)
+
+                            for sim in range(n_sims):
+                                s_cash = _oi_cash; s_brok = _oi_brok; s_pf = _oi_pf; s_ps = _oi_ps
+                                s_roth = _oi_roth; s_life = _oi_life; s_ann = _oi_ann
+                                for yr_i in range(n_years_mc):
+                                    _yi = min(yr_i, len(rows_t) - 1)
+                                    _spending = _det_spending[_yi]; ss = _det_ss[_yi]; pension = _det_pension[_yi]
+                                    eff_tax = _det_eff_tax[_yi]; inv_inc = _det_inv_inc[_yi]; extra_inc = _det_extra_inc[_yi]
+                                    _mc_yr = start_year + yr_i
+                                    _age_f = (_mc_yr - filer_dob.year) if filer_dob else (current_age_filer + yr_i + 1)
+                                    _age_s = ((_mc_yr - spouse_dob.year) if spouse_dob else None) if current_age_spouse else None
+                                    rmd_f = TEA.compute_rmd_uniform_start73(s_pf, _age_f)
+                                    rmd_s = TEA.compute_rmd_uniform_start73(s_ps, _age_s)
+                                    rmd = rmd_f + rmd_s; s_pf -= rmd_f; s_ps -= rmd_s
+                                    total_income = ss + pension + rmd + inv_inc + extra_inc
+                                    est_taxes = total_income * eff_tax
+                                    income_available = total_income
+                                    cash_needed = _spending + est_taxes; shortfall = cash_needed - income_available
+                                    if shortfall > 0:
+                                        for bucket in spending_order:
+                                            if shortfall <= 0: break
+                                            if bucket == "Taxable":
+                                                pull = min(shortfall, max(0.0, s_cash)); s_cash -= pull; shortfall -= pull
+                                                if shortfall > 0:
+                                                    pull = min(shortfall, max(0.0, s_brok)); s_brok -= pull; shortfall -= pull
+                                            elif bucket == "Pre-Tax":
+                                                _avail = max(0.0, s_pf) + max(0.0, s_ps); pull = min(shortfall, _avail)
+                                                if _avail > 0:
+                                                    pf_pull = pull * max(0.0, s_pf) / _avail; s_pf -= pf_pull; s_ps -= (pull - pf_pull)
+                                                shortfall -= pull
+                                            elif bucket == "Tax-Free":
+                                                pull = min(shortfall, max(0.0, s_roth)); s_roth -= pull; shortfall -= pull
+                                                if shortfall > 0:
+                                                    pull = min(shortfall, max(0.0, s_life)); s_life -= pull; shortfall -= pull
+                                            elif bucket == "Tax-Deferred":
+                                                pull = min(shortfall, max(0.0, s_ann)); s_ann -= pull; shortfall -= pull
+                                    else:
+                                        s_cash += abs(shortfall)
+                                    if _opt_use_corr:
+                                        z = rng.standard_normal(5)
+                                        corr_z = _oL @ z
+                                        asset_shocks = corr_z * _opt_mc_vols
+                                        shock_cash = _ow_taxable @ asset_shocks
+                                        shock_brok = _ow_taxable @ asset_shocks
+                                        shock_pf = _ow_pretax_f @ asset_shocks
+                                        shock_ps = _ow_pretax_s @ asset_shocks
+                                        shock_roth = _ow_roth @ asset_shocks
+                                        shock_ann = _ow_annuity @ asset_shocks
+                                        shock_life = 0.0
+                                        s_cash = max(0.0, s_cash) * (1 + r_taxable + shock_cash)
+                                        s_brok = max(0.0, s_brok) * (1 + r_taxable + shock_brok)
+                                        s_pf = max(0.0, s_pf) * (1 + r_pretax + shock_pf)
+                                        s_ps = max(0.0, s_ps) * (1 + r_pretax + shock_ps)
+                                        s_roth = max(0.0, s_roth) * (1 + r_roth + shock_roth)
+                                        s_ann = max(0.0, s_ann) * (1 + r_annuity + shock_ann)
+                                        s_life = max(0.0, s_life) * (1 + r_life + shock_life)
+                                    else:
+                                        yr_shock = rng.normal(0, mc_volatility)
+                                        s_cash = max(0.0, s_cash) * (1 + r_taxable + yr_shock)
+                                        s_brok = max(0.0, s_brok) * (1 + r_taxable + yr_shock)
+                                        s_pf = max(0.0, s_pf) * (1 + r_pretax + yr_shock)
+                                        s_ps = max(0.0, s_ps) * (1 + r_pretax + yr_shock)
+                                        s_roth = max(0.0, s_roth) * (1 + r_roth + yr_shock)
+                                        s_ann = max(0.0, s_ann) * (1 + r_annuity + yr_shock)
+                                        s_life = max(0.0, s_life) * (1 + r_life + yr_shock)
+                                    total_port = s_cash + s_brok + s_pf + s_ps + s_roth + s_ann + s_life
+                                    if total_port <= 0:
+                                        ran_out_year[sim] = yr_i
+                                        s_cash = s_brok = s_pf = s_ps = s_roth = s_ann = s_life = 0.0; total_port = 0.0
+                                ending_portfolios[sim] = s_cash + s_brok + s_pf + s_ps + s_roth + s_ann + s_life
+
+                            success_rate = np.sum(ending_portfolios > 0) / n_sims * 100
+                            _mc_comparison.append({
+                                "Strategy": tier["label"],
+                                "Det. Estate": f"${tier['result']['after_tax_estate']:,.0f}",
+                                "Success Rate": f"{success_rate:.1f}%",
+                                "Median Portfolio": f"${np.median(ending_portfolios):,.0f}",
+                                "10th Pctl": f"${np.percentile(ending_portfolios, 10):,.0f}",
+                                "90th Pctl": f"${np.percentile(ending_portfolios, 90):,.0f}",
+                            })
+                            progress.progress((ti + 1) / len(_mc_tiers))
+
+                        progress.empty()
+                        if _opt_use_corr:
+                            st.caption("Correlated Monte Carlo — per-account volatility from asset allocation")
+                        else:
+                            st.caption(f"Simple Monte Carlo — uniform vol: {mc_volatility:.1%}")
+                        st.dataframe(pd.DataFrame(_mc_comparison), use_container_width=True, hide_index=True)
 
     # ════════════════════════════════════════════════════════════════
     # TAB 5: Roth Conversion Opportunity (retired clients only)
