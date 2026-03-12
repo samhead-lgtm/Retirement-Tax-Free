@@ -744,14 +744,18 @@ def compute_irmaa_safe_amount(target_irmaa_tier, base_non_ss_income, gross_ss,
 
 def compute_gains_harvest_amount(base_non_ss_income, existing_preferential, gross_ss,
                                   filing_status, filer_65, spouse_65, retirement_deduction,
-                                  inf_factor=1.0, tax_year=None):
-    """Binary search for the max additional LTCG that can be realized at the 0% rate.
+                                  inf_factor=1.0, tax_year=None, target_rate=0.0):
+    """Binary search for the max additional LTCG that can be realized at or below target_rate.
 
     Accounts for SS taxability feedback and deduction phaseouts (gains add to AGI).
-    Returns the max additional gains that fit entirely in the 0% LTCG bracket.
+    target_rate=0.0 → 0% bracket ceiling (default, backward-compatible).
+    target_rate=0.15 → 15% bracket ceiling (used for concentrated stock cap).
     """
     pref_brackets = get_preferential_brackets(filing_status, inf_factor)
-    zero_pct_ceiling = pref_brackets[0][1]  # e.g., $96,700 joint
+    target_ceiling = pref_brackets[0][1]  # default: 0% ceiling
+    for _low, _high, _rate in pref_brackets:
+        if _rate <= target_rate:
+            target_ceiling = _high
 
     lo, hi = 0.0, 2_000_000.0
     for _ in range(40):
@@ -766,7 +770,7 @@ def compute_gains_harvest_amount(base_non_ss_income, existing_preferential, gros
         taxable_income = max(0.0, agi - deduction)
         total_pref = existing_preferential + mid
         ordinary_taxable = max(0.0, taxable_income - total_pref)
-        pref_room = max(0.0, zero_pct_ceiling - ordinary_taxable)
+        pref_room = max(0.0, target_ceiling - ordinary_taxable)
         if total_pref < pref_room:
             lo = mid
         else:
@@ -1039,7 +1043,8 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
         total_spend_need: Total spending needed this year (living + mortgage)
         cash_received: Cash from fixed sources (SS + pensions + RMDs)
         balances: dict with keys cash, brokerage, pretax, roth, life,
-                  annuity_value, annuity_basis, dyn_gain_pct
+                  annuity_value, annuity_basis, dyn_gain_pct,
+                  and optionally concentrated, conc_gain_pct
         base_year_inp: Base tax input dict (taxable_ira set to conversion only,
                        cap_gain_loss set to investment income only, other_income=0)
         p_base_cap_gain: Base capital gains from investment income
@@ -1047,16 +1052,18 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
         conversion_this_year: Roth conversion amount this year
 
     Returns:
-        (wd_cash, wd_brokerage, wd_pretax, wd_roth, wd_life, wd_annuity,
-         ann_gains_withdrawn, cap_gains_realized, final_tax_result)
+        (wd_cash, wd_brokerage, wd_conc, wd_pretax, wd_roth, wd_life, wd_annuity,
+         ann_gains_withdrawn, cap_gains_realized, conc_cg_realized, final_tax_result)
     """
-    wd_cash = wd_brokerage = wd_pretax = wd_roth = wd_life = wd_annuity = 0.0
+    wd_cash = wd_brokerage = wd_conc = wd_pretax = wd_roth = wd_life = wd_annuity = 0.0
     ann_gains_withdrawn = cap_gains_realized = 0.0
+    conc_gain_pct = balances.get("conc_gain_pct", 0.0)
+    conc_cg_realized = 0.0
 
-    def _build_inp(wd_pt, cg, ag):
+    def _build_inp(wd_pt, cg, ag, ccg=0.0):
         inp = dict(base_year_inp)
         inp["taxable_ira"] = wd_pt + conversion_this_year
-        inp["cap_gain_loss"] = p_base_cap_gain + cg
+        inp["cap_gain_loss"] = p_base_cap_gain + cg + ccg
         inp["other_income"] = ag
         return inp
 
@@ -1070,14 +1077,15 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
     for conv_iter in range(10):
         # Compute current tax with current withdrawals
         cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
-        curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
+        conc_cg_realized = wd_conc * conc_gain_pct
+        curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn, conc_cg_realized)
         curr_res = compute_case_cached(_serialize_inputs_for_cache(curr_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
         taxes = curr_res["total_tax"]
         medicare = curr_res["medicare_premiums"]
         curr_tax = taxes + medicare
 
         # Compute shortfall
-        total_wd = wd_cash + wd_brokerage + wd_pretax + wd_roth + wd_life + wd_annuity
+        total_wd = wd_cash + wd_brokerage + wd_conc + wd_pretax + wd_roth + wd_life + wd_annuity
         cash_available = cash_received + total_wd
         cash_needed = total_spend_need + taxes + medicare
         shortfall = cash_needed - cash_available
@@ -1107,7 +1115,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             if avail_brok > 0:
                 p = min(PROBE, avail_brok)
                 test_cg = max(0.0, wd_brokerage + p - _reinvested_base) * dyn_gain_pct
-                test_inp = _build_inp(wd_pretax, test_cg, ann_gains_withdrawn)
+                test_inp = _build_inp(wd_pretax, test_cg, ann_gains_withdrawn, conc_cg_realized)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                 cost = (_tax_total(test_res) - curr_tax) / p
                 candidates.append(("brokerage", cost, avail_brok))
@@ -1115,7 +1123,7 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             avail_pre = balances["pretax"] - wd_pretax
             if avail_pre > 0:
                 p = min(PROBE, avail_pre)
-                test_inp = _build_inp(wd_pretax + p, cap_gains_realized, ann_gains_withdrawn)
+                test_inp = _build_inp(wd_pretax + p, cap_gains_realized, ann_gains_withdrawn, conc_cg_realized)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                 cost = (_tax_total(test_res) - curr_tax) / p
                 candidates.append(("pretax", cost, avail_pre))
@@ -1125,10 +1133,19 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                 p = min(PROBE, avail_ann)
                 rem_gains = max(0.0, ann_total_gains - ann_gains_withdrawn)
                 test_ag = ann_gains_withdrawn + min(p, rem_gains)
-                test_inp = _build_inp(wd_pretax, cap_gains_realized, test_ag)
+                test_inp = _build_inp(wd_pretax, cap_gains_realized, test_ag, conc_cg_realized)
                 test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                 cost = (_tax_total(test_res) - curr_tax) / p
                 candidates.append(("annuity", cost, avail_ann))
+
+            avail_conc = balances.get("concentrated", 0.0) - wd_conc
+            if avail_conc > 0:
+                p = min(PROBE, avail_conc)
+                test_ccg = (wd_conc + p) * conc_gain_pct
+                test_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn, test_ccg)
+                test_res = compute_case_cached(_serialize_inputs_for_cache(test_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
+                cost = (_tax_total(test_res) - curr_tax) / p
+                candidates.append(("concentrated", cost, avail_conc))
 
             if not candidates:
                 break
@@ -1143,12 +1160,14 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
             if pull_full > PROBE * 2:
                 # Check if average cost at full pull is significantly higher
                 if best_src == "brokerage":
-                    test_inp_full = _build_inp(wd_pretax, max(0.0, wd_brokerage + pull_full - _reinvested_base) * dyn_gain_pct, ann_gains_withdrawn)
+                    test_inp_full = _build_inp(wd_pretax, max(0.0, wd_brokerage + pull_full - _reinvested_base) * dyn_gain_pct, ann_gains_withdrawn, conc_cg_realized)
                 elif best_src == "pretax":
-                    test_inp_full = _build_inp(wd_pretax + pull_full, cap_gains_realized, ann_gains_withdrawn)
+                    test_inp_full = _build_inp(wd_pretax + pull_full, cap_gains_realized, ann_gains_withdrawn, conc_cg_realized)
+                elif best_src == "concentrated":
+                    test_inp_full = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn, (wd_conc + pull_full) * conc_gain_pct)
                 else:
                     rem = max(0.0, ann_total_gains - ann_gains_withdrawn)
-                    test_inp_full = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn + min(pull_full, rem))
+                    test_inp_full = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn + min(pull_full, rem), conc_cg_realized)
                 test_res_full = compute_case_cached(_serialize_inputs_for_cache(test_inp_full), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                 cost_full = (_tax_total(test_res_full) - curr_tax) / pull_full
 
@@ -1159,12 +1178,14 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                     for _ in range(12):
                         mid = (lo + hi) / 2
                         if best_src == "brokerage":
-                            test_inp_mid = _build_inp(wd_pretax, max(0.0, wd_brokerage + mid - _reinvested_base) * dyn_gain_pct, ann_gains_withdrawn)
+                            test_inp_mid = _build_inp(wd_pretax, max(0.0, wd_brokerage + mid - _reinvested_base) * dyn_gain_pct, ann_gains_withdrawn, conc_cg_realized)
                         elif best_src == "pretax":
-                            test_inp_mid = _build_inp(wd_pretax + mid, cap_gains_realized, ann_gains_withdrawn)
+                            test_inp_mid = _build_inp(wd_pretax + mid, cap_gains_realized, ann_gains_withdrawn, conc_cg_realized)
+                        elif best_src == "concentrated":
+                            test_inp_mid = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn, (wd_conc + mid) * conc_gain_pct)
                         else:
                             rem = max(0.0, ann_total_gains - ann_gains_withdrawn)
-                            test_inp_mid = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn + min(mid, rem))
+                            test_inp_mid = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn + min(mid, rem), conc_cg_realized)
                         test_res_mid = compute_case_cached(_serialize_inputs_for_cache(test_inp_mid), inf_factor, medicare_inflation_factor=medicare_inf_factor)
                         cost_mid = (_tax_total(test_res_mid) - curr_tax) / mid
                         if cost_mid <= threshold:
@@ -1179,6 +1200,9 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
                 cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
             elif best_src == "pretax":
                 wd_pretax += pull_full
+            elif best_src == "concentrated":
+                wd_conc += pull_full
+                conc_cg_realized = wd_conc * conc_gain_pct
             elif best_src == "annuity":
                 rem = max(0.0, ann_total_gains - ann_gains_withdrawn)
                 ann_gains_withdrawn += min(pull_full, rem)
@@ -1188,13 +1212,21 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
 
             # Update curr_tax for next fill_round probe
             cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
-            curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
+            conc_cg_realized = wd_conc * conc_gain_pct
+            curr_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn, conc_cg_realized)
             curr_res = compute_case_cached(_serialize_inputs_for_cache(curr_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
             curr_tax = _tax_total(curr_res)
 
         # Step 6: Tax-free sources (last resort)
         if shortfall > 1.0:
-            if conversion_this_year == 0:
+            _other_exhausted = (
+                wd_cash >= balances["cash"] - 1
+                and wd_brokerage >= balances["brokerage"] - 1
+                and wd_conc >= balances.get("concentrated", 0.0) - 1
+                and wd_pretax >= balances["pretax"] - 1
+                and wd_annuity >= balances["annuity_value"] - 1
+            )
+            if conversion_this_year == 0 or _other_exhausted:
                 avail = balances["roth"] - wd_roth
                 pull = min(shortfall, max(0.0, avail))
                 if pull > 0:
@@ -1209,11 +1241,12 @@ def _fill_shortfall_dynamic(total_spend_need, cash_received, balances,
 
     # Final tax result
     cap_gains_realized = max(0.0, wd_brokerage - _reinvested_base) * dyn_gain_pct
-    final_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn)
+    conc_cg_realized = wd_conc * conc_gain_pct
+    final_inp = _build_inp(wd_pretax, cap_gains_realized, ann_gains_withdrawn, conc_cg_realized)
     final_res = compute_case_cached(_serialize_inputs_for_cache(final_inp), inf_factor, medicare_inflation_factor=medicare_inf_factor)
 
-    return (wd_cash, wd_brokerage, wd_pretax, wd_roth, wd_life, wd_annuity,
-            ann_gains_withdrawn, cap_gains_realized, final_res)
+    return (wd_cash, wd_brokerage, wd_conc, wd_pretax, wd_roth, wd_life, wd_annuity,
+            ann_gains_withdrawn, cap_gains_realized, conc_cg_realized, final_res)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1785,8 +1818,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 "dyn_gain_pct": dyn_gain_pct,
                 "reinvested_base": reinvested_base,
             }
-            (wd_cash, wd_brokerage, wd_pretax, wd_roth, wd_life, wd_annuity,
-             ann_gains_withdrawn, cap_gains_realized, final_res) = _fill_shortfall_dynamic(
+            (wd_cash, wd_brokerage, wd_conc, wd_pretax, wd_roth, wd_life, wd_annuity,
+             ann_gains_withdrawn, cap_gains_realized, conc_cg_realized, final_res) = _fill_shortfall_dynamic(
                 total_spend_need, cash_received, blend_balances, base_year_inp,
                 yr_cap_gain, bracket_inf, conversion_this_year, medicare_inf_factor=medicare_inf)
             yr_tax = final_res["total_tax"]
@@ -2798,6 +2831,14 @@ def run_retirement_projection(balances, params, spending_order):
     bal_brokerage = balances.get("brokerage", balances["taxable"])
     bal_cash = balances.get("cash", 0.0)
     brokerage_basis = balances.get("brokerage_basis", bal_brokerage)
+    bal_conc = balances.get("conc_stock", 0.0)
+    conc_basis = balances.get("conc_stock_basis", bal_conc)
+    conc_gain_pct_param = params.get("conc_stock_gain_pct", 0.0)
+    if bal_conc > 0 and conc_basis == bal_conc:
+        conc_basis = bal_conc * (1.0 - conc_gain_pct_param)
+    conc_div_yield = params.get("conc_stock_div_yield", 0.0)
+    conc_unwind = params.get("conc_stock_unwind", False)
+    conc_unwind_years = params.get("conc_stock_unwind_years", 0)
     bal_ro = balances["roth"]
     bal_hs = balances["hsa"]
 
@@ -3023,6 +3064,8 @@ def run_retirement_projection(balances, params, spending_order):
 
         # Investment income from taxable accounts (generated before withdrawals)
         yr_dividends = bal_brokerage * div_yield if bal_brokerage > 0 else 0.0
+        yr_conc_div = bal_conc * conc_div_yield if bal_conc > 0 else 0.0
+        yr_dividends += yr_conc_div  # concentrated dividends are qualified
         yr_cash_interest = bal_cash * cash_int_rate if bal_cash > 0 else 0.0
         yr_brok_interest = bal_brokerage * brok_int_yield if bal_brokerage > 0 else 0.0
         yr_interest = yr_cash_interest + yr_brok_interest
@@ -3082,12 +3125,17 @@ def run_retirement_projection(balances, params, spending_order):
             rmd_amount = min(rmd_amount, bal_pt)
             deferred_rmd = 0.0
 
+        # Forced concentrated stock unwind — computed post-hoc after actual AGI is known
+        _conc_forced_sell = 0.0
+        _conc_forced_cg = 0.0
+
         wd_pretax = rmd_amount  # start with at least the RMD
         wd_cash = 0.0
         wd_brokerage = 0.0
+        wd_conc = 0.0
         wd_roth = 0.0
         wd_hsa = 0.0
-        yr_cap_gains = 0.0  # capital gains from brokerage sales
+        yr_cap_gains = 0.0  # capital gains from brokerage sales (forced conc added post-hoc)
 
         # QCD: direct IRA-to-charity transfer
         yr_qcd = 0.0
@@ -3179,7 +3227,7 @@ def run_retirement_projection(balances, params, spending_order):
             else:
                 yr_medicare = 0.0
             cash_needed = expenses + taxes + yr_medicare - conv_tax_withheld  # withheld portion already paid from conversion
-            wd_taxable = wd_cash + wd_brokerage
+            wd_taxable = wd_cash + wd_brokerage + wd_conc
             cash_available = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_taxable + wd_roth + wd_hsa
             shortfall = cash_needed - cash_available
 
@@ -3214,6 +3262,15 @@ def run_retirement_projection(balances, params, spending_order):
                             wd_brokerage += pull_brok
                             shortfall -= pull_brok
                             pulled = True
+                    if shortfall > 0:
+                        avail_conc = bal_conc - wd_conc
+                        if avail_conc > 0:
+                            pull_conc = min(shortfall, avail_conc)
+                            gain_pct_conc = max(0.0, 1.0 - conc_basis / bal_conc) if bal_conc > 0 else 0.0
+                            yr_cap_gains += pull_conc * gain_pct_conc
+                            wd_conc += pull_conc
+                            shortfall -= pull_conc
+                            pulled = True
                 elif bucket == "Tax-Free":
                     avail_roth = bal_ro - wd_roth
                     pull = min(shortfall, avail_roth)
@@ -3246,10 +3303,64 @@ def run_retirement_projection(balances, params, spending_order):
                                                         filer_65=_yr_filer_65, spouse_65=_yr_spouse_65)
         else:
             yr_medicare = 0.0
-        wd_taxable = wd_cash + wd_brokerage
+
+        # Post-hoc IRMAA-aware concentrated stock unwind
+        # Uses actual AGI from withdrawal path — no estimation needed
+        if conc_unwind and bal_conc > 0 and conc_unwind_years > 0:
+            _conc_yrs = max(1, conc_unwind_years - i)
+            _conc_guideline = min(bal_conc, bal_conc / _conc_yrs)
+            _remaining_conc = max(0.0, bal_conc - wd_conc)
+            if _remaining_conc > 0:
+                _dyn_gp_forced = max(0.0, 1.0 - conc_basis / bal_conc) if bal_conc > 0 else 0.0
+                _conc_forced_sell = min(_conc_guideline, _remaining_conc)
+
+                # IRMAA-aware: never cross into the next IRMAA tier
+                if _dyn_gp_forced > 0 and (_yr_filer_65 or _yr_spouse_65):
+                    _is_joint = "joint" in _yr_filing_status.lower()
+                    _irmaa_thresholds = [218000, 274000, 342000, 410000, 750000] if _is_joint else \
+                                        [109000, 137000, 171000, 205000, 500000]
+                    _next_irmaa = None
+                    for _it in _irmaa_thresholds:
+                        _it_inf = _it * bracket_inf
+                        if tax_result["agi"] < _it_inf:
+                            _next_irmaa = _it_inf
+                            break
+                    if _next_irmaa is not None:
+                        # At IRMAA income levels, CG increases AGI 1:1 (SS already 85% taxable)
+                        _irmaa_room_cg = max(0.0, _next_irmaa - tax_result["agi"] - 500)  # $500 safety buffer
+                        _irmaa_sell = min(_remaining_conc, _irmaa_room_cg / _dyn_gp_forced) if _dyn_gp_forced > 0 else 0.0
+                        # IRMAA is binding: fill room if > guideline, cap if < guideline
+                        _conc_forced_sell = _irmaa_sell
+                    # else: AGI above all tiers — IRMAA maxed, sell guideline
+
+                _conc_forced_sell = min(_conc_forced_sell, _remaining_conc)
+                _conc_forced_cg = _conc_forced_sell * _dyn_gp_forced
+
+                # Recompute taxes with forced CG included
+                if _conc_forced_cg > 0:
+                    total_cap_gains = yr_cap_gains + _conc_forced_cg + inv_cap_gains_income
+                    _yr_sc_params["retirement_income"] = wd_pretax + pen_income + yr_inherited_dist + conversion_this_year
+                    tax_result = calc_year_taxes(gross_ss, pretax_income, total_cap_gains,
+                                                 inv_ordinary_income, _yr_filing_status,
+                                                 _yr_filer_65, _yr_spouse_65, bracket_inf, state_rate,
+                                                 sc_params=_yr_sc_params)
+                    taxes = tax_result["total_tax"]
+                    if _yr_filer_65 or _yr_spouse_65:
+                        yr_medicare, _ = estimate_medicare_premiums(tax_result["agi"], _yr_filing_status, bracket_inf, medicare_inf,
+                                                                    filer_65=_yr_filer_65, spouse_65=_yr_spouse_65)
+
+                # Transfer conc -> brokerage (new shares at market price = full basis)
+                if bal_conc > 0:
+                    _cb_sold = conc_basis * (_conc_forced_sell / bal_conc)
+                    conc_basis -= _cb_sold
+                bal_conc -= _conc_forced_sell
+                bal_brokerage += _conc_forced_sell
+                brokerage_basis += _conc_forced_sell
+
+        wd_taxable = wd_cash + wd_brokerage + wd_conc
 
         # Surplus: income exceeds expenses + taxes + medicare -> reinvest
-        cash_available_final = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_cash + wd_brokerage + wd_roth + wd_hsa
+        cash_available_final = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_cash + wd_brokerage + wd_conc + wd_roth + wd_hsa
         cash_needed_final = expenses + taxes + yr_medicare - conv_tax_withheld
         yr_surplus = max(0.0, cash_available_final - cash_needed_final)
 
@@ -3261,6 +3372,11 @@ def run_retirement_projection(balances, params, spending_order):
             basis_reduction = brokerage_basis * (wd_brokerage / bal_brokerage)
             brokerage_basis = max(0.0, brokerage_basis - basis_reduction)
         bal_brokerage -= wd_brokerage
+        # Reduce concentrated stock basis proportionally to withdrawal
+        if wd_conc > 0 and bal_conc > 0:
+            _conc_br = conc_basis * (wd_conc / bal_conc)
+            conc_basis = max(0.0, conc_basis - _conc_br)
+        bal_conc -= wd_conc
         bal_cash -= wd_cash
         bal_ro -= wd_roth
         bal_hs -= wd_hsa
@@ -3292,6 +3408,7 @@ def run_retirement_projection(balances, params, spending_order):
         bal_ro = max(0.0, bal_ro) * (1 + r_ro_yr)
         # Brokerage: reduce by div + interest yield since those flow to spending income
         bal_brokerage = max(0.0, bal_brokerage) * (1 + r_tx_yr - div_yield - brok_int_yield)
+        bal_conc = max(0.0, bal_conc) * (1 + r_tx_yr - conc_div_yield)
         bal_cash = max(0.0, bal_cash) * (1 + cash_int_rate)
         bal_hs = max(0.0, bal_hs) * (1 + r_hs_yr)
         bal_tx = bal_brokerage + bal_cash
@@ -3311,7 +3428,7 @@ def run_retirement_projection(balances, params, spending_order):
                 curr_annuity *= (1 + ret_annuity_return)
 
         bal_inherited_total = sum(ret_iira_bals)
-        total_bal = bal_pt + bal_ro + bal_tx + bal_hs + bal_inherited_total
+        total_bal = bal_pt + bal_ro + bal_tx + bal_hs + bal_conc + bal_inherited_total
         gross_estate = total_bal + curr_home_val + curr_inv_re_val + curr_life + curr_annuity
 
         # After-tax estate: what heirs actually receive
@@ -3332,6 +3449,7 @@ def run_retirement_projection(balances, params, spending_order):
             bal_pt * (1 - heir_total_rate) +
             bal_ro +
             bal_tx +  # stepped-up basis
+            bal_conc +  # stepped-up basis at death
             bal_hs * (1 - heir_total_rate) +
             bal_inherited_total * (1 - heir_total_rate) +
             curr_home_val + curr_inv_re_val +
@@ -3373,6 +3491,8 @@ def run_retirement_projection(balances, params, spending_order):
             "W/D Taxable": round(wd_taxable, 0),
             "W/D Roth": round(wd_roth, 0), "W/D HSA": round(wd_hsa, 0),
         })
+        if balances.get("conc_stock", 0.0) > 0:
+            row["W/D Conc"] = round(wd_conc + _conc_forced_sell, 0)
         if any(ira["balance"] > 0 for ira in ret_inherited_iras):
             row["Inherited Dist"] = round(yr_inherited_dist, 0)
         row.update({
@@ -3394,6 +3514,8 @@ def run_retirement_projection(balances, params, spending_order):
             "Bal Taxable": round(bal_tx, 0),
             "Bal Roth": round(bal_ro, 0), "Bal HSA": round(bal_hs, 0),
         })
+        if balances.get("conc_stock", 0.0) > 0:
+            row["Bal Conc"] = round(bal_conc, 0)
         if any(ira["balance"] > 0 for ira in ret_inherited_iras):
             row["Bal Inherited"] = round(bal_inherited_total, 0)
         row["Portfolio"] = round(total_bal, 0)
@@ -3411,7 +3533,7 @@ def run_retirement_projection(balances, params, spending_order):
         rows.append(row)
 
     bal_inherited_final = sum(ret_iira_bals)
-    final_total = bal_pt + bal_ro + bal_tx + bal_hs + bal_inherited_final
+    final_total = bal_pt + bal_ro + bal_tx + bal_hs + bal_conc + bal_inherited_final
     gross_estate_final = final_total + curr_home_val + curr_inv_re_val + curr_life + curr_annuity
     # Use last row's after-tax estate if available
     net_estate_final = rows[-1]["Estate (Net)"] if rows else gross_estate_final
@@ -4084,6 +4206,7 @@ def run_unified_optimizer(
     roth_variants,        # [(label, strategy, target_agi, stop_age_or_None), ...]
     base_retire_params,   # from _build_retire_params()-like dict
     salary_growth, pre_ret_return,
+    conc_stock_variants=None,  # [(label, {param_overrides}), ...] or None
     progress_callback=None,
 ):
     """Cross-product all 4 dimensions, run full accumulation → retirement for each combo.
@@ -4102,6 +4225,10 @@ def run_unified_optimizer(
 
     retire_age = base_retire_params.get("retire_age", 65)
 
+    # Default conc_stock_variants to Hold (no change) if not provided
+    if conc_stock_variants is None:
+        conc_stock_variants = [("Hold", {})]
+
     # Phase 1: Accumulation cache — only contrib mix affects this
     accum_cache = {}
     total_accum = len(contrib_variants)
@@ -4111,7 +4238,7 @@ def run_unified_optimizer(
     n_all_wf = len(waterfall_variants)
     n_roth_active = sum(1 for _, rs, _, _ in roth_variants if rs != "none")
     n_roth_none = len(roth_variants) - n_roth_active
-    total_retire = len(contrib_variants) * len(ss_variants) * (
+    total_retire = len(contrib_variants) * len(ss_variants) * len(conc_stock_variants) * (
         n_roth_none * n_all_wf + n_roth_active * n_compat_wf_conv)
     total_steps = total_accum + total_retire
     step = 0
@@ -4124,6 +4251,11 @@ def run_unified_optimizer(
                                  c_dict, salary_growth, pre_ret_return, ii)
         ar = accum["rows"]
         af = ar[-1] if ar else {}
+        # Concentrated stock: accumulation engine doesn't know about it, so grow independently
+        _conc_start = float(start_balances.get("conc_stock", 0.0))
+        _conc_div_y = base_retire_params.get("conc_stock_div_yield", 0.0)
+        _conc_r_tx = base_retire_params.get("r_taxable", pre_ret_return)
+        _conc_growth_rate = (1 + _conc_r_tx - _conc_div_y) ** years_to_ret if _conc_start > 0 else 1.0
         bals = {
             "pretax": float(af.get("Bal Pre-Tax", 0)),
             "roth": float(af.get("Bal Roth", 0)),
@@ -4132,6 +4264,8 @@ def run_unified_optimizer(
             "cash": float(accum.get("final_cash", 0)),
             "brokerage_basis": float(accum.get("final_basis", af.get("Bal Taxable", 0))),
             "hsa": float(af.get("Bal HSA", 0)),
+            "conc_stock": _conc_start * _conc_growth_rate,
+            "conc_stock_basis": float(start_balances.get("conc_stock_basis", 0.0)),
         }
         inh_state = accum.get("inherited_iras_state", [])
         _accum_by_contrib[c_label] = (bals, inh_state, ar)
@@ -4158,36 +4292,41 @@ def run_unified_optimizer(
                     if tf_idx < pt_idx:
                         continue
                 for s_label, s_filer_claim, s_spouse_claim in ss_variants:
-                    params = copy.deepcopy(base_retire_params)
-                    if r_strategy != "none":
-                        params["roth_conversion_strategy"] = r_strategy
-                        params["roth_conversion_target_agi"] = r_target
-                        eff_stop = r_stop if r_stop is not None else (retire_age + 10)
-                        params["roth_conversion_stop_age"] = eff_stop
-                    params["ss_filer_claim_age"] = s_filer_claim
-                    if s_spouse_claim is not None:
-                        params["ss_spouse_claim_age"] = s_spouse_claim
-                    params["inherited_iras"] = inh_state
+                    for cv_label, cv_params in conc_stock_variants:
+                        params = copy.deepcopy(base_retire_params)
+                        if r_strategy != "none":
+                            params["roth_conversion_strategy"] = r_strategy
+                            params["roth_conversion_target_agi"] = r_target
+                            eff_stop = r_stop if r_stop is not None else (retire_age + 10)
+                            params["roth_conversion_stop_age"] = eff_stop
+                        params["ss_filer_claim_age"] = s_filer_claim
+                        if s_spouse_claim is not None:
+                            params["ss_spouse_claim_age"] = s_spouse_claim
+                        params["inherited_iras"] = inh_state
+                        # Apply concentrated stock variant overrides
+                        params.update(cv_params)
 
-                    ret = run_retirement_projection(copy.deepcopy(bals), params, w_order)
+                        ret = run_retirement_projection(copy.deepcopy(bals), params, w_order)
 
-                    all_combos.append({
-                        "contrib": c_label,
-                        "waterfall": w_label,
-                        "ss": s_label,
-                        "roth": r_label,
-                        "estate": ret["estate"],
-                        "taxes": ret["total_taxes"],
-                        "final_total": ret["final_total"],
-                        "converted": ret.get("total_converted", 0),
-                        "_c_label": c_label, "_r_label": r_label,
-                        "_w_order": w_order, "_s_fc": s_filer_claim, "_s_sc": s_spouse_claim,
-                        "_r_strategy": r_strategy, "_r_target": r_target, "_r_stop": r_stop,
-                    })
-                    step += 1
-                    if progress_callback:
-                        progress_callback(step, total_steps,
-                                          f"Testing {c_label} / {w_label} / {s_label} / {r_label}")
+                        all_combos.append({
+                            "contrib": c_label,
+                            "waterfall": w_label,
+                            "ss": s_label,
+                            "roth": r_label,
+                            "conc_stock": cv_label,
+                            "estate": ret["estate"],
+                            "taxes": ret["total_taxes"],
+                            "final_total": ret["final_total"],
+                            "converted": ret.get("total_converted", 0),
+                            "_c_label": c_label, "_r_label": r_label,
+                            "_w_order": w_order, "_s_fc": s_filer_claim, "_s_sc": s_spouse_claim,
+                            "_r_strategy": r_strategy, "_r_target": r_target, "_r_stop": r_stop,
+                            "_cv_params": cv_params,
+                        })
+                        step += 1
+                        if progress_callback:
+                            progress_callback(step, total_steps,
+                                              f"Testing {c_label} / {w_label} / {s_label} / {r_label} / {cv_label}")
 
     all_combos.sort(key=lambda x: x["estate"], reverse=True)
 
@@ -4207,6 +4346,8 @@ def run_unified_optimizer(
         "SS Claiming": _dim_analysis("ss"),
         "Roth Conversion": _dim_analysis("roth"),
     }
+    if len(conc_stock_variants) > 1:
+        dimension_analysis["Conc Stock"] = _dim_analysis("conc_stock")
 
     # Re-run best combo for full detail
     best = all_combos[0]
@@ -4221,6 +4362,7 @@ def run_unified_optimizer(
     if best["_s_sc"] is not None:
         params["ss_spouse_claim_age"] = best["_s_sc"]
     params["inherited_iras"] = inh_state
+    params.update(best.get("_cv_params", {}))
     best_retire = run_retirement_projection(copy.deepcopy(bals), params, best["_w_order"])
 
     return {
@@ -4229,6 +4371,7 @@ def run_unified_optimizer(
             "waterfall": best["waterfall"],
             "ss": best["ss"],
             "roth": best["roth"],
+            "conc_stock": best.get("conc_stock", "Hold"),
             "estate": best["estate"],
             "taxes": best["taxes"],
             "final_total": best["final_total"],
