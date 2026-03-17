@@ -1357,6 +1357,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     r_roth = params["r_roth"]
     r_annuity = params["r_annuity"]
     r_life = params["r_life"]
+    life_death_benefit = params.get("life_death_benefit", 0.0)
+    life_db_grows = params.get("life_db_grows", False)
+    life_spend_cv = params.get("life_spend_cv", False)
     gross_ss_total = params["gross_ss_total"]
     taxable_pensions_total = params["taxable_pensions_total"]
     filing_status = params["filing_status"]
@@ -1485,6 +1488,10 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     curr_pre_spouse = total_pre * (1.0 - pretax_filer_ratio)
     curr_roth = initial_assets["taxfree"]["roth"]
     curr_life = initial_assets["taxfree"]["life_cash_value"]
+    if life_db_grows:
+        curr_death_benefit = life_death_benefit + curr_life  # increasing DB (Option B)
+    else:
+        curr_death_benefit = max(life_death_benefit, curr_life)  # level DB (Option A)
     curr_ann = initial_assets["annuity"]["value"]
     curr_ann_basis = initial_assets["annuity"]["basis"]
     curr_mtg_bal = mtg_balance
@@ -1751,6 +1758,11 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             wd_annuity = _forced_ann_wd
             ann_gains_withdrawn = _forced_gains
 
+        # Life insurance withdrawal cap: (r_life - 2%) * CV, 5-year waiting period
+        _life_wd_ok = life_spend_cv  # no withdrawals first 5 years
+        _life_max_wd = max(0.0, r_life - 0.02) * curr_life if _life_wd_ok else 0.0
+        _life_avail = min(curr_life, _life_max_wd)  # cap for this year
+
         # Pre-pull additional expenses from their designated sources
         for _aex in _active_addl_expenses:
             _aex_amt = _aex["amount"]
@@ -1768,7 +1780,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 _pull = min(_aex_amt, max(0.0, curr_roth - wd_roth))
                 wd_roth += _pull
             elif _aex_src == "Life Insurance (loan)":
-                _pull = min(_aex_amt, max(0.0, curr_life - wd_life))
+                _pull = min(_aex_amt, max(0.0, _life_avail - wd_life))
                 wd_life += _pull
             elif _aex_src == "Annuity":
                 _pull = min(_aex_amt, max(0.0, curr_ann - wd_annuity))
@@ -1813,7 +1825,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             blend_balances = {
                 "cash": curr_cash, "brokerage": curr_brokerage,
                 "pretax": max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve),
-                "roth": curr_roth, "life": curr_life,
+                "roth": curr_roth, "life": _life_avail,
                 "annuity_value": curr_ann, "annuity_basis": curr_ann_basis,
                 "dyn_gain_pct": dyn_gain_pct,
                 "reinvested_base": reinvested_base,
@@ -1913,8 +1925,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         pull = min(shortfall, avail)
                         if pull > 0:
                             wd_roth += pull; shortfall -= pull
-                    if shortfall > 0:
-                        avail = max(0.0, curr_life - wd_life)
+                    if shortfall > 0 and _life_wd_ok:
+                        avail = max(0.0, _life_avail - wd_life)
                         pull = min(shortfall, avail)
                         if pull > 0:
                             wd_life += pull; shortfall -= pull
@@ -1979,7 +1991,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 avail_brok = max(0.0, curr_brokerage - wd_brokerage)
                 avail_pt = max(0.0, curr_pre_filer + curr_pre_spouse - wd_pretax - qcd_reserve)
                 avail_roth = max(0.0, curr_roth - wd_roth) if conversion_this_year == 0 else 0.0
-                avail_life = max(0.0, curr_life - wd_life)
+                avail_life = max(0.0, _life_avail - wd_life)
                 avail_ann = max(0.0, curr_ann - wd_annuity)
 
                 w_cash = avail_cash * _pw.get("cash", 1.0)
@@ -2104,8 +2116,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                                 wd_roth += pull
                                 shortfall -= pull
                                 pulled = True
-                        if shortfall > 0:
-                            avail = curr_life - wd_life
+                        if shortfall > 0 and _life_wd_ok:
+                            avail = _life_avail - wd_life
                             pull = min(shortfall, max(0.0, avail))
                             if pull > 0:
                                 wd_life += pull
@@ -2279,6 +2291,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
         curr_roth -= wd_roth
         curr_life -= wd_life
+        curr_death_benefit = max(0.0, curr_death_benefit - wd_life)  # DB reduced dollar-for-dollar
         curr_ann -= wd_annuity
 
         if wd_annuity > 0:
@@ -2328,6 +2341,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         curr_roth = max(0.0, curr_roth) * (1 + r_roth)
         curr_ann = max(0.0, curr_ann) * (1 + r_annuity)
         curr_life = max(0.0, curr_life) * (1 + r_life)
+        if life_db_grows:
+            curr_death_benefit = max(curr_death_benefit, 0.0) * (1 + r_life)
+        curr_death_benefit = max(curr_death_benefit, curr_life)  # DB never < CV
 
         # Home appreciation
         curr_home_val *= (1 + home_appr)
@@ -2335,12 +2351,13 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
         # Estate calculation — present-value after-tax (what heirs receive today)
         total_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + curr_life
+        _life_estate = curr_death_benefit  # heirs receive death benefit, not cash value
         _pretax_yr = curr_pre_filer + curr_pre_spouse
         _heir_pretax_net = _pretax_yr * (1.0 - heir_tax_rate)
         _heir_roth_net = curr_roth  # tax-free, no haircut
         _heir_ann_net = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
-        at_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_life + _heir_pretax_net + _heir_roth_net + _heir_ann_net
-        gross_estate_yr = total_wealth_yr + home_equity
+        at_wealth_yr = curr_cash + curr_ef + curr_brokerage + _life_estate + _heir_pretax_net + _heir_roth_net + _heir_ann_net
+        gross_estate_yr = total_wealth_yr - curr_life + _life_estate + home_equity
         # Estate tax: unlimited marital deduction → $0 while both spouses alive.
         # Only applies after first death (survivor's estate) or for single filers.
         _estate_tax_yr = 0.0
@@ -2391,7 +2408,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "Bal Cash": round(curr_cash, 0), "Bal EF": round(curr_ef, 0), "Bal Taxable": round(curr_brokerage, 0),
             "Bal Pre-Tax": round(curr_pre_filer + curr_pre_spouse, 0),
             "Bal Roth": round(curr_roth, 0), "Bal Annuity": round(curr_ann, 0),
-            "Bal Life": round(curr_life, 0),
+            "Bal Life": round(curr_life, 0), "Bal DB": round(curr_death_benefit, 0),
             "Bal Tax-Free": round(curr_roth + curr_life, 0),
             "Portfolio": round(total_wealth_yr, 0),
             "Total Wealth": round(total_wealth_yr, 0),
@@ -2407,14 +2424,15 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         year_details.append(row)
 
     total_wealth = curr_cash + curr_ef + curr_brokerage + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + curr_life
+    _final_life_estate = curr_death_benefit  # heirs receive death benefit
     # Present-value after-tax estate (what heirs receive today)
     _final_pretax = curr_pre_filer + curr_pre_spouse
     _final_heir_pretax = _final_pretax * (1.0 - heir_tax_rate)
     _final_heir_roth = curr_roth  # tax-free
     _final_heir_ann = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
-    after_tax_estate = curr_cash + curr_ef + curr_brokerage + curr_life + _final_heir_pretax + _final_heir_roth + _final_heir_ann
+    after_tax_estate = curr_cash + curr_ef + curr_brokerage + _final_life_estate + _final_heir_pretax + _final_heir_roth + _final_heir_ann
     home_equity_final = max(0.0, curr_home_val - curr_mtg_bal)
-    _gross_final = total_wealth + home_equity_final
+    _gross_final = total_wealth - curr_life + _final_life_estate + home_equity_final
     _final_estate_tax = 0.0
     _both_alive_final = _estate_is_joint and (first_death_idx is None or years < first_death_idx)
     if _estate_tax_enabled and not _both_alive_final:
@@ -2895,7 +2913,10 @@ def run_retirement_projection(balances, params, spending_order):
     surplus_dest = params.get("surplus_destination", "brokerage")
     heir_bracket_option = params.get("heir_bracket_option", "same")  # "same", "lower", "higher"
     ret_life = params.get("life_cash_value", 0.0)
+    life_spend_cv = params.get("life_spend_cv", False)
     ret_life_return = params.get("r_life", 0.04)
+    ret_life_death_benefit = params.get("life_death_benefit", 0.0)
+    life_db_grows = params.get("life_db_grows", False)
     ret_annuity = params.get("annuity_value", 0.0)
     ret_annuity_basis = params.get("annuity_basis", 0.0)
     ret_annuity_return = params.get("r_annuity", 0.04)
@@ -2941,6 +2962,10 @@ def run_retirement_projection(balances, params, spending_order):
     curr_home_val = home_val
     curr_inv_re_val = inv_re_val
     curr_life = ret_life
+    if life_db_grows:
+        curr_death_benefit = ret_life_death_benefit + ret_life  # increasing DB (Option B)
+    else:
+        curr_death_benefit = max(ret_life_death_benefit, ret_life)  # level DB (Option A)
     curr_annuity = ret_annuity
 
     spouse_age_at_retire = params.get("spouse_age_at_retire")
@@ -3090,7 +3115,14 @@ def run_retirement_projection(balances, params, spending_order):
             yr_rental_income += _r_inc
         yr_other_income += yr_rental_income
 
-        fixed_cash = gross_ss + pen_income + yr_dividends + yr_interest + yr_other_income
+        # Life insurance automatic income: (r_life - 2%) * CV, 5-year waiting period
+        _life_wd_ok = life_spend_cv
+        _life_auto_wd = 0.0
+        if _life_wd_ok and curr_life > 0:
+            _life_max_wd = max(0.0, ret_life_return - 0.02) * curr_life
+            _life_auto_wd = min(curr_life, _life_max_wd)
+
+        fixed_cash = gross_ss + pen_income + yr_dividends + yr_interest + yr_other_income + _life_auto_wd
 
         # Inherited IRA distributions (mandatory, ordinary income)
         yr_inherited_dist = 0.0
@@ -3135,6 +3167,7 @@ def run_retirement_projection(balances, params, spending_order):
         wd_conc = 0.0
         wd_roth = 0.0
         wd_hsa = 0.0
+        wd_life = _life_auto_wd  # automatic income from life insurance
         yr_cap_gains = 0.0  # capital gains from brokerage sales (forced conc added post-hoc)
 
         # QCD: direct IRA-to-charity transfer
@@ -3228,7 +3261,7 @@ def run_retirement_projection(balances, params, spending_order):
                 yr_medicare = 0.0
             cash_needed = expenses + taxes + yr_medicare - conv_tax_withheld  # withheld portion already paid from conversion
             wd_taxable = wd_cash + wd_brokerage + wd_conc
-            cash_available = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_taxable + wd_roth + wd_hsa
+            cash_available = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_taxable + wd_roth + wd_hsa + wd_life
             shortfall = cash_needed - cash_available
 
             if shortfall <= 1.0:
@@ -3285,6 +3318,7 @@ def run_retirement_projection(balances, params, spending_order):
                             wd_hsa += pull
                             shortfall -= pull
                             pulled = True
+                    # Life insurance income is automatic (like pension), not waterfall
             if not pulled:
                 break
 
@@ -3360,7 +3394,7 @@ def run_retirement_projection(balances, params, spending_order):
         wd_taxable = wd_cash + wd_brokerage + wd_conc
 
         # Surplus: income exceeds expenses + taxes + medicare -> reinvest
-        cash_available_final = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_cash + wd_brokerage + wd_conc + wd_roth + wd_hsa
+        cash_available_final = fixed_cash + (wd_pretax - yr_qcd_cash_offset) + wd_cash + wd_brokerage + wd_conc + wd_roth + wd_hsa + wd_life
         cash_needed_final = expenses + taxes + yr_medicare - conv_tax_withheld
         yr_surplus = max(0.0, cash_available_final - cash_needed_final)
 
@@ -3380,6 +3414,8 @@ def run_retirement_projection(balances, params, spending_order):
         bal_cash -= wd_cash
         bal_ro -= wd_roth
         bal_hs -= wd_hsa
+        curr_life -= wd_life
+        curr_death_benefit = max(0.0, curr_death_benefit - wd_life)  # DB reduced dollar-for-dollar
 
         # Reinvest surplus (after-tax money -> 100% cost basis)
         if yr_surplus > 0 and surplus_dest != "none":
@@ -3424,12 +3460,16 @@ def run_retirement_projection(balances, params, spending_order):
                 curr_inv_re_val *= (1 + inv_re_appr)
             if curr_life > 0:
                 curr_life *= (1 + ret_life_return)
+            if life_db_grows:
+                curr_death_benefit = max(curr_death_benefit, 0.0) * (1 + ret_life_return)
+            curr_death_benefit = max(curr_death_benefit, curr_life)  # DB never < CV
             if curr_annuity > 0:
                 curr_annuity *= (1 + ret_annuity_return)
 
         bal_inherited_total = sum(ret_iira_bals)
         total_bal = bal_pt + bal_ro + bal_tx + bal_hs + bal_conc + bal_inherited_total
-        gross_estate = total_bal + curr_home_val + curr_inv_re_val + curr_life + curr_annuity
+        _rp_life_estate = curr_death_benefit  # heirs receive death benefit
+        gross_estate = total_bal + curr_home_val + curr_inv_re_val + _rp_life_estate + curr_annuity
 
         # After-tax estate: what heirs actually receive
         my_marginal = tax_result["marginal_rate"]
@@ -3453,7 +3493,7 @@ def run_retirement_projection(balances, params, spending_order):
             bal_hs * (1 - heir_total_rate) +
             bal_inherited_total * (1 - heir_total_rate) +
             curr_home_val + curr_inv_re_val +
-            curr_life + _ret_ann_net
+            _rp_life_estate + _ret_ann_net  # death benefit, not cash value
         )
         # Estate tax: unlimited marital deduction → $0 while both spouses alive.
         _ret_yr_estate_tax = 0.0
@@ -3490,6 +3530,7 @@ def run_retirement_projection(balances, params, spending_order):
         row.update({
             "W/D Taxable": round(wd_taxable, 0),
             "W/D Roth": round(wd_roth, 0), "W/D HSA": round(wd_hsa, 0),
+            "W/D Life": round(wd_life, 0),
         })
         if balances.get("conc_stock", 0.0) > 0:
             row["W/D Conc"] = round(wd_conc + _conc_forced_sell, 0)
@@ -3503,6 +3544,7 @@ def run_retirement_projection(balances, params, spending_order):
             "Surplus Reinv": round(yr_surplus, 0),
             "Living Exp": round(living_exp, 0), "Mortgage": round(mtg_pmt, 0),
             "Total Exp": round(expenses, 0),
+            "AGI": round(tax_result["agi"], 0),
             "Fed Tax": round(tax_result["fed_tax"], 0),
             "State Tax": round(tax_result["state_tax"], 0),
             "Medicare": round(yr_medicare, 0),
@@ -3521,6 +3563,7 @@ def run_retirement_projection(balances, params, spending_order):
         row["Portfolio"] = round(total_bal, 0)
         if curr_life > 0 or ret_life > 0:
             row["Life Ins"] = round(curr_life, 0)
+            row["Bal DB"] = round(curr_death_benefit, 0)
         if curr_annuity > 0 or ret_annuity > 0:
             row["Annuity"] = round(curr_annuity, 0)
         row["Home Value"] = round(curr_home_val, 0)
@@ -3534,7 +3577,7 @@ def run_retirement_projection(balances, params, spending_order):
 
     bal_inherited_final = sum(ret_iira_bals)
     final_total = bal_pt + bal_ro + bal_tx + bal_hs + bal_conc + bal_inherited_final
-    gross_estate_final = final_total + curr_home_val + curr_inv_re_val + curr_life + curr_annuity
+    gross_estate_final = final_total + curr_home_val + curr_inv_re_val + curr_death_benefit + curr_annuity
     # Use last row's after-tax estate if available
     net_estate_final = rows[-1]["Estate (Net)"] if rows else gross_estate_final
     return {
@@ -3667,6 +3710,8 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
     # Life insurance & annuity (display-only during accumulation — no withdrawals)
     accum_life = income_info.get("life_cash_value", 0) if income_info else 0
     accum_life_return = income_info.get("r_life", 0.04) if income_info else 0.04
+    accum_life_db = max(income_info.get("life_death_benefit", 0), accum_life) if income_info else accum_life
+    accum_life_db_grows = income_info.get("life_db_grows", False) if income_info else False
     accum_annuity = income_info.get("annuity_value", 0) if income_info else 0
     accum_annuity_return = income_info.get("r_annuity", 0.04) if income_info else 0.04
 
@@ -4056,11 +4101,15 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             accum_inv_re_value *= (1 + accum_inv_re_appr)
         if yr > 0 and accum_life > 0:
             accum_life *= (1 + accum_life_return)
+        if yr > 0 and accum_life_db_grows:
+            accum_life_db = max(accum_life_db, 0.0) * (1 + accum_life_return)
+        accum_life_db = max(accum_life_db, accum_life)  # DB never < CV
         if yr > 0 and accum_annuity > 0:
             accum_annuity *= (1 + accum_annuity_return)
 
         # Gross & net estate (matching retirement projection layout)
-        gross_estate = total + accum_home_value + accum_inv_re_value + accum_life + accum_annuity
+        _accum_life_estate = accum_life_db  # heirs receive death benefit
+        gross_estate = total + accum_home_value + accum_inv_re_value + _accum_life_estate + accum_annuity
         _acc_marginal = get_marginal_fed_rate(ordinary_taxable, filing, bracket_inf_f)
         if accum_heir_bracket == "lower":
             _acc_heir_fed = _heir_rate_from_offset(_acc_marginal, -1)
@@ -4079,7 +4128,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             bal_hsa * (1 - _acc_heir_rate) +
             bal_inherited_total * (1 - _acc_heir_rate) +
             accum_home_value + accum_inv_re_value +
-            accum_life +  # life insurance: tax-free to beneficiaries
+            _accum_life_estate +  # life insurance death benefit: tax-free to beneficiaries
             _acc_ann_net  # annuity: gains taxed as ordinary income to heirs
         )
         # Estate tax: unlimited marital deduction → $0 while both spouses alive (always both alive during accumulation).
@@ -4106,6 +4155,7 @@ def run_accumulation(current_age, years_to_ret, start_balances, contributions, s
             "Living Exp": round(yr_living, 0),
             "Mortgage": round(yr_mortgage, 0),
             "Other Exp": round(yr_future_exp, 0),
+            "AGI": round(yr_agi, 0),
             "Fed Tax": round(fed_tax, 0), "State Tax": round(state_tax, 0),
             "FICA": round(yr_fica, 0), "Total Tax": round(yr_taxes, 0),
             "Save Pre-Tax": round(c_pretax, 0), "Save Roth": round(c_roth, 0),

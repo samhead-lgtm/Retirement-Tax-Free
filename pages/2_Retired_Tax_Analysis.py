@@ -1554,6 +1554,60 @@ def compute_estate_tax(gross_estate, federal_exemption, exemption_growth, years_
     return federal_tax + state_tax
 
 
+def _allocate_charitable_bequest(
+    charity_amt, pretax, roth, ann_val, ann_basis,
+    cash, ef, brokerage, conc, life_estate, heir_tax_rate
+):
+    """Allocate charitable bequest from most-taxable accounts first.
+
+    Priority: pretax -> annuity gains -> annuity basis -> brokerage/conc/cash
+    Never from: Roth, life insurance (tax-free to heirs)
+
+    Returns (actual_charity, heir_after_tax).
+    """
+    remaining = charity_amt
+
+    # 1. From pre-tax (saves heir_tax_rate per dollar)
+    from_pretax = min(remaining, pretax)
+    remaining -= from_pretax
+
+    # 2. From annuity gains (saves heir_tax_rate per dollar)
+    ann_gains = max(0.0, ann_val - ann_basis)
+    from_ann_gains = min(remaining, ann_gains)
+    remaining -= from_ann_gains
+
+    # 3. From neutral sources: annuity basis, brokerage, conc, cash, EF
+    from_ann_basis = min(remaining, ann_basis)
+    remaining -= from_ann_basis
+    from_brokerage = min(remaining, brokerage)
+    remaining -= from_brokerage
+    from_conc = min(remaining, conc)
+    remaining -= from_conc
+    from_cash = min(remaining, cash + ef)
+    remaining -= from_cash
+
+    # Never from Roth or life insurance
+    actual_charity = charity_amt - remaining
+
+    # Heir portions (what's left after charity takes its share)
+    heir_pretax = pretax - from_pretax
+    heir_ann_gains = ann_gains - from_ann_gains
+    heir_ann_basis = ann_basis - from_ann_basis
+    heir_brokerage = brokerage - from_brokerage
+    heir_conc = conc - from_conc
+    heir_cash_ef = (cash + ef) - from_cash
+
+    # Apply heir tax to remaining taxable accounts
+    heir_pretax_net = heir_pretax * (1.0 - heir_tax_rate)
+    heir_ann_net = heir_ann_basis + heir_ann_gains * (1.0 - heir_tax_rate)
+
+    # Total after-tax value for heirs
+    heir_after_tax = (heir_cash_ef + heir_brokerage + heir_conc + life_estate +
+                      heir_pretax_net + roth + heir_ann_net)
+
+    return actual_charity, heir_after_tax
+
+
 def run_wealth_projection(initial_assets, params, spending_order, conversion_strategy="none",
                            target_agi=0, stop_conversion_age=100, conversion_years_limit=0,
                            blend_mode=False, pretax_annual_cap=None, prorata_blend=False,
@@ -1706,6 +1760,13 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     p_medical_expenses = params.get("medical_expenses", 0.0)
     p_charitable = params.get("charitable", 0.0)
     p_qcd_annual = params.get("qcd_annual", 0.0)
+    p_stock_donation = params.get("stock_donation_annual", 0.0)
+    p_stock_donation_end_age = params.get("stock_donation_end_age", 70)
+    _stock_donation_additional = params.get("stock_donation_additional", False)
+    _charity_bequest_mode = params.get("charitable_bequest_mode", "pct")
+    _charity_bequest_pct = params.get("charitable_bequest_pct", 0.0)
+    _charity_bequest_fixed = params.get("charitable_bequest_fixed", 0.0)
+    _charity_bequest_inflate = params.get("charitable_bequest_inflate", False)
     p_state_tax_rate = params.get("state_tax_rate", 0.055)
 
     # Mortgage
@@ -1743,6 +1804,11 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
     curr_pre_spouse = total_pre * (1.0 - pretax_filer_ratio)
     curr_roth = initial_assets["taxfree"]["roth"]
     curr_life = initial_assets["taxfree"]["life_cash_value"]
+    # Death benefit: track separately, reduced dollar-for-dollar by withdrawals
+    if life_db_grows:
+        curr_death_benefit = life_death_benefit + curr_life  # increasing DB (Option B)
+    else:
+        curr_death_benefit = max(life_death_benefit, curr_life)  # level DB (Option A)
     curr_ann = initial_assets["annuity"]["value"]
     curr_ann_basis = initial_assets["annuity"]["basis"]
     curr_mtg_bal = mtg_balance
@@ -1773,6 +1839,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
     total_taxes_paid = 0.0
     total_converted = 0.0
+    total_stock_donated = 0.0
     year_details = []
     tax_results = []
 
@@ -1849,6 +1916,19 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     if conversion_strategy == "none" or conversion_strategy == 0 or conversion_strategy == 0.0:
                         _yr_conv_strat = _phase.get("conversion_strategy", "none")
                     break
+
+        # Lifetime appreciated stock donation from brokerage
+        yr_stock_donation = 0.0
+        yr_stock_donation_basis = 0.0
+        if p_stock_donation > 0 and curr_brokerage > 0 and _turning_f <= p_stock_donation_end_age:
+            _don_requested = p_stock_donation * inf_factor
+            _don_amt = min(_don_requested, curr_brokerage)
+            _don_basis_pct = brokerage_basis / curr_brokerage if curr_brokerage > 0 else 1.0
+            yr_stock_donation_basis = _don_amt * _don_basis_pct
+            yr_stock_donation = _don_amt
+            curr_brokerage -= _don_amt
+            brokerage_basis = max(0.0, brokerage_basis - yr_stock_donation_basis)
+            total_stock_donated += _don_amt
 
         # Investment income: scale with current brokerage balance (yield-based)
         yr_ordinary_div = curr_brokerage * _div_yield
@@ -1972,7 +2052,13 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
         # QCD adjustments: reduce taxable RMD, avoid double-dipping deduction, reduce spending need
         taxable_rmd = rmd_total - min(yr_qcd, rmd_total)
-        yr_charitable_deduction = max(0.0, yr_charitable - yr_qcd)
+        if _stock_donation_additional:
+            yr_charitable_deduction = max(0.0, yr_charitable - yr_qcd) + yr_stock_donation
+        else:
+            yr_charitable_deduction = max(0.0, yr_charitable - yr_qcd)
+            # Stock replaces cash giving — reduce cash spending need
+            if yr_stock_donation > 0:
+                total_spend_need -= min(yr_stock_donation, max(0.0, yr_charitable - yr_qcd))
         total_spend_need -= yr_qcd  # QCD pays this portion of charitable directly from IRA
 
         # QCD reserve: find the minimum IRA balance from which the account can
@@ -2166,6 +2252,11 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             wd_annuity = _forced_ann_wd
             ann_gains_withdrawn = _forced_gains
 
+        # Life insurance withdrawal cap: (r_life - 2%) * CV, 5-year waiting period
+        _life_wd_ok = life_spend_cv
+        _life_max_wd = max(0.0, r_life - 0.02) * curr_life if _life_wd_ok else 0.0
+        _life_avail = min(curr_life, _life_max_wd)  # cap for this year
+
         # Pre-pull additional expenses from their designated sources
         for _aex in _active_addl_expenses:
             _aex_amt = _aex["amount"]
@@ -2185,7 +2276,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                 _pull = min(_aex_amt, max(0.0, curr_roth - wd_roth))
                 wd_roth += _pull
             elif _aex_src == "Life Insurance (loan)":
-                _pull = min(_aex_amt, max(0.0, curr_life - wd_life)) if life_spend_cv else 0.0
+                _pull = min(_aex_amt, max(0.0, _life_avail - wd_life))
                 wd_life += _pull
             elif _aex_src == "Annuity":
                 _pull = min(_aex_amt, max(0.0, curr_ann - wd_annuity))
@@ -2231,7 +2322,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             blend_balances = {
                 "cash": curr_cash, "brokerage": curr_brokerage,
                 "pretax": max(0.0, curr_pre_filer + curr_pre_spouse - qcd_reserve),
-                "roth": curr_roth, "life": curr_life if life_spend_cv else 0.0,
+                "roth": curr_roth, "life": _life_avail,
                 "annuity_value": curr_ann, "annuity_basis": curr_ann_basis,
                 "dyn_gain_pct": dyn_gain_pct,
                 "reinvested_base": reinvested_base,
@@ -2353,8 +2444,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                         pull = min(shortfall, avail)
                         if pull > 0:
                             wd_roth += pull; shortfall -= pull
-                    if shortfall > 0 and life_spend_cv:
-                        avail = max(0.0, curr_life - wd_life)
+                    if shortfall > 0 and _life_wd_ok:
+                        avail = max(0.0, _life_avail - wd_life)
                         pull = min(shortfall, avail)
                         if pull > 0:
                             wd_life += pull; shortfall -= pull
@@ -2427,7 +2518,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                     avail_cash < 1 and avail_brok < 1 and avail_conc < 1 and avail_pt < 1 and avail_ann < 1
                 )
                 avail_roth = max(0.0, curr_roth - wd_roth) if (conversion_this_year == 0 or _pr_other_dry) else 0.0
-                avail_life = max(0.0, curr_life - wd_life) if life_spend_cv else 0.0
+                avail_life = max(0.0, _life_avail - wd_life)
 
                 w_cash = avail_cash * _pw.get("cash", 1.0)
                 w_brok = avail_brok * _pw.get("brokerage", 1.0)
@@ -2567,8 +2658,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
                                 wd_roth += pull
                                 shortfall -= pull
                                 pulled = True
-                        if shortfall > 0 and life_spend_cv:
-                            avail = curr_life - wd_life
+                        if shortfall > 0 and _life_wd_ok:
+                            avail = _life_avail - wd_life
                             pull = min(shortfall, max(0.0, avail))
                             if pull > 0:
                                 wd_life += pull
@@ -2811,6 +2902,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
 
         curr_roth -= wd_roth
         curr_life -= wd_life
+        curr_death_benefit = max(0.0, curr_death_benefit - wd_life)  # DB reduced dollar-for-dollar
         curr_ann -= wd_annuity
 
         if wd_annuity > 0:
@@ -2860,6 +2952,9 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         curr_roth = max(0.0, curr_roth) * (1 + r_roth)
         curr_ann = max(0.0, curr_ann) * (1 + r_annuity)
         curr_life = max(0.0, curr_life) * (1 + r_life)
+        if life_db_grows:
+            curr_death_benefit = max(curr_death_benefit, 0.0) * (1 + r_life)
+        curr_death_benefit = max(curr_death_benefit, curr_life)  # DB never < CV
         curr_conc = max(0.0, curr_conc) * (1 + r_taxable - conc_div_yield)
 
         # Home appreciation
@@ -2871,30 +2966,43 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             curr_inv_re_val *= (1 + inv_re_appr)
 
         # Death benefit payout at first death (if policy pays on this death)
-        if first_death_idx is not None and i == first_death_idx and curr_life > 0 and life_death_benefit > 0:
+        if first_death_idx is not None and i == first_death_idx and curr_life > 0 and curr_death_benefit > 0:
             _should_pay = (
                 (life_payout == "Filer Death" and filer_dies_first) or
                 (life_payout == "Spouse Death" and not filer_dies_first) or
                 (life_payout == "Last to Die" and False)  # pays at end (estate only)
             )
             if _should_pay:
-                _db = life_death_benefit + (curr_life if life_db_grows else 0)
-                curr_cash += _db
+                curr_cash += curr_death_benefit
                 curr_life = 0
+                curr_death_benefit = 0
                 life_premium = 0
 
         # Estate calculation — present-value after-tax (what heirs receive today)
-        # Use death benefit instead of cash value when policy is active
-        _life_estate = curr_life
-        if life_death_benefit > 0 and curr_life > 0:
-            _life_estate = life_death_benefit + (curr_life if life_db_grows else 0)
+        _life_estate = curr_death_benefit  # heirs receive death benefit, not cash value
         total_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_conc + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + _life_estate
         _pretax_yr = curr_pre_filer + curr_pre_spouse
-        _heir_pretax_net = _pretax_yr * (1.0 - heir_tax_rate)
-        _heir_roth_net = curr_roth  # tax-free, no haircut
-        _heir_ann_net = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
-        at_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_conc + _life_estate + _heir_pretax_net + _heir_roth_net + _heir_ann_net
         gross_estate_yr = total_wealth_yr + home_equity + curr_inv_re_val
+
+        # Charitable bequest allocation
+        if _charity_bequest_mode == "pct" and _charity_bequest_pct > 0:
+            _yr_charity_bequest = gross_estate_yr * _charity_bequest_pct
+        elif _charity_bequest_mode == "fixed" and _charity_bequest_fixed > 0:
+            _yr_charity_bequest = _charity_bequest_fixed * ((1 + inflation) ** i) if _charity_bequest_inflate else _charity_bequest_fixed
+        else:
+            _yr_charity_bequest = 0.0
+
+        if _yr_charity_bequest > 0:
+            _yr_charity_actual, at_wealth_yr = _allocate_charitable_bequest(
+                _yr_charity_bequest, _pretax_yr, curr_roth, curr_ann, curr_ann_basis,
+                curr_cash, curr_ef, curr_brokerage, curr_conc, _life_estate, heir_tax_rate)
+            at_wealth_yr += _yr_charity_actual  # total = heir portion + charity portion
+        else:
+            _yr_charity_actual = 0.0
+            _heir_pretax_net = _pretax_yr * (1.0 - heir_tax_rate)
+            _heir_ann_net = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
+            at_wealth_yr = curr_cash + curr_ef + curr_brokerage + curr_conc + _life_estate + _heir_pretax_net + curr_roth + _heir_ann_net
+
         # Estate tax: unlimited marital deduction → $0 while both spouses alive.
         _estate_tax_yr = 0.0
         _both_alive = _estate_is_joint and (first_death_idx is None or i < first_death_idx)
@@ -2942,6 +3050,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "AGI": round(yr_agi, 0),
             "Taxes": round(yr_tax, 0), "Medicare": round(yr_medicare, 0),
             "Surplus": round(yr_surplus, 0),
+            "Stock Gift": round(yr_stock_donation, 0),
         })
         if yr_life_premium > 0:
             row["Life Prem"] = round(yr_life_premium, 0)
@@ -2949,7 +3058,7 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
             "Bal Cash": round(curr_cash, 0), "Bal EF": round(curr_ef, 0), "Bal Taxable": round(curr_brokerage, 0), "Bal Conc": round(curr_conc, 0),
             "Bal Pre-Tax": round(curr_pre_filer + curr_pre_spouse, 0),
             "Bal Roth": round(curr_roth, 0), "Bal Annuity": round(curr_ann, 0),
-            "Bal Life": round(_life_estate, 0),
+            "Bal Life": round(curr_life, 0), "Bal DB": round(curr_death_benefit, 0),
             "Portfolio": round(total_wealth_yr, 0),
             "Total Wealth": round(total_wealth_yr, 0),
         })
@@ -2961,25 +3070,41 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         if curr_inv_re_val > 0 or inv_re_val > 0:
             row["Inv RE"] = round(curr_inv_re_val, 0)
         row["Gross Estate"] = round(gross_estate_yr, 0)
+        if _yr_charity_bequest > 0:
+            row["Charity Bequest"] = round(_yr_charity_actual, 0)
         if _estate_tax_enabled:
             row["Estate Tax"] = round(_estate_tax_yr, 0)
         row["Estate (Net)"] = round(net_estate_yr, 0)
         row["_net_draw"] = (wd_cash + wd_brokerage + wd_conc + wd_pretax + wd_roth + wd_life + wd_annuity) - yr_surplus
         year_details.append(row)
 
-    # Final life estate: death benefit if policy still active (Last to Die pays at end)
-    _final_life_estate = curr_life
-    if life_death_benefit > 0 and curr_life > 0:
-        _final_life_estate = life_death_benefit + (curr_life if life_db_grows else 0)
+    # Final life estate: death benefit (tracked with dollar-for-dollar withdrawal reductions)
+    _final_life_estate = curr_death_benefit
     total_wealth = curr_cash + curr_ef + curr_brokerage + curr_conc + curr_pre_filer + curr_pre_spouse + curr_roth + curr_ann + _final_life_estate
     # Present-value after-tax estate (what heirs receive today)
     _final_pretax = curr_pre_filer + curr_pre_spouse
-    _final_heir_pretax = _final_pretax * (1.0 - heir_tax_rate)
-    _final_heir_roth = curr_roth  # tax-free
-    _final_heir_ann = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
-    after_tax_estate = curr_cash + curr_ef + curr_brokerage + curr_conc + _final_life_estate + _final_heir_pretax + _final_heir_roth + _final_heir_ann
     home_equity_final = max(0.0, curr_home_val - curr_mtg_bal)
     _gross_final = total_wealth + home_equity_final + curr_inv_re_val
+
+    # Charitable bequest allocation (final)
+    if _charity_bequest_mode == "pct" and _charity_bequest_pct > 0:
+        _final_charity_bequest = _gross_final * _charity_bequest_pct
+    elif _charity_bequest_mode == "fixed" and _charity_bequest_fixed > 0:
+        _final_charity_bequest = _charity_bequest_fixed * ((1 + inflation) ** years) if _charity_bequest_inflate else _charity_bequest_fixed
+    else:
+        _final_charity_bequest = 0.0
+
+    if _final_charity_bequest > 0:
+        _final_charity_actual, after_tax_estate = _allocate_charitable_bequest(
+            _final_charity_bequest, _final_pretax, curr_roth, curr_ann, curr_ann_basis,
+            curr_cash, curr_ef, curr_brokerage, curr_conc, _final_life_estate, heir_tax_rate)
+        after_tax_estate += _final_charity_actual  # total = heir + charity
+    else:
+        _final_charity_actual = 0.0
+        _final_heir_pretax = _final_pretax * (1.0 - heir_tax_rate)
+        _final_heir_ann = curr_ann_basis + max(0.0, curr_ann - curr_ann_basis) * (1.0 - heir_tax_rate)
+        after_tax_estate = curr_cash + curr_ef + curr_brokerage + curr_conc + _final_life_estate + _final_heir_pretax + curr_roth + _final_heir_ann
+
     _final_estate_tax = 0.0
     _both_alive_final = _estate_is_joint and (first_death_idx is None or years < first_death_idx)
     if _estate_tax_enabled and not _both_alive_final:
@@ -2994,6 +3119,8 @@ def run_wealth_projection(initial_assets, params, spending_order, conversion_str
         "total_wealth": total_wealth,
         "gross_estate": _gross_final,
         "estate_tax": _final_estate_tax,
+        "charitable_bequest": _final_charity_actual,
+        "total_stock_donated": total_stock_donated,
         "total_taxes": total_taxes_paid, "total_converted": total_converted,
         "final_cash": curr_cash + curr_ef, "final_brokerage": curr_brokerage,
         "final_pretax": curr_pre_filer + curr_pre_spouse,
@@ -4619,7 +4746,7 @@ with tab3:
             }
             # Hide detail sub-columns that are rolled up into summary columns
             _hide_cols = ["W/D Roth", "W/D Life",
-                          "Bal Life",
+                          "Bal Life", "Bal DB",
                           "Total Wealth", "_net_draw"]
             # Hide Addl Expense / Extra Income columns if all zeros
             if all(r.get("Addl Exp", 0) == 0 for r in rows):
@@ -5215,7 +5342,7 @@ with tab4:
                 with col3b: st.metric("vs Best", f"${_selected_result['after_tax_estate'] - best['after_tax_estate']:+,.0f}")
 
             # Show year-by-year detail for selected strategy
-            _opt_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "_net_draw"]
+            _opt_hide = ["W/D Roth", "W/D Life", "Bal Life", "Bal DB", "Total Wealth", "_net_draw"]
             # Hide zero columns
             _zero_hide = ["Harvest Gains"]
             _sel_details = _selected_result.get("_year_details", [])
@@ -5477,7 +5604,7 @@ with tab4:
                 _p2_selected_result = next(r for r in p2_sorted if r["strategy_name"] == _p2_selected_label)
 
                 _p2_sel_details = _p2_selected_result.get("_year_details", [])
-                _p2_hide = ["W/D Roth", "W/D Life", "Bal Life", "Total Wealth", "_net_draw"]
+                _p2_hide = ["W/D Roth", "W/D Life", "Bal Life", "Bal DB", "Total Wealth", "_net_draw"]
                 _p2_zero_hide = ["Harvest Gains"]
                 if _p2_sel_details:
                     with st.expander(f"Year-by-Year Detail: {_p2_selected_label}", expanded=True):
